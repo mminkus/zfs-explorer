@@ -1,0 +1,182 @@
+# ZFS Explorer - Multi-language .gitignore
+
+#############
+# C/Native Library
+#############
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.out
+*.lo
+*.la
+.libs/
+.deps/
+
+# Native build artifacts
+native/libzdbdecode.so
+native/libzdbdecode.a
+native/src/*.o
+
+#############
+# Rust/Cargo
+#############
+backend/target/
+backend/Cargo.lock
+backend/**/*.rs.bk
+backend/.cargo/
+!backend/.cargo/config.toml
+
+# FFI generated bindings
+backend/src/ffi/bindings.rs
+
+#############
+# Node/npm/React
+#############
+ui/node_modules/
+ui/dist/
+ui/build/
+ui/.vite/
+ui/.turbo/
+ui/.next/
+ui/.nuxt/
+ui/.cache/
+
+# Logs
+ui/npm-debug.log*
+ui/yarn-debug.log*
+ui/yarn-error.log*
+ui/pnpm-debug.log*
+ui/lerna-debug.log*
+
+# Environment files
+ui/.env
+ui/.env.local
+ui/.env.*.local
+
+# Editor directories and files
+ui/.vscode/*
+!ui/.vscode/extensions.json
+ui/.idea/
+ui/*.suo
+ui/*.ntvs*
+ui/*.njsproj
+ui/*.sln
+ui/*.sw?
+
+#############
+# OpenZFS Build Artifacts
+#############
+# Don't ignore the zfs/ submodule itself, but ignore build artifacts
+zfs/autom4te.cache/
+zfs/config.log
+zfs/config.status
+zfs/configure
+zfs/Makefile
+zfs/Makefile.in
+zfs/libtool
+zfs/**/*.o
+zfs/**/*.lo
+zfs/**/*.la
+zfs/**/.deps/
+zfs/**/.libs/
+zfs/**/.dirstamp
+zfs/zfs.release
+zfs/zfs_config.h
+zfs/zfs_config.h.in
+zfs/stamp-h1
+zfs/module/Kbuild
+zfs/include/zfs_gitrev.h
+
+# Built OpenZFS userland installation
+_deps/
+
+#############
+# IDEs and Editors
+#############
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.bak
+.project
+.cproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+#############
+# OS-specific
+#############
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.stackdump
+
+#############
+# Logs and temporary files
+#############
+*.log
+*.tmp
+*.temp
+*.pid
+*.seed
+*.pid.lock
+.pnpm-debug.log
+
+#############
+# Claude Code
+#############
+.claude/
+!.claude/plans/
+
+#############
+# Build and Test Artifacts
+#############
+*.gcda
+*.gcno
+*.gcov
+coverage/
+*.profraw
+*.profdata
+
+#############
+# Documentation Build
+#############
+docs/_build/
+site/
+
+#############
+# Debugging
+#############
+*.dSYM/
+core
+vgcore.*
+*.core
+
+#############
+# Package Managers
+#############
+.npm
+.yarn/
+.pnpm-store/
+
+#############
+# Misc
+#############
+*.orig
+*.rej
+.*.swp
+Session.vim
+tags
+TAGS

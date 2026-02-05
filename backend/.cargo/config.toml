@@ -1,0 +1,7 @@
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+  # Bake rpath into the binary so it can find shared libraries at runtime
+  # $ORIGIN is a special linker variable meaning "directory containing the executable"
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../native",
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../_deps/openzfs/lib",
+]

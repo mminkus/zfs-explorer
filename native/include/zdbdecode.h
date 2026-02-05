@@ -1,0 +1,55 @@
+#ifndef ZDBDECODE_H
+#define ZDBDECODE_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Opaque handles */
+typedef struct zdx_pool zdx_pool_t;
+
+/* === Result type (all JSON functions return this) === */
+typedef struct {
+    char *json;       /* NUL-terminated, freed by zdx_free_result() */
+    size_t len;       /* length excluding NUL */
+    int err;          /* 0 = ok, otherwise errno-style */
+    char *errmsg;     /* human-readable, also freed by zdx_free_result() */
+} zdx_result_t;
+
+/* Free a result structure (frees json and errmsg, zeroes struct) */
+void zdx_free_result(zdx_result_t *r);
+
+/* === Lifecycle (call once) === */
+int zdx_init(void);   /* kernel_init(SPA_MODE_READ) */
+void zdx_fini(void);  /* kernel_fini() */
+
+/* === Pool operations === */
+zdx_result_t zdx_list_pools(void);
+zdx_pool_t *zdx_pool_open(const char *name, int *err);
+void zdx_pool_close(zdx_pool_t *pool);
+zdx_result_t zdx_pool_info(zdx_pool_t *pool);
+zdx_result_t zdx_pool_vdevs(zdx_pool_t *pool);
+zdx_result_t zdx_pool_datasets(zdx_pool_t *pool);
+
+/* === MOS object operations === */
+zdx_result_t zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
+                                   uint64_t start, uint64_t limit);
+zdx_result_t zdx_mos_get_object(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_mos_get_blkptrs(zdx_pool_t *pool, uint64_t objid);
+
+/* === ZAP operations === */
+zdx_result_t zdx_zap_info(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_zap_entries(zdx_pool_t *pool, uint64_t objid,
+                             uint64_t cursor, uint64_t limit);
+
+/* === Version info === */
+const char *zdx_version(void); /* returns OpenZFS commit hash (injected at build time) */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* ZDBDECODE_H */
