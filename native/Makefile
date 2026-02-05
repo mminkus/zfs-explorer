@@ -25,6 +25,9 @@ WARNFLAGS = -Wall -Wextra -Wshadow -Wformat=2 -Wstrict-prototypes -Wno-cast-qual
 
 # Library linking
 LDFLAGS ?=
+# Add RPATH so libzdbdecode.so can find OpenZFS libraries
+# $ORIGIN is the directory containing libzdbdecode.so (native/)
+LDFLAGS += -Wl,-rpath,'$$ORIGIN/../_deps/openzfs/lib'
 LDLIBS = -L$(ZFS_PREFIX)/lib -lzfs -lzpool -lnvpair
 
 # Targets

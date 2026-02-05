@@ -30,17 +30,26 @@ From the container:
 rsync -av /home/martin/development/zfs-explorer martin@nexus:/home/martin/development/
 ```
 
-### 2. Run the backend on nexus
+### 2. Copy files to nexus
+
+From the container:
+```bash
+rsync -av /home/martin/development/zfs-explorer/native martin@nexus:/nexus/local/home/martin/development/zfs-explorer/
+rsync -av /home/martin/development/zfs-explorer/_deps martin@nexus:/nexus/local/home/martin/development/zfs-explorer/
+rsync -av /home/martin/development/zfs-explorer/backend/target martin@nexus:/nexus/local/home/martin/development/zfs-explorer/backend/
+```
+
+### 3. Run the backend on nexus
 
 ```bash
 ssh martin@nexus
-cd /home/martin/development/zfs-explorer/backend
+cd /nexus/local/home/martin/development/zfs-explorer/backend
 
 # Just run it - rpath is baked into the binary!
 sudo ./target/debug/zfs-explorer
 ```
 
-> **Note:** The binary has rpath baked in (via `.cargo/config.toml`) so it automatically finds `libzdbdecode.so` and ZFS libraries without needing `LD_LIBRARY_PATH`.
+> **Note:** RUNPATH is baked into both the binary and `libzdbdecode.so` (via `.cargo/config.toml` and `native/Makefile`), so they automatically find all shared libraries without needing `LD_LIBRARY_PATH`.
 
 Expected output:
 ```
@@ -49,7 +58,7 @@ Expected output:
 2026-02-05T05:45:00.000000Z  INFO zfs_explorer: API server listening on 127.0.0.1:9000
 ```
 
-### 3. Test the API
+### 4. Test the API
 
 From nexus (in another terminal):
 ```bash
@@ -61,7 +70,7 @@ Expected response:
 ["nexus","rpool"]
 ```
 
-### 4. Run the UI
+### 5. Run the UI
 
 From the container (or nexus):
 ```bash
