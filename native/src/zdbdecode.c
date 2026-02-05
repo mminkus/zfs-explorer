@@ -4,11 +4,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <errno.h>
+#include <ctype.h>
 
 /* ZFS headers */
 #include <sys/zfs_context.h>
 #include <sys/spa.h>
+#include <sys/dmu.h>
+#include <sys/dnode.h>
+#include <sys/dmu_objset.h>
+#include <sys/dsl_dir.h>
+#include <sys/dsl_dataset.h>
+#include <sys/zap.h>
+#include <sys/zap_impl.h>
+#include <sys/zfs_refcount.h>
 #include <libzpool.h>
 #include <libzfs.h>
 
@@ -20,7 +30,7 @@
 /* Opaque pool handle */
 struct zdx_pool {
     char *name;
-    zpool_handle_t *zpool;
+    spa_t *spa;
 };
 
 /* Global libzfs handle */
@@ -85,6 +95,143 @@ make_success(char *json)
 }
 
 /*
+ * Return a safe object type name
+ */
+static const char *
+dmu_ot_name_safe(dmu_object_type_t type)
+{
+    if (!DMU_OT_IS_VALID(type)) {
+        return "unknown";
+    }
+
+    if (type & DMU_OT_NEWTYPE) {
+        dmu_object_byteswap_t bswap = DMU_OT_BYTESWAP(type);
+        if (bswap < DMU_BSWAP_NUMFUNCS &&
+            dmu_ot_byteswap[bswap].ob_name != NULL) {
+            return dmu_ot_byteswap[bswap].ob_name;
+        }
+        return "newtype";
+    }
+
+    if (type >= DMU_OT_NUMTYPES) {
+        return "unknown";
+    }
+
+    if (dmu_ot[type].ot_name == NULL) {
+        return "unknown";
+    }
+
+    return dmu_ot[type].ot_name;
+}
+
+static char *
+bytes_to_hex(const uint8_t *data, size_t len)
+{
+    static const char *hex = "0123456789abcdef";
+    size_t out_len = len * 2;
+    char *out = malloc(out_len + 1);
+    if (!out)
+        return NULL;
+
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = hex[(data[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[data[i] & 0xF];
+    }
+    out[out_len] = '\0';
+    return out;
+}
+
+static char *
+numbers_preview(const void *data, uint64_t count, int int_len)
+{
+    uint64_t shown = count;
+    if (shown > 8)
+        shown = 8;
+
+    size_t cap = 64 + shown * 24;
+    char *out = malloc(cap);
+    if (!out)
+        return NULL;
+
+    size_t used = 0;
+    for (uint64_t i = 0; i < shown; i++) {
+        int written = 0;
+        switch (int_len) {
+        case 1:
+            written = snprintf(out + used, cap - used, "%u ",
+                (unsigned)((const uint8_t *)data)[i]);
+            break;
+        case 2:
+            written = snprintf(out + used, cap - used, "%u ",
+                (unsigned)((const uint16_t *)data)[i]);
+            break;
+        case 4:
+            written = snprintf(out + used, cap - used, "%u ",
+                (unsigned)((const uint32_t *)data)[i]);
+            break;
+        case 8:
+            written = snprintf(out + used, cap - used, "%llu ",
+                (unsigned long long)((const uint64_t *)data)[i]);
+            break;
+        default:
+            written = snprintf(out + used, cap - used, "? ");
+            break;
+        }
+
+        if (written < 0 || (size_t)written >= cap - used) {
+            out[used] = '\0';
+            return out;
+        }
+        used += (size_t)written;
+    }
+
+    if (count > shown) {
+        (void)snprintf(out + used, cap - used, "...");
+    } else if (used > 0 && out[used - 1] == ' ') {
+        out[used - 1] = '\0';
+    }
+
+    return out;
+}
+
+static int
+append_semantic_edge(char **array, int *count, uint64_t source,
+    uint64_t target, const char *label, const char *kind, double confidence)
+{
+    char *label_json = json_string(label);
+    char *kind_json = json_string(kind);
+    if (!label_json || !kind_json) {
+        free(label_json);
+        free(kind_json);
+        return -1;
+    }
+
+    char *item = json_format(
+        "{\"source_obj\":%llu,\"target_obj\":%llu,\"label\":%s,"
+        "\"kind\":%s,\"confidence\":%.2f}",
+        (unsigned long long)source,
+        (unsigned long long)target,
+        label_json,
+        kind_json,
+        confidence);
+    free(label_json);
+    free(kind_json);
+
+    if (!item)
+        return -1;
+
+    char *new_array = json_array_append(*array, item);
+    free(item);
+    if (!new_array)
+        return -1;
+
+    free(*array);
+    *array = new_array;
+    (*count)++;
+    return 0;
+}
+
+/*
  * Initialize the library
  */
 int
@@ -115,6 +262,1038 @@ zdx_fini(void)
     }
 
     kernel_fini();
+}
+
+/*
+ * Open a pool via libzpool
+ */
+zdx_pool_t *
+zdx_pool_open(const char *name, int *err)
+{
+    if (err)
+        *err = 0;
+
+    if (name == NULL) {
+        if (err)
+            *err = EINVAL;
+        return NULL;
+    }
+
+    spa_t *spa = NULL;
+    int rc = spa_open(name, &spa, FTAG);
+    if (rc != 0) {
+        if (err)
+            *err = rc;
+        return NULL;
+    }
+
+    zdx_pool_t *pool = calloc(1, sizeof (zdx_pool_t));
+    if (!pool) {
+        spa_close(spa, FTAG);
+        if (err)
+            *err = ENOMEM;
+        return NULL;
+    }
+
+    pool->name = strdup(name);
+    pool->spa = spa;
+    return pool;
+}
+
+/*
+ * Close a pool handle
+ */
+void
+zdx_pool_close(zdx_pool_t *pool)
+{
+    if (!pool)
+        return;
+
+    if (pool->spa)
+        spa_close(pool->spa, FTAG);
+
+    free(pool->name);
+    free(pool);
+}
+
+/*
+ * Pool info (stub for now)
+ */
+zdx_result_t
+zdx_pool_info(zdx_pool_t *pool)
+{
+    if (!pool)
+        return make_error(EINVAL, "pool not open");
+
+    return make_error(ENOSYS, "pool info not implemented");
+}
+
+/*
+ * Pool vdevs (stub for now)
+ */
+zdx_result_t
+zdx_pool_vdevs(zdx_pool_t *pool)
+{
+    if (!pool)
+        return make_error(EINVAL, "pool not open");
+
+    return make_error(ENOSYS, "pool vdevs not implemented");
+}
+
+/*
+ * Pool datasets (stub for now)
+ */
+zdx_result_t
+zdx_pool_datasets(zdx_pool_t *pool)
+{
+    if (!pool)
+        return make_error(EINVAL, "pool not open");
+
+    return make_error(ENOSYS, "pool datasets not implemented");
+}
+
+/*
+ * List MOS objects with optional type filter + pagination
+ */
+zdx_result_t
+zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
+    uint64_t start, uint64_t limit)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    char *array = json_array_start();
+    if (!array)
+        return make_error(ENOMEM, "failed to allocate JSON array");
+
+    uint64_t object = start;
+    uint64_t last_obj = 0;
+    int count = 0;
+    int err = 0;
+
+    while (count < (int)limit) {
+        err = dmu_object_next(mos, &object, B_FALSE, 0);
+        if (err != 0)
+            break;
+
+        dmu_object_info_t doi;
+        if (dmu_object_info(mos, object, &doi) != 0)
+            continue;
+
+        if (type_filter >= 0 &&
+            doi.doi_type != (dmu_object_type_t)type_filter)
+            continue;
+
+        char *type_name = json_string(dmu_ot_name_safe(doi.doi_type));
+        char *bonus_name = json_string(dmu_ot_name_safe(doi.doi_bonus_type));
+        if (!type_name || !bonus_name) {
+            free(type_name);
+            free(bonus_name);
+            free(array);
+            return make_error(ENOMEM, "failed to allocate JSON strings");
+        }
+
+        char *item = json_format(
+            "{\"id\":%llu,\"type\":%u,\"type_name\":%s,"
+            "\"bonus_type\":%u,\"bonus_type_name\":%s}",
+            (unsigned long long)object,
+            (unsigned)doi.doi_type,
+            type_name,
+            (unsigned)doi.doi_bonus_type,
+            bonus_name);
+        free(type_name);
+        free(bonus_name);
+
+        if (!item) {
+            free(array);
+            return make_error(ENOMEM, "failed to allocate JSON item");
+        }
+
+        char *new_array = json_array_append(array, item);
+        free(item);
+
+        if (!new_array) {
+            free(array);
+            return make_error(ENOMEM, "failed to append JSON item");
+        }
+
+        free(array);
+        array = new_array;
+        count++;
+        last_obj = object;
+    }
+
+    if (err != 0 && err != ENOENT && err != ESRCH) {
+        free(array);
+        return make_error(err, "dmu_object_next failed: %s", strerror(err));
+    }
+
+    char *objects_json = json_array_end(array, count > 0);
+    free(array);
+    if (!objects_json)
+        return make_error(ENOMEM, "failed to finalize JSON array");
+
+    int has_more = 0;
+    if (count > 0 && count == (int)limit) {
+        uint64_t peek = object;
+        if (dmu_object_next(mos, &peek, B_FALSE, 0) == 0)
+            has_more = 1;
+    }
+
+    char *next_json = has_more
+        ? json_format("%llu", (unsigned long long)last_obj)
+        : strdup("null");
+    if (!next_json) {
+        free(objects_json);
+        return make_error(ENOMEM, "failed to allocate next cursor");
+    }
+
+    char *result = json_format(
+        "{\"start\":%llu,\"limit\":%llu,\"count\":%d,"
+        "\"next\":%s,\"objects\":%s}",
+        (unsigned long long)start,
+        (unsigned long long)limit,
+        count,
+        next_json,
+        objects_json);
+    free(next_json);
+    free(objects_json);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * Get MOS object dnode metadata
+ */
+zdx_result_t
+zdx_mos_get_object(zdx_pool_t *pool, uint64_t objid)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    dnode_t *dn = NULL;
+    int err = dnode_hold(mos, objid, FTAG, &dn);
+    if (err != 0)
+        return make_error(err, "dnode_hold failed for object %llu",
+            (unsigned long long)objid);
+
+    dmu_object_info_t doi;
+    dmu_object_info_from_dnode(dn, &doi);
+
+    dnode_phys_t *dnp = dn->dn_phys;
+    if (!dnp) {
+        dnode_rele(dn, FTAG);
+        return make_error(EIO, "missing dnode phys for object %llu",
+            (unsigned long long)objid);
+    }
+
+    char *type_name = json_string(dmu_ot_name_safe(doi.doi_type));
+    char *bonus_name = json_string(dmu_ot_name_safe(doi.doi_bonus_type));
+    if (!type_name || !bonus_name) {
+        free(type_name);
+        free(bonus_name);
+        dnode_rele(dn, FTAG);
+        return make_error(ENOMEM, "failed to allocate JSON strings");
+    }
+
+    uint64_t used_bytes = DN_USED_BYTES(dnp);
+    uint64_t indirect_block_size = 1ULL << dnp->dn_indblkshift;
+    int is_zap = (DMU_OT_BYTESWAP(doi.doi_type) == DMU_BSWAP_ZAP);
+
+    char *bonus_decoded = strdup("null");
+    if (!bonus_decoded) {
+        free(type_name);
+        free(bonus_name);
+        dnode_rele(dn, FTAG);
+        return make_error(ENOMEM, "failed to allocate bonus JSON");
+    }
+
+    char *edges = json_array_start();
+    if (!edges) {
+        free(bonus_decoded);
+        free(type_name);
+        free(bonus_name);
+        dnode_rele(dn, FTAG);
+        return make_error(ENOMEM, "failed to allocate edges array");
+    }
+    int edge_count = 0;
+
+    if (doi.doi_bonus_type == DMU_OT_DSL_DIR &&
+        dnp->dn_bonuslen >= sizeof (dsl_dir_phys_t)) {
+        dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dnp);
+        free(bonus_decoded);
+        bonus_decoded = json_format(
+            "{"
+            "\"kind\":\"dsl_dir\","
+            "\"head_dataset_obj\":%llu,"
+            "\"parent_dir_obj\":%llu,"
+            "\"origin_obj\":%llu,"
+            "\"child_dir_zapobj\":%llu,"
+            "\"props_zapobj\":%llu"
+            "}",
+            (unsigned long long)dd->dd_head_dataset_obj,
+            (unsigned long long)dd->dd_parent_obj,
+            (unsigned long long)dd->dd_origin_obj,
+            (unsigned long long)dd->dd_child_dir_zapobj,
+            (unsigned long long)dd->dd_props_zapobj);
+
+        if (!bonus_decoded) {
+            free(edges);
+            free(type_name);
+            free(bonus_name);
+            dnode_rele(dn, FTAG);
+            return make_error(ENOMEM, "failed to allocate bonus JSON");
+        }
+
+        if (dd->dd_child_dir_zapobj != 0) {
+            if (append_semantic_edge(&edges, &edge_count, objid,
+                dd->dd_child_dir_zapobj, "child_dir_zapobj",
+                "dsl_child_dir_zapobj", 1.0) != 0) {
+                free(edges);
+                free(bonus_decoded);
+                free(type_name);
+                free(bonus_name);
+                dnode_rele(dn, FTAG);
+                return make_error(ENOMEM, "failed to append edge");
+            }
+        }
+        if (dd->dd_head_dataset_obj != 0) {
+            if (append_semantic_edge(&edges, &edge_count, objid,
+                dd->dd_head_dataset_obj, "head_dataset_obj",
+                "dsl_head_dataset_obj", 1.0) != 0) {
+                free(edges);
+                free(bonus_decoded);
+                free(type_name);
+                free(bonus_name);
+                dnode_rele(dn, FTAG);
+                return make_error(ENOMEM, "failed to append edge");
+            }
+        }
+        if (dd->dd_props_zapobj != 0) {
+            if (append_semantic_edge(&edges, &edge_count, objid,
+                dd->dd_props_zapobj, "props_zapobj",
+                "dsl_props_zapobj", 1.0) != 0) {
+                free(edges);
+                free(bonus_decoded);
+                free(type_name);
+                free(bonus_name);
+                dnode_rele(dn, FTAG);
+                return make_error(ENOMEM, "failed to append edge");
+            }
+        }
+        if (dd->dd_origin_obj != 0) {
+            if (append_semantic_edge(&edges, &edge_count, objid,
+                dd->dd_origin_obj, "origin_obj",
+                "dsl_origin_obj", 1.0) != 0) {
+                free(edges);
+                free(bonus_decoded);
+                free(type_name);
+                free(bonus_name);
+                dnode_rele(dn, FTAG);
+                return make_error(ENOMEM, "failed to append edge");
+            }
+        }
+        if (dd->dd_parent_obj != 0) {
+            if (append_semantic_edge(&edges, &edge_count, objid,
+                dd->dd_parent_obj, "parent_dir_obj",
+                "dsl_parent_dir_obj", 1.0) != 0) {
+                free(edges);
+                free(bonus_decoded);
+                free(type_name);
+                free(bonus_name);
+                dnode_rele(dn, FTAG);
+                return make_error(ENOMEM, "failed to append edge");
+            }
+        }
+    } else if (doi.doi_bonus_type == DMU_OT_DSL_DATASET &&
+        dnp->dn_bonuslen >= sizeof (dsl_dataset_phys_t)) {
+        dsl_dataset_phys_t *ds = (dsl_dataset_phys_t *)DN_BONUS(dnp);
+        /* TODO: Decode more DSL dataset fields (objset, snapshots ZAP, etc.) */
+        free(bonus_decoded);
+        bonus_decoded = json_format(
+            "{"
+            "\"kind\":\"dsl_dataset\","
+            "\"dir_obj\":%llu,"
+            "\"prev_snap_obj\":%llu,"
+            "\"next_snap_obj\":%llu,"
+            "\"snapnames_zapobj\":%llu"
+            "}",
+            (unsigned long long)ds->ds_dir_obj,
+            (unsigned long long)ds->ds_prev_snap_obj,
+            (unsigned long long)ds->ds_next_snap_obj,
+            (unsigned long long)ds->ds_snapnames_zapobj);
+
+        if (!bonus_decoded) {
+            free(edges);
+            free(type_name);
+            free(bonus_name);
+            dnode_rele(dn, FTAG);
+            return make_error(ENOMEM, "failed to allocate bonus JSON");
+        }
+    }
+
+    char *edges_json = json_array_end(edges, edge_count > 0);
+    free(edges);
+    if (!edges_json) {
+        free(bonus_decoded);
+        free(type_name);
+        free(bonus_name);
+        dnode_rele(dn, FTAG);
+        return make_error(ENOMEM, "failed to finalize edges JSON");
+    }
+
+    char *result = json_format(
+        "{"
+        "\"id\":%llu,"
+        "\"type\":{\"id\":%u,\"name\":%s},"
+        "\"bonus_type\":{\"id\":%u,\"name\":%s},"
+        "\"is_zap\":%s,"
+        "\"bonus_decoded\":%s,"
+        "\"semantic_edges\":%s,"
+        "\"nlevels\":%u,"
+        "\"nblkptr\":%u,"
+        "\"indblkshift\":%u,"
+        "\"indirect_block_size\":%llu,"
+        "\"data_block_size\":%u,"
+        "\"metadata_block_size\":%u,"
+        "\"bonus_size\":%llu,"
+        "\"bonus_len\":%u,"
+        "\"checksum\":%u,"
+        "\"compress\":%u,"
+        "\"flags\":%u,"
+        "\"maxblkid\":%llu,"
+        "\"used_bytes\":%llu,"
+        "\"fill_count\":%llu,"
+        "\"physical_blocks_512\":%llu,"
+        "\"max_offset\":%llu,"
+        "\"indirection\":%u,"
+        "\"dnodesize\":%llu"
+        "}",
+        (unsigned long long)objid,
+        (unsigned)doi.doi_type,
+        type_name,
+        (unsigned)doi.doi_bonus_type,
+        bonus_name,
+        is_zap ? "true" : "false",
+        bonus_decoded,
+        edges_json,
+        (unsigned)dnp->dn_nlevels,
+        (unsigned)dnp->dn_nblkptr,
+        (unsigned)dnp->dn_indblkshift,
+        (unsigned long long)indirect_block_size,
+        (unsigned)doi.doi_data_block_size,
+        (unsigned)doi.doi_metadata_block_size,
+        (unsigned long long)doi.doi_bonus_size,
+        (unsigned)dnp->dn_bonuslen,
+        (unsigned)dnp->dn_checksum,
+        (unsigned)dnp->dn_compress,
+        (unsigned)dnp->dn_flags,
+        (unsigned long long)dnp->dn_maxblkid,
+        (unsigned long long)used_bytes,
+        (unsigned long long)doi.doi_fill_count,
+        (unsigned long long)doi.doi_physical_blocks_512,
+        (unsigned long long)doi.doi_max_offset,
+        (unsigned)doi.doi_indirection,
+        (unsigned long long)doi.doi_dnodesize);
+
+    free(bonus_decoded);
+    free(edges_json);
+    free(type_name);
+    free(bonus_name);
+    dnode_rele(dn, FTAG);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * Convert blkptr to JSON object
+ */
+static char *
+blkptr_to_json(const blkptr_t *bp, int index, int is_spill)
+{
+    int is_hole = BP_IS_HOLE(bp);
+    int is_embedded = BP_IS_EMBEDDED(bp);
+    int is_gang = BP_IS_GANG(bp);
+    int dedup = BP_GET_DEDUP(bp);
+    int level = BP_GET_LEVEL(bp);
+    int type = BP_GET_TYPE(bp);
+    uint64_t lsize = BP_GET_LSIZE(bp);
+    uint64_t psize = BP_GET_PSIZE(bp);
+    uint64_t asize = BP_GET_ASIZE(bp);
+    uint64_t birth = BP_GET_BIRTH(bp);
+    uint64_t logical_birth = BP_GET_LOGICAL_BIRTH(bp);
+    uint64_t physical_birth = BP_GET_PHYSICAL_BIRTH(bp);
+    uint64_t fill = BP_GET_FILL(bp);
+    int checksum = BP_GET_CHECKSUM(bp);
+    int compress = BP_GET_COMPRESS(bp);
+    int ndvas = BP_GET_NDVAS(bp);
+
+    char *dvas = json_array_start();
+    if (!dvas)
+        return NULL;
+
+    int dva_count = 0;
+    for (int i = 0; i < SPA_DVAS_PER_BP; i++) {
+        const dva_t *dva = &bp->blk_dva[i];
+        if (!DVA_IS_VALID(dva))
+            continue;
+
+        char *item = json_format(
+            "{\"vdev\":%llu,\"offset\":%llu,\"asize\":%llu,"
+            "\"is_gang\":%s}",
+            (unsigned long long)DVA_GET_VDEV(dva),
+            (unsigned long long)DVA_GET_OFFSET(dva),
+            (unsigned long long)DVA_GET_ASIZE(dva),
+            DVA_GET_GANG(dva) ? "true" : "false");
+        if (!item) {
+            free(dvas);
+            return NULL;
+        }
+
+        char *new_dvas = json_array_append(dvas, item);
+        free(item);
+        if (!new_dvas) {
+            free(dvas);
+            return NULL;
+        }
+
+        free(dvas);
+        dvas = new_dvas;
+        dva_count++;
+    }
+
+    char *dvas_json = json_array_end(dvas, dva_count > 0);
+    free(dvas);
+    if (!dvas_json)
+        return NULL;
+
+    char *result = json_format(
+        "{"
+        "\"index\":%d,"
+        "\"is_spill\":%s,"
+        "\"is_hole\":%s,"
+        "\"is_embedded\":%s,"
+        "\"is_gang\":%s,"
+        "\"level\":%d,"
+        "\"type\":%d,"
+        "\"lsize\":%llu,"
+        "\"psize\":%llu,"
+        "\"asize\":%llu,"
+        "\"birth_txg\":%llu,"
+        "\"logical_birth\":%llu,"
+        "\"physical_birth\":%llu,"
+        "\"fill\":%llu,"
+        "\"checksum\":%d,"
+        "\"compression\":%d,"
+        "\"dedup\":%s,"
+        "\"ndvas\":%d,"
+        "\"dvas\":%s"
+        "}",
+        index,
+        is_spill ? "true" : "false",
+        is_hole ? "true" : "false",
+        is_embedded ? "true" : "false",
+        is_gang ? "true" : "false",
+        level,
+        type,
+        (unsigned long long)lsize,
+        (unsigned long long)psize,
+        (unsigned long long)asize,
+        (unsigned long long)birth,
+        (unsigned long long)logical_birth,
+        (unsigned long long)physical_birth,
+        (unsigned long long)fill,
+        checksum,
+        compress,
+        dedup ? "true" : "false",
+        ndvas,
+        dvas_json);
+
+    free(dvas_json);
+    return result;
+}
+
+/*
+ * Get MOS object blkptrs
+ */
+zdx_result_t
+zdx_mos_get_blkptrs(zdx_pool_t *pool, uint64_t objid)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    dnode_t *dn = NULL;
+    int err = dnode_hold(mos, objid, FTAG, &dn);
+    if (err != 0)
+        return make_error(err, "dnode_hold failed for object %llu",
+            (unsigned long long)objid);
+
+    dnode_phys_t *dnp = dn->dn_phys;
+    if (!dnp) {
+        dnode_rele(dn, FTAG);
+        return make_error(EIO, "missing dnode phys for object %llu",
+            (unsigned long long)objid);
+    }
+
+    char *array = json_array_start();
+    if (!array) {
+        dnode_rele(dn, FTAG);
+        return make_error(ENOMEM, "failed to allocate JSON array");
+    }
+
+    int count = 0;
+    for (int i = 0; i < dnp->dn_nblkptr; i++) {
+        blkptr_t *bp = &dnp->dn_blkptr[i];
+        char *item = blkptr_to_json(bp, i, 0);
+        if (!item) {
+            free(array);
+            dnode_rele(dn, FTAG);
+            return make_error(ENOMEM, "failed to build blkptr JSON");
+        }
+
+        char *new_array = json_array_append(array, item);
+        free(item);
+        if (!new_array) {
+            free(array);
+            dnode_rele(dn, FTAG);
+            return make_error(ENOMEM, "failed to append blkptr JSON");
+        }
+
+        free(array);
+        array = new_array;
+        count++;
+    }
+
+    int has_spill = (dnp->dn_flags & DNODE_FLAG_SPILL_BLKPTR) != 0;
+    if (has_spill) {
+        blkptr_t *spill = DN_SPILL_BLKPTR(dnp);
+        char *item = blkptr_to_json(spill, dnp->dn_nblkptr, 1);
+        if (!item) {
+            free(array);
+            dnode_rele(dn, FTAG);
+            return make_error(ENOMEM, "failed to build spill blkptr JSON");
+        }
+
+        char *new_array = json_array_append(array, item);
+        free(item);
+        if (!new_array) {
+            free(array);
+            dnode_rele(dn, FTAG);
+            return make_error(ENOMEM, "failed to append spill blkptr JSON");
+        }
+
+        free(array);
+        array = new_array;
+        count++;
+    }
+
+    char *blkptrs_json = json_array_end(array, count > 0);
+    free(array);
+    if (!blkptrs_json) {
+        dnode_rele(dn, FTAG);
+        return make_error(ENOMEM, "failed to finalize blkptrs JSON");
+    }
+
+    char *result = json_format(
+        "{"
+        "\"id\":%llu,"
+        "\"nblkptr\":%u,"
+        "\"has_spill\":%s,"
+        "\"blkptrs\":%s"
+        "}",
+        (unsigned long long)objid,
+        (unsigned)dnp->dn_nblkptr,
+        has_spill ? "true" : "false",
+        blkptrs_json);
+    free(blkptrs_json);
+    dnode_rele(dn, FTAG);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * Unified object fetch: dnode + blkptrs + optional ZAP
+ */
+zdx_result_t
+zdx_obj_get(zdx_pool_t *pool, uint64_t objid)
+{
+    zdx_result_t obj = zdx_mos_get_object(pool, objid);
+    if (obj.err != 0)
+        return obj;
+
+    zdx_result_t blk = zdx_mos_get_blkptrs(pool, objid);
+    if (blk.err != 0) {
+        zdx_free_result(&obj);
+        return blk;
+    }
+
+    /* Determine if this is a ZAP object by inspecting the object JSON. */
+    boolean_t is_zap = B_FALSE;
+    if (obj.json != NULL && strstr(obj.json, "\"is_zap\":true") != NULL)
+        is_zap = B_TRUE;
+
+    zdx_result_t zinfo = {0};
+    zdx_result_t zents = {0};
+    if (is_zap) {
+        zinfo = zdx_zap_info(pool, objid);
+        if (zinfo.err != 0) {
+            zdx_free_result(&obj);
+            zdx_free_result(&blk);
+            return zinfo;
+        }
+        zents = zdx_zap_entries(pool, objid, 0, 200);
+        if (zents.err != 0) {
+            zdx_free_result(&obj);
+            zdx_free_result(&blk);
+            zdx_free_result(&zinfo);
+            return zents;
+        }
+    }
+
+    const char *zap_info_json = is_zap ? zinfo.json : "null";
+    const char *zap_entries_json = is_zap ? zents.json : "null";
+
+    char *result = json_format(
+        "{"
+        "\"object\":%s,"
+        "\"blkptrs\":%s,"
+        "\"zap_info\":%s,"
+        "\"zap_entries\":%s"
+        "}",
+        obj.json,
+        blk.json,
+        zap_info_json,
+        zap_entries_json);
+
+    zdx_free_result(&obj);
+    zdx_free_result(&blk);
+    if (is_zap) {
+        zdx_free_result(&zinfo);
+        zdx_free_result(&zents);
+    }
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * DSL dir children
+ */
+zdx_result_t
+zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    dnode_t *dn = NULL;
+    int err = dnode_hold(mos, objid, FTAG, &dn);
+    if (err != 0)
+        return make_error(err, "dnode_hold failed for object %llu",
+            (unsigned long long)objid);
+
+    dmu_object_info_t doi;
+    dmu_object_info_from_dnode(dn, &doi);
+
+    if (doi.doi_bonus_type != DMU_OT_DSL_DIR ||
+        dn->dn_bonuslen < sizeof (dsl_dir_phys_t)) {
+        dnode_rele(dn, FTAG);
+        return make_error(EINVAL, "object %llu is not DSL dir",
+            (unsigned long long)objid);
+    }
+
+    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dn->dn_phys);
+    uint64_t zapobj = dd->dd_child_dir_zapobj;
+    dnode_rele(dn, FTAG);
+
+    char *array = json_array_start();
+    if (!array)
+        return make_error(ENOMEM, "failed to allocate JSON array");
+    int count = 0;
+
+    if (zapobj != 0) {
+        zap_cursor_t zc;
+        zap_cursor_init(&zc, mos, zapobj);
+        zap_attribute_t *attrp = zap_attribute_long_alloc();
+        if (!attrp) {
+            zap_cursor_fini(&zc);
+            free(array);
+            return make_error(ENOMEM, "failed to allocate zap attribute");
+        }
+
+        while ((err = zap_cursor_retrieve(&zc, attrp)) == 0) {
+            uint64_t child_obj = 0;
+            if (attrp->za_integer_length == 8 &&
+                attrp->za_num_integers == 1) {
+                (void) zap_lookup(mos, zapobj, attrp->za_name,
+                    8, 1, &child_obj);
+            }
+
+            // Skip entries with invalid object IDs
+            if (child_obj == 0) {
+                zap_cursor_advance(&zc);
+                continue;
+            }
+
+            // Validate that the child object exists and is a DSL directory
+            dnode_t *child_dn = NULL;
+            int child_err = dnode_hold(mos, child_obj, FTAG, &child_dn);
+            if (child_err != 0) {
+                // Skip non-existent objects
+                zap_cursor_advance(&zc);
+                continue;
+            }
+
+            dmu_object_info_t child_doi;
+            dmu_object_info_from_dnode(child_dn, &child_doi);
+            dnode_rele(child_dn, FTAG);
+
+            // Skip if not a DSL directory
+            if (child_doi.doi_bonus_type != DMU_OT_DSL_DIR) {
+                zap_cursor_advance(&zc);
+                continue;
+            }
+
+            char *name_json = json_string(attrp->za_name);
+            if (!name_json) {
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                free(array);
+                return make_error(ENOMEM, "failed to allocate name");
+            }
+
+            char *item = json_format(
+                "{\"name\":%s,\"dir_objid\":%llu}",
+                name_json,
+                (unsigned long long)child_obj);
+            free(name_json);
+            if (!item) {
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                free(array);
+                return make_error(ENOMEM, "failed to allocate JSON item");
+            }
+
+            char *new_array = json_array_append(array, item);
+            free(item);
+            if (!new_array) {
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                free(array);
+                return make_error(ENOMEM, "failed to append JSON item");
+            }
+            free(array);
+            array = new_array;
+            count++;
+
+            zap_cursor_advance(&zc);
+        }
+
+        if (err != 0 && err != ENOENT) {
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            free(array);
+            return make_error(err, "zap_cursor_retrieve failed: %s",
+                strerror(err));
+        }
+
+        zap_attribute_free(attrp);
+        zap_cursor_fini(&zc);
+    }
+
+    char *children_json = json_array_end(array, count > 0);
+    free(array);
+    if (!children_json)
+        return make_error(ENOMEM, "failed to finalize JSON array");
+
+    char *result = json_format(
+        "{"
+        "\"dir_objid\":%llu,"
+        "\"child_dir_zapobj\":%llu,"
+        "\"children\":%s"
+        "}",
+        (unsigned long long)objid,
+        (unsigned long long)zapobj,
+        children_json);
+    free(children_json);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * DSL dir head dataset
+ */
+zdx_result_t
+zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    dnode_t *dn = NULL;
+    int err = dnode_hold(mos, objid, FTAG, &dn);
+    if (err != 0)
+        return make_error(err, "dnode_hold failed for object %llu",
+            (unsigned long long)objid);
+
+    dmu_object_info_t doi;
+    dmu_object_info_from_dnode(dn, &doi);
+    if (doi.doi_bonus_type != DMU_OT_DSL_DIR ||
+        dn->dn_bonuslen < sizeof (dsl_dir_phys_t)) {
+        dnode_rele(dn, FTAG);
+        return make_error(EINVAL, "object %llu is not DSL dir",
+            (unsigned long long)objid);
+    }
+
+    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dn->dn_phys);
+    uint64_t head = dd->dd_head_dataset_obj;
+    dnode_rele(dn, FTAG);
+
+    char *result = json_format(
+        "{\"dir_objid\":%llu,\"head_dataset_obj\":%llu}",
+        (unsigned long long)objid,
+        (unsigned long long)head);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * DSL root dir discovery
+ */
+zdx_result_t
+zdx_dsl_root_dir(zdx_pool_t *pool)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    // Note: DMU_POOL_ROOT_DATASET actually points to the root *directory* object,
+    // not a dataset. This is confusing OpenZFS naming.
+    uint64_t root_dir = 0;
+    int err = zap_lookup(mos, DMU_POOL_DIRECTORY_OBJECT,
+        DMU_POOL_ROOT_DATASET, 8, 1, &root_dir);
+    if (err != 0)
+        return make_error(err, "failed to lookup root_dataset: %s",
+            strerror(err));
+
+    // Read the directory's head_dataset_obj to get the actual root dataset
+    dmu_buf_t *db = NULL;
+    err = dmu_bonus_hold(mos, root_dir, FTAG, &db);
+    if (err != 0)
+        return make_error(err, "dmu_bonus_hold failed for root dir %llu",
+            (unsigned long long)root_dir);
+
+    if (db->db_size < sizeof (dsl_dir_phys_t)) {
+        dmu_buf_rele(db, FTAG);
+        return make_error(EINVAL, "root dir bonus too small");
+    }
+
+    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)db->db_data;
+    uint64_t root_dataset = dd->dd_head_dataset_obj;
+    dmu_buf_rele(db, FTAG);
+
+    char *result = json_format(
+        "{"
+        "\"root_dataset_obj\":%llu,"
+        "\"root_dir_obj\":%llu"
+        "}",
+        (unsigned long long)root_dataset,
+        (unsigned long long)root_dir);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * List DMU object types
+ */
+zdx_result_t
+zdx_list_dmu_types(void)
+{
+    char *array = json_array_start();
+    if (!array)
+        return make_error(ENOMEM, "failed to allocate JSON array");
+
+    int count = 0;
+    for (int i = 0; i < DMU_OT_NUMTYPES; i++) {
+        const char *name = dmu_ot[i].ot_name ? dmu_ot[i].ot_name : "unknown";
+        char *name_json = json_string(name);
+        if (!name_json) {
+            free(array);
+            return make_error(ENOMEM, "failed to allocate JSON string");
+        }
+
+        char *item = json_format(
+            "{\"id\":%d,\"name\":%s,\"metadata\":%s,\"encrypted\":%s}",
+            i,
+            name_json,
+            dmu_ot[i].ot_metadata ? "true" : "false",
+            dmu_ot[i].ot_encrypt ? "true" : "false");
+        free(name_json);
+
+        if (!item) {
+            free(array);
+            return make_error(ENOMEM, "failed to allocate JSON item");
+        }
+
+        char *new_array = json_array_append(array, item);
+        free(item);
+        if (!new_array) {
+            free(array);
+            return make_error(ENOMEM, "failed to append JSON item");
+        }
+
+        free(array);
+        array = new_array;
+        count++;
+    }
+
+    char *final_json = json_array_end(array, count > 0);
+    free(array);
+    if (!final_json)
+        return make_error(ENOMEM, "failed to finalize JSON");
+
+    return make_success(final_json);
 }
 
 /*
@@ -200,85 +1379,368 @@ zdx_version(void)
 }
 
 /*
- * Stub implementations for M1/M2 functions
+ * Stub implementations for M2 functions
  */
-
-zdx_pool_t *
-zdx_pool_open(const char *name, int *err)
-{
-    *err = ENOSYS;
-    return NULL;
-}
-
-void
-zdx_pool_close(zdx_pool_t *pool)
-{
-    (void)pool;
-}
-
-zdx_result_t
-zdx_pool_info(zdx_pool_t *pool)
-{
-    (void)pool;
-    return make_error(ENOSYS, "not implemented");
-}
-
-zdx_result_t
-zdx_pool_vdevs(zdx_pool_t *pool)
-{
-    (void)pool;
-    return make_error(ENOSYS, "not implemented");
-}
-
-zdx_result_t
-zdx_pool_datasets(zdx_pool_t *pool)
-{
-    (void)pool;
-    return make_error(ENOSYS, "not implemented");
-}
-
-zdx_result_t
-zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
-                     uint64_t start, uint64_t limit)
-{
-    (void)pool;
-    (void)type_filter;
-    (void)start;
-    (void)limit;
-    return make_error(ENOSYS, "not implemented");
-}
-
-zdx_result_t
-zdx_mos_get_object(zdx_pool_t *pool, uint64_t objid)
-{
-    (void)pool;
-    (void)objid;
-    return make_error(ENOSYS, "not implemented");
-}
-
-zdx_result_t
-zdx_mos_get_blkptrs(zdx_pool_t *pool, uint64_t objid)
-{
-    (void)pool;
-    (void)objid;
-    return make_error(ENOSYS, "not implemented");
-}
 
 zdx_result_t
 zdx_zap_info(zdx_pool_t *pool, uint64_t objid)
 {
-    (void)pool;
-    (void)objid;
-    return make_error(ENOSYS, "not implemented");
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    zap_stats_t zs;
+    int err = zap_get_stats(mos, objid, &zs);
+    if (err != 0)
+        return make_error(err, "zap_get_stats failed: %s", strerror(err));
+
+    int is_micro = (zs.zs_ptrtbl_len == 0);
+    char *result = json_format(
+        "{"
+        "\"object\":%llu,"
+        "\"kind\":\"%s\","
+        "\"block_size\":%llu,"
+        "\"num_entries\":%llu,"
+        "\"num_blocks\":%llu,"
+        "\"num_leafs\":%llu,"
+        "\"ptrtbl_len\":%llu,"
+        "\"ptrtbl_zt_blk\":%llu,"
+        "\"ptrtbl_zt_numblks\":%llu,"
+        "\"ptrtbl_zt_shift\":%llu,"
+        "\"ptrtbl_blks_copied\":%llu,"
+        "\"ptrtbl_nextblk\":%llu,"
+        "\"zap_block_type\":%llu,"
+        "\"zap_magic\":%llu,"
+        "\"zap_salt\":%llu"
+        "}",
+        (unsigned long long)objid,
+        is_micro ? "microzap" : "fatzap",
+        (unsigned long long)zs.zs_blocksize,
+        (unsigned long long)zs.zs_num_entries,
+        (unsigned long long)zs.zs_num_blocks,
+        (unsigned long long)zs.zs_num_leafs,
+        (unsigned long long)zs.zs_ptrtbl_len,
+        (unsigned long long)zs.zs_ptrtbl_zt_blk,
+        (unsigned long long)zs.zs_ptrtbl_zt_numblks,
+        (unsigned long long)zs.zs_ptrtbl_zt_shift,
+        (unsigned long long)zs.zs_ptrtbl_blks_copied,
+        (unsigned long long)zs.zs_ptrtbl_nextblk,
+        (unsigned long long)zs.zs_block_type,
+        (unsigned long long)zs.zs_magic,
+        (unsigned long long)zs.zs_salt);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
 }
 
 zdx_result_t
 zdx_zap_entries(zdx_pool_t *pool, uint64_t objid,
                uint64_t cursor, uint64_t limit)
 {
-    (void)pool;
-    (void)objid;
-    (void)cursor;
-    (void)limit;
-    return make_error(ENOSYS, "not implemented");
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    zap_cursor_t zc;
+    zap_cursor_init_serialized(&zc, mos, objid, cursor);
+
+    zap_attribute_t *attrp = zap_attribute_long_alloc();
+    if (!attrp) {
+        zap_cursor_fini(&zc);
+        return make_error(ENOMEM, "failed to allocate zap attribute");
+    }
+
+    char *array = json_array_start();
+    if (!array) {
+        zap_attribute_free(attrp);
+        zap_cursor_fini(&zc);
+        return make_error(ENOMEM, "failed to allocate JSON array");
+    }
+
+    uint64_t count = 0;
+    int err = 0;
+    int done = 0;
+    const size_t max_value_bytes = 1024 * 1024;
+
+    while (count < limit) {
+        err = zap_cursor_retrieve(&zc, attrp);
+        if (err == ENOENT) {
+            done = 1;
+            break;
+        }
+        if (err != 0) {
+            free(array);
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            return make_error(err, "zap_cursor_retrieve failed: %s",
+                strerror(err));
+        }
+
+        boolean_t key64 =
+            !!(zap_getflags(zc.zc_zap) & ZAP_FLAG_UINT64_KEY);
+
+        uint64_t key_u64 = 0;
+        char *name_json = NULL;
+        if (key64) {
+            memcpy(&key_u64, attrp->za_name, sizeof (uint64_t));
+            char *key_str = json_format("0x%016llx",
+                (unsigned long long)key_u64);
+            if (!key_str) {
+                free(array);
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                return make_error(ENOMEM, "failed to allocate key string");
+            }
+            name_json = json_string(key_str);
+            free(key_str);
+        } else {
+            name_json = json_string(attrp->za_name);
+        }
+
+        if (!name_json) {
+            free(array);
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            return make_error(ENOMEM, "failed to allocate name string");
+        }
+
+        uint64_t value_u64 = 0;
+        int maybe_ref = 0;
+        uint64_t target_obj = 0;
+        char *value_preview = NULL;
+        int truncated = 0;
+
+        if (attrp->za_num_integers > 0) {
+            size_t size = (size_t)attrp->za_num_integers *
+                (size_t)attrp->za_integer_length;
+            if (size > max_value_bytes) {
+                truncated = 1;
+                value_preview = strdup("(truncated)");
+            } else {
+                void *prop = calloc(1, size);
+                if (!prop) {
+                    free(name_json);
+                    free(array);
+                    zap_attribute_free(attrp);
+                    zap_cursor_fini(&zc);
+                    return make_error(ENOMEM, "failed to allocate zap value");
+                }
+
+                int lookup_err;
+                if (key64) {
+                    lookup_err = zap_lookup_uint64(mos, objid,
+                        (const uint64_t *)attrp->za_name, 1,
+                        attrp->za_integer_length,
+                        attrp->za_num_integers, prop);
+                } else {
+                    lookup_err = zap_lookup(mos, objid, attrp->za_name,
+                        attrp->za_integer_length,
+                        attrp->za_num_integers, prop);
+                }
+
+                if (lookup_err != 0) {
+                    free(prop);
+                    free(name_json);
+                    free(array);
+                    zap_attribute_free(attrp);
+                    zap_cursor_fini(&zc);
+                    return make_error(lookup_err, "zap_lookup failed: %s",
+                        strerror(lookup_err));
+                }
+
+                if (attrp->za_integer_length == 8 &&
+                    attrp->za_num_integers == 1) {
+                    value_u64 = ((uint64_t *)prop)[0];
+                    if (value_u64 != 0) {
+                        dmu_object_info_t tmp;
+                        if (dmu_object_info(mos, value_u64, &tmp) == 0) {
+                            maybe_ref = 1;
+                            target_obj = value_u64;
+                        }
+                    }
+                }
+
+                if (attrp->za_integer_length == 1) {
+                    uint8_t *u8 = (uint8_t *)prop;
+                    int printable = 1;
+                    for (uint64_t i = 0; i < attrp->za_num_integers; i++) {
+                        if (u8[i] == 0) {
+                            if (i + 1 != attrp->za_num_integers) {
+                                printable = 0;
+                                break;
+                            }
+                            continue;
+                        }
+                        if (!isprint(u8[i]) && !isspace(u8[i])) {
+                            printable = 0;
+                            break;
+                        }
+                    }
+
+                    if (printable) {
+                        size_t slen = attrp->za_num_integers;
+                        if (slen > 0 && u8[slen - 1] == 0)
+                            slen--;
+                        char *tmp = malloc(slen + 1);
+                        if (tmp) {
+                            memcpy(tmp, u8, slen);
+                            tmp[slen] = '\0';
+                            value_preview = tmp;
+                        }
+                    }
+
+                    if (!value_preview) {
+                        value_preview = bytes_to_hex(u8,
+                            (size_t)attrp->za_num_integers);
+                    }
+                } else {
+                    value_preview = numbers_preview(prop,
+                        attrp->za_num_integers, attrp->za_integer_length);
+                }
+
+                free(prop);
+            }
+        } else {
+            value_preview = strdup("");
+        }
+
+        if (!value_preview)
+            value_preview = strdup("");
+
+        char *value_json = json_string(value_preview);
+        if (!value_json) {
+            free(value_preview);
+            free(name_json);
+            free(array);
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            return make_error(ENOMEM, "failed to allocate value string");
+        }
+
+        char key_buf[32];
+        char value_buf[32];
+        const char *key_json = "null";
+        const char *value_u64_json = "null";
+        const char *ref_json = "null";
+        const char *target_json = "null";
+
+        if (key64) {
+            (void)snprintf(key_buf, sizeof (key_buf), "%llu",
+                (unsigned long long)key_u64);
+            key_json = key_buf;
+        }
+
+        if (attrp->za_integer_length == 8 && attrp->za_num_integers == 1) {
+            (void)snprintf(value_buf, sizeof (value_buf), "%llu",
+                (unsigned long long)value_u64);
+            value_u64_json = value_buf;
+            ref_json = value_buf;
+        }
+        if (maybe_ref) {
+            (void)snprintf(value_buf, sizeof (value_buf), "%llu",
+                (unsigned long long)target_obj);
+            target_json = value_buf;
+        }
+
+        char *item = json_format(
+            "{"
+            "\"name\":%s,"
+            "\"key_u64\":%s,"
+            "\"integer_length\":%d,"
+            "\"num_integers\":%llu,"
+            "\"value_preview\":%s,"
+            "\"value_u64\":%s,"
+            "\"ref_objid\":%s,"
+            "\"maybe_object_ref\":%s,"
+            "\"target_obj\":%s,"
+            "\"truncated\":%s"
+            "}",
+            name_json,
+            key_json,
+            attrp->za_integer_length,
+            (unsigned long long)attrp->za_num_integers,
+            value_json,
+            value_u64_json,
+            ref_json,
+            maybe_ref ? "true" : "false",
+            target_json,
+            truncated ? "true" : "false");
+
+        free(value_preview);
+        free(value_json);
+        free(name_json);
+
+        if (!item) {
+            free(array);
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            return make_error(ENOMEM, "failed to allocate JSON item");
+        }
+
+        char *new_array = json_array_append(array, item);
+        free(item);
+        if (!new_array) {
+            free(array);
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            return make_error(ENOMEM, "failed to append JSON item");
+        }
+
+        free(array);
+        array = new_array;
+        count++;
+
+        zap_cursor_advance(&zc);
+    }
+
+    char *entries_json = json_array_end(array, count > 0);
+    free(array);
+    if (!entries_json) {
+        zap_attribute_free(attrp);
+        zap_cursor_fini(&zc);
+        return make_error(ENOMEM, "failed to finalize JSON array");
+    }
+
+    uint64_t next = 0;
+    if (!done)
+        next = zap_cursor_serialize(&zc);
+
+    char next_buf[32];
+    const char *next_json = "null";
+    if (!done) {
+        (void)snprintf(next_buf, sizeof (next_buf), "%llu",
+            (unsigned long long)next);
+        next_json = next_buf;
+    }
+
+    char *result = json_format(
+        "{"
+        "\"object\":%llu,"
+        "\"cursor\":%llu,"
+        "\"next\":%s,"
+        "\"count\":%llu,"
+        "\"entries\":%s"
+        "}",
+        (unsigned long long)objid,
+        (unsigned long long)cursor,
+        next_json,
+        (unsigned long long)count,
+        entries_json);
+
+    free(entries_json);
+    zap_attribute_free(attrp);
+    zap_cursor_fini(&zc);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
 }

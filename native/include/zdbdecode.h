@@ -39,11 +39,20 @@ zdx_result_t zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
                                    uint64_t start, uint64_t limit);
 zdx_result_t zdx_mos_get_object(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_mos_get_blkptrs(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_obj_get(zdx_pool_t *pool, uint64_t objid);
+
+/* === DMU type catalog === */
+zdx_result_t zdx_list_dmu_types(void);
 
 /* === ZAP operations === */
 zdx_result_t zdx_zap_info(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_zap_entries(zdx_pool_t *pool, uint64_t objid,
                              uint64_t cursor, uint64_t limit);
+
+/* === DSL traversal === */
+zdx_result_t zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_dsl_root_dir(zdx_pool_t *pool);
 
 /* === Version info === */
 const char *zdx_version(void); /* returns OpenZFS commit hash (injected at build time) */

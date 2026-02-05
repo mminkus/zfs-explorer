@@ -76,10 +76,120 @@ impl Drop for ZdxResult {
     }
 }
 
+#[derive(Debug)]
+pub struct PoolHandle {
+    pub name: String,
+    pub ptr: *mut zdx_pool_t,
+}
+
+unsafe impl Send for PoolHandle {}
+unsafe impl Sync for PoolHandle {}
+
 /// List all pools (behind mutex)
 pub fn list_pools() -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
     let raw = unsafe { zdx_list_pools() };
+    ZdxResult::from_raw(raw)
+}
+
+/// Open a pool (behind mutex)
+pub fn pool_open(name: &str) -> Result<PoolHandle, (i32, String)> {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let c_name = CString::new(name).map_err(|e| (-1, e.to_string()))?;
+    let mut err: i32 = 0;
+    let ptr = unsafe { zdx_pool_open(c_name.as_ptr(), &mut err) };
+    if ptr.is_null() {
+        let msg = format!("zdx_pool_open failed with code {}", err);
+        return Err((err, msg));
+    }
+
+    Ok(PoolHandle {
+        name: name.to_string(),
+        ptr,
+    })
+}
+
+/// Close a pool (behind mutex)
+pub fn pool_close(ptr: *mut zdx_pool_t) {
+    if ptr.is_null() {
+        return;
+    }
+    let _lock = FFI_MUTEX.lock().unwrap();
+    unsafe { zdx_pool_close(ptr) };
+}
+
+/// List MOS objects
+pub fn mos_list_objects(
+    pool: *mut zdx_pool_t,
+    type_filter: i32,
+    start: u64,
+    limit: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_mos_list_objects(pool, type_filter, start, limit) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Get MOS object info
+pub fn mos_get_object(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_mos_get_object(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Get MOS object blkptrs
+pub fn mos_get_blkptrs(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_mos_get_blkptrs(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Unified object fetch
+pub fn obj_get(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_obj_get(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// List DMU object types
+pub fn list_dmu_types() -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_list_dmu_types() };
+    ZdxResult::from_raw(raw)
+}
+
+/// Get ZAP info
+pub fn zap_info(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_zap_info(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Get ZAP entries
+pub fn zap_entries(pool: *mut zdx_pool_t, objid: u64, cursor: u64, limit: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_zap_entries(pool, objid, cursor, limit) };
+    ZdxResult::from_raw(raw)
+}
+
+/// DSL dir children
+pub fn dsl_dir_children(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dsl_dir_children(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// DSL dir head dataset
+pub fn dsl_dir_head(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dsl_dir_head(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// DSL root dir discovery
+pub fn dsl_root_dir(pool: *mut zdx_pool_t) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dsl_root_dir(pool) };
     ZdxResult::from_raw(raw)
 }
 

@@ -2,7 +2,7 @@
 
 A web-based ZFS on-disk structure explorer ("Wireshark for ZFS").
 
-**Current Status:** Milestone 0 (Proof of Life) - Complete ✅
+**Current Status:** Milestone 1 (MOS Object Browser) - Implemented ✅
 
 ## Architecture
 
@@ -17,6 +17,13 @@ React UI (port 8080) → Rust API (port 9000) → libzdbdecode.so → ZFS Librar
 - ✅ React UI displaying pool list
 - ✅ Global mutex for thread-safe ZFS calls
 - ✅ FFI with proper memory management (zdx_free_result)
+
+## What's Implemented (Milestone 1)
+
+- ✅ Pool open/close via libzpool (single active pool)
+- ✅ MOS object listing with pagination and type filtering
+- ✅ MOS object inspector (dnode fields + blkptrs)
+- ✅ Basic UI for browsing MOS objects and inspecting metadata
 
 ## Testing on nexus Host
 
@@ -116,9 +123,12 @@ zfs-explorer/
         └── App.css
 ```
 
-## API Endpoints (M0)
+## API Endpoints (M0 + M1)
 
 - `GET /api/pools` - List all imported pools (returns JSON array of strings)
+- `GET /api/pools/:pool/mos/objects?type=&start=&limit=` - List MOS objects
+- `GET /api/pools/:pool/obj/:objid` - MOS dnode metadata
+- `GET /api/pools/:pool/obj/:objid/blkptrs` - MOS block pointers
 
 ## Build from Scratch
 
@@ -157,12 +167,10 @@ npm install
 - Access via SSH tunnel for remote use
 - Requires root privileges (or ZFS capabilities) to access pools
 
-## Next Steps (Milestone 1)
+## Next Steps (Milestone 2)
 
-- Pool opening (`zdx_pool_open`)
-- MOS object listing
-- Dnode inspection
-- Block pointer decoding
+- ZAP decoding (microzap + fatzap)
+- Inspector table for ZAP entries
 
 ## Tech Stack
 
