@@ -2,7 +2,7 @@
 
 A web-based ZFS on-disk structure explorer ("Wireshark for ZFS").
 
-**Current Status:** Milestone 1 (MOS Object Browser) - Implemented ✅
+**Current Status:** Active development (MOS browser, ZAP decoding, DSL edges, hex dump, dataset tree, FS navigation in progress)
 
 ## Architecture
 
@@ -25,74 +25,57 @@ React UI (port 8080) → Rust API (port 9000) → libzdbdecode.so → ZFS Librar
 - ✅ MOS object inspector (dnode fields + blkptrs)
 - ✅ Basic UI for browsing MOS objects and inspecting metadata
 
-## Testing on nexus Host
+## Running on a Host with ZFS Access
 
-Since the LXC container doesn't have direct ZFS access, test on the nexus host:
+If your UI runs in a container/VM without ZFS access, run the backend on a host
+that can see `/dev/zfs`, then tunnel the ports.
 
-### 1. Copy the build to nexus
+### 1. Build on your dev machine
 
-From the container:
 ```bash
-# Copy the entire project (or just backend + native + _deps)
-rsync -av /home/martin/development/zfs-explorer martin@nexus:/home/martin/development/
+# Build native + backend
+cd native
+make clean && make
+cd ../backend
+cargo build
 ```
 
-### 2. Copy files to nexus
+### 2. Copy to the ZFS host (optional)
 
-From the container:
 ```bash
-rsync -av /home/martin/development/zfs-explorer/native martin@nexus:/nexus/local/home/martin/development/zfs-explorer/
-rsync -av /home/martin/development/zfs-explorer/_deps martin@nexus:/nexus/local/home/martin/development/zfs-explorer/
-rsync -av /home/martin/development/zfs-explorer/backend/target martin@nexus:/nexus/local/home/martin/development/zfs-explorer/backend/
+# Adjust USER/HOST/PATH to your environment
+rsync -av ./native ./_deps ./backend/target USER@HOST:/path/to/zfs-explorer/
 ```
 
-### 3. Run the backend on nexus
+### 3. Run the backend on the ZFS host
 
 ```bash
-ssh martin@nexus
-cd /nexus/local/home/martin/development/zfs-explorer/backend
-
-# Just run it - rpath is baked into the binary!
+ssh USER@HOST
+cd /path/to/zfs-explorer/backend
 sudo ./target/debug/zfs-explorer
 ```
 
-> **Note:** RUNPATH is baked into both the binary and `libzdbdecode.so` (via `.cargo/config.toml` and `native/Makefile`), so they automatically find all shared libraries without needing `LD_LIBRARY_PATH`.
-
 Expected output:
 ```
-2026-02-05T05:45:00.000000Z  INFO zfs_explorer: Initializing ZFS library...
-2026-02-05T05:45:00.000000Z  INFO zfs_explorer: ZFS Explorer starting (OpenZFS 21bbe7cb6)
-2026-02-05T05:45:00.000000Z  INFO zfs_explorer: API server listening on 127.0.0.1:9000
+INFO zfs_explorer: Initializing ZFS library...
+INFO zfs_explorer: ZFS Explorer starting (OpenZFS 21bbe7cb6)
+INFO zfs_explorer: API server listening on 127.0.0.1:9000
 ```
 
-### 4. Test the API
+### 4. Run the UI
 
-From nexus (in another terminal):
 ```bash
-curl http://127.0.0.1:9000/api/pools
-```
-
-Expected response:
-```json
-["nexus","rpool"]
-```
-
-### 5. Run the UI
-
-From the container (or nexus):
-```bash
-cd /home/martin/development/zfs-explorer/ui
+cd ui
 npm run dev
 ```
 
-Then access via SSH tunnel:
+### 5. Tunnel ports (if UI and backend are on different hosts)
+
 ```bash
-# From your local machine:
-ssh -L 8080:127.0.0.1:8080 -L 9000:127.0.0.1:9000 martin@nexus
+# From your local machine
+ssh -L 8080:127.0.0.1:8080 -L 9000:127.0.0.1:9000 USER@HOST
 # Open http://localhost:8080 in your browser
 ```
-
-Or directly on nexus if it has a browser.
 
 ## Project Structure
 
@@ -123,12 +106,21 @@ zfs-explorer/
         └── App.css
 ```
 
-## API Endpoints (M0 + M1)
+## API Endpoints (Selected)
 
 - `GET /api/pools` - List all imported pools (returns JSON array of strings)
 - `GET /api/pools/:pool/mos/objects?type=&start=&limit=` - List MOS objects
 - `GET /api/pools/:pool/obj/:objid` - MOS dnode metadata
 - `GET /api/pools/:pool/obj/:objid/blkptrs` - MOS block pointers
+- `GET /api/pools/:pool/obj/:objid/zap` - ZAP entries
+- `GET /api/pools/:pool/graph/from/:objid` - 1-hop graph slice
+- `GET /api/pools/:pool/datasets/tree` - Dataset tree
+- `GET /api/pools/:pool/dataset/:dsl_dir_obj/head` - Dataset → objset
+- `GET /api/pools/:pool/objset/:objset_id/root` - ZPL root znode
+- `GET /api/pools/:pool/objset/:objset_id/dir/:dir_obj/entries` - Directory entries
+- `GET /api/pools/:pool/objset/:objset_id/walk?path=/a/b` - Path walk
+- `GET /api/pools/:pool/objset/:objset_id/stat/:objid` - ZPL stat
+- `GET /api/pools/:pool/block?vdev=&offset=&asize=` - Raw block hex dump
 
 ## Build from Scratch
 
@@ -163,14 +155,15 @@ npm install
 
 ## Security Model
 
-- Backend binds to **127.0.0.1:8080** only (localhost)
+- Backend binds to **127.0.0.1:9000** only (localhost)
 - Access via SSH tunnel for remote use
 - Requires root privileges (or ZFS capabilities) to access pools
 
-## Next Steps (Milestone 2)
+## Next Steps
 
-- ZAP decoding (microzap + fatzap)
-- Inspector table for ZAP entries
+- Finish FS navigation + graph integration
+- Add richer ZPL metadata decoding
+- Expand graph tools and inspection workflows
 
 ## Tech Stack
 
@@ -182,6 +175,4 @@ npm install
 
 ## References
 
-- [Implementation Plan](/.claude/plans/wiggly-frolicking-lampson.md)
-- [zfs-comphist](../zfs-comphist) - Reference implementation
 - OpenZFS commit: [21bbe7cb6](https://github.com/openzfs/zfs/commit/21bbe7cb6)

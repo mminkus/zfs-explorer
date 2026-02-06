@@ -12,6 +12,7 @@
 /* ZFS headers */
 #include <sys/zfs_context.h>
 #include <sys/spa.h>
+#include <sys/spa_impl.h>
 #include <sys/dmu.h>
 #include <sys/dnode.h>
 #include <sys/blkptr.h>
@@ -20,6 +21,7 @@
 #include <sys/dsl_dataset.h>
 #include <sys/rrwlock.h>
 #include <sys/zfs_znode.h>
+#include <sys/zfs_sa.h>
 #include <sys/sa.h>
 #include <sys/zap.h>
 #include <sys/zap_impl.h>
@@ -293,6 +295,25 @@ append_semantic_edge(char **array, int *count, uint64_t source,
     *array = new_array;
     (*count)++;
     return 0;
+}
+
+static int
+zdx_sa_setup(objset_t *os, sa_attr_type_t **tablep)
+{
+    uint64_t sa_attrs = 0;
+    uint64_t version = 0;
+    int err;
+
+    if (dmu_objset_type(os) != DMU_OST_ZFS)
+        return EINVAL;
+
+    err = zap_lookup(os, MASTER_NODE_OBJ, ZPL_VERSION_STR, 8, 1, &version);
+    if (err == 0 && version >= ZPL_VERSION_SA) {
+        (void) zap_lookup(os, MASTER_NODE_OBJ, ZFS_SA_ATTRS, 8, 1, &sa_attrs);
+    }
+
+    err = sa_setup(os, sa_attrs, zfs_attr_table, ZPL_END, tablep);
+    return err;
 }
 
 /*
@@ -1340,17 +1361,16 @@ zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj)
 
     uint64_t objset_id = dmu_objset_id(os);
 
-    blkptr_t rootbp;
-    rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
-    rootbp = dsl_dataset_phys(ds)->ds_bp;
-    rrw_exit(&ds->ds_bp_rwlock, FTAG);
-
     dsl_dataset_rele(ds, FTAG);
     dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
 
-    char *rootbp_json = blkptr_to_json(&rootbp, 0, 0);
-    if (!rootbp_json)
-        return make_error(ENOMEM, "failed to encode rootbp");
+    /*
+     * NOTE: Avoid reading ds_bp under ds_bp_rwlock here.
+     * Some environments can stall indefinitely in rrw_enter(),
+     * which blocks all subsequent FFI calls (global mutex).
+     * We can still return objset_id without the rootbp.
+     */
+    const char *rootbp_json = "null";
 
     char *result = json_format(
         "{"
@@ -1361,7 +1381,6 @@ zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj)
         (unsigned long long)dsobj,
         (unsigned long long)objset_id,
         rootbp_json);
-    free(rootbp_json);
 
     if (!result)
         return make_error(ENOMEM, "failed to allocate JSON result");
@@ -1895,6 +1914,8 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     int err;
     int config_entered = 0;
     zdx_result_t result;
+    sa_attr_type_t *sa_table = NULL;
+    boolean_t sa_setup_done = B_FALSE;
 
     dsl_pool_config_enter(spa->spa_dsl_pool, FTAG);
     config_entered = 1;
@@ -1918,6 +1939,13 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
         goto out;
     }
 
+    err = zdx_sa_setup(os, &sa_table);
+    if (err != 0) {
+        result = make_error(err, "sa_setup failed: %s", strerror(err));
+        goto out;
+    }
+    sa_setup_done = B_TRUE;
+
     sa_handle_t *hdl = NULL;
     err = sa_handle_get(os, objid, NULL, SA_HDL_PRIVATE, &hdl);
     if (err != 0) {
@@ -1934,36 +1962,36 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
 
     sa_bulk_attr_t bulk[12];
     int idx = 0;
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_UID], NULL, &uid, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_GID], NULL, &gid, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_LINKS], NULL, &links, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_GEN], NULL, &gen, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_MODE], NULL, &mode, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_PARENT], NULL, &parent, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_SIZE], NULL, &size, 8);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_ATIME], NULL, atime, 16);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_MTIME], NULL, mtime, 16);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_CRTIME], NULL, crtime, 16);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_CTIME], NULL, ctime, 16);
-    SA_ADD_BULK_ATTR(bulk, idx, sa_attr_table[ZPL_FLAGS], NULL, &flags, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_UID], NULL, &uid, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_GID], NULL, &gid, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_LINKS], NULL, &links, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_GEN], NULL, &gen, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_MODE], NULL, &mode, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_PARENT], NULL, &parent, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_SIZE], NULL, &size, 8);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_ATIME], NULL, atime, 16);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_MTIME], NULL, mtime, 16);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_CRTIME], NULL, crtime, 16);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_CTIME], NULL, ctime, 16);
+    SA_ADD_BULK_ATTR(bulk, idx, sa_table[ZPL_FLAGS], NULL, &flags, 8);
 
     boolean_t partial = B_FALSE;
     if (sa_bulk_lookup(hdl, bulk, idx) != 0) {
         partial = B_TRUE;
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_UID], &uid, sizeof (uid));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_GID], &gid, sizeof (gid));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_LINKS], &links, sizeof (links));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_GEN], &gen, sizeof (gen));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_MODE], &mode, sizeof (mode));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_PARENT], &parent,
+        (void) sa_lookup(hdl, sa_table[ZPL_UID], &uid, sizeof (uid));
+        (void) sa_lookup(hdl, sa_table[ZPL_GID], &gid, sizeof (gid));
+        (void) sa_lookup(hdl, sa_table[ZPL_LINKS], &links, sizeof (links));
+        (void) sa_lookup(hdl, sa_table[ZPL_GEN], &gen, sizeof (gen));
+        (void) sa_lookup(hdl, sa_table[ZPL_MODE], &mode, sizeof (mode));
+        (void) sa_lookup(hdl, sa_table[ZPL_PARENT], &parent,
             sizeof (parent));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_SIZE], &size, sizeof (size));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_ATIME], atime, sizeof (atime));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_MTIME], mtime, sizeof (mtime));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_CRTIME], crtime,
+        (void) sa_lookup(hdl, sa_table[ZPL_SIZE], &size, sizeof (size));
+        (void) sa_lookup(hdl, sa_table[ZPL_ATIME], atime, sizeof (atime));
+        (void) sa_lookup(hdl, sa_table[ZPL_MTIME], mtime, sizeof (mtime));
+        (void) sa_lookup(hdl, sa_table[ZPL_CRTIME], crtime,
             sizeof (crtime));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_CTIME], ctime, sizeof (ctime));
-        (void) sa_lookup(hdl, sa_attr_table[ZPL_FLAGS], &flags,
+        (void) sa_lookup(hdl, sa_table[ZPL_CTIME], ctime, sizeof (ctime));
+        (void) sa_lookup(hdl, sa_table[ZPL_FLAGS], &flags,
             sizeof (flags));
     }
 
@@ -2022,6 +2050,8 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     result = make_success(result_json);
 
 out:
+    if (sa_setup_done && os && os->os_sa != NULL)
+        sa_tear_down(os);
     if (ds)
         dsl_dataset_rele(ds, FTAG);
     if (config_entered)

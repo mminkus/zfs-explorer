@@ -245,6 +245,15 @@ footer code {
   min-width: 160px;
 }
 
+.graph-select {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 0.3rem 0.5rem;
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
 .graph-search:focus {
   outline: none;
   border-color: var(--accent);
@@ -486,10 +495,76 @@ footer code {
   color: var(--muted);
 }
 
+.fs-active {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(77, 208, 225, 0.08);
+  font-size: 0.75rem;
+}
+
+.fs-active-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+
+.fs-active-meta {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
 .fs-path {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
+}
+
+.fs-actions {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.fs-path-input {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.fs-path-input input {
+  flex: 1;
+  min-width: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  padding: 0.35rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+.fs-path-input button,
+.fs-meta-btn {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.fs-path-input button:disabled,
+.fs-meta-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .fs-path-seg {
@@ -525,7 +600,7 @@ footer code {
 
 .fs-row {
   display: grid;
-  grid-template-columns: 1fr 80px 90px;
+  grid-template-columns: minmax(120px, 1fr) 70px 80px 90px 170px;
   gap: 0.5rem;
   padding: 0.45rem 0.6rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
@@ -543,6 +618,29 @@ footer code {
   font-size: 0.65rem;
   letter-spacing: 0.05em;
   color: var(--muted);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.fs-header-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
+
+.fs-header-btn.align-right {
+  text-align: right;
+}
+
+.fs-header-btn.active {
+  color: var(--text);
 }
 
 .fs-row.clickable {
@@ -551,6 +649,18 @@ footer code {
 
 .fs-row.clickable:hover {
   background: rgba(77, 208, 225, 0.08);
+}
+
+.fs-row.selectable {
+  cursor: pointer;
+}
+
+.fs-row.selectable:hover {
+  background: rgba(255, 140, 66, 0.08);
+}
+
+.fs-row.selected {
+  background: rgba(255, 140, 66, 0.18);
 }
 
 .fs-name {
@@ -563,6 +673,17 @@ footer code {
 
 .fs-obj {
   color: var(--muted);
+}
+
+.fs-size {
+  color: var(--muted);
+  text-align: right;
+}
+
+.fs-mtime {
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.2;
 }
 
 .fs-empty {
@@ -912,6 +1033,57 @@ footer code {
   border: 1px dashed rgba(255, 255, 255, 0.1);
   overflow: hidden;
   position: relative;
+}
+
+.fs-center-list {
+  flex: 1;
+  width: 100%;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.fs-graph-legend {
+  position: absolute;
+  bottom: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  background: rgba(12, 14, 18, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 0.5rem 0.6rem;
+  font-size: 0.7rem;
+  color: var(--text);
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-dot.legend-dir {
+  background: rgba(77, 208, 225, 0.7);
+}
+
+.legend-dot.legend-file {
+  background: rgba(255, 140, 66, 0.7);
+}
+
+.legend-dot.legend-symlink {
+  background: rgba(186, 104, 200, 0.7);
+}
+
+.legend-dot.legend-more {
+  background: rgba(255, 255, 255, 0.4);
 }
 
 .graph-canvas {

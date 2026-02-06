@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import './App.css'
 import { ObjectGraph } from './components/ObjectGraph'
 import { ZapMapView } from './components/ZapMapView'
+import { FsGraph } from './components/FsGraph'
 
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
@@ -134,6 +135,26 @@ type FsDirResponse = {
   entries: FsEntry[]
 }
 
+type FsStat = {
+  objset_id: number
+  objid: number
+  mode: number
+  type: number
+  type_name: string
+  uid: number
+  gid: number
+  size: number
+  links: number
+  parent: number
+  flags: number
+  gen: number
+  partial: boolean
+  atime: { sec: number; nsec: number }
+  mtime: { sec: number; nsec: number }
+  ctime: { sec: number; nsec: number }
+  crtime: { sec: number; nsec: number }
+}
+
 type ZapInfo = {
   object: number
   kind: string
@@ -257,6 +278,26 @@ function App() {
   const [fsNext, setFsNext] = useState<number | null>(null)
   const [fsLoading, setFsLoading] = useState(false)
   const [fsError, setFsError] = useState<string | null>(null)
+  const [fsPathInput, setFsPathInput] = useState('')
+  const [fsPathError, setFsPathError] = useState<string | null>(null)
+  const [fsPathLoading, setFsPathLoading] = useState(false)
+  const [fsSelected, setFsSelected] = useState<{
+    name: string
+    objid: number
+    type_name: string
+  } | null>(null)
+  const [fsStat, setFsStat] = useState<FsStat | null>(null)
+  const [fsStatLoading, setFsStatLoading] = useState(false)
+  const [fsStatError, setFsStatError] = useState<string | null>(null)
+  const [fsEntryStats, setFsEntryStats] = useState<Record<number, FsStat>>({})
+  const [fsEntryStatsLoading, setFsEntryStatsLoading] = useState(false)
+  const [fsEntryStatsError, setFsEntryStatsError] = useState<string | null>(null)
+  const [fsCenterView, setFsCenterView] = useState<'list' | 'graph'>('list')
+  const [fsSearch, setFsSearch] = useState('')
+  const [fsSort, setFsSort] = useState<{
+    key: 'name' | 'type' | 'size' | 'mtime'
+    dir: 'asc' | 'desc'
+  }>({ key: 'name', dir: 'asc' })
   const [navStack, setNavStack] = useState<number[]>([])
   const [navIndex, setNavIndex] = useState(-1)
   const [inspectorTab, setInspectorTab] = useState<'summary' | 'zap' | 'blkptr' | 'raw'>('summary')
@@ -277,6 +318,9 @@ function App() {
   const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
   const [centerView, setCenterView] = useState<'explore' | 'graph' | 'physical'>('explore')
   const hexRequestKey = useRef<string | null>(null)
+  const fsStatKey = useRef<string | null>(null)
+  const fsFilterRef = useRef<HTMLInputElement | null>(null)
+  const fsAutoMetaKey = useRef<string | null>(null)
 
   const zapObjectKeys = useMemo(
     () =>
@@ -296,6 +340,55 @@ function App() {
     mosObjects.forEach(obj => map.set(obj.id, obj))
     return map
   }, [mosObjects])
+
+  const filteredFsEntries = useMemo(() => {
+    const term = fsSearch.trim().toLowerCase()
+    if (!term) return fsEntries
+    return fsEntries.filter(entry => {
+      if (entry.name.toLowerCase().includes(term)) return true
+      return entry.objid.toString().includes(term)
+    })
+  }, [fsEntries, fsSearch])
+
+  const sortedFsEntries = useMemo(() => {
+    const entries = [...filteredFsEntries]
+    const dir = fsSort.dir === 'asc' ? 1 : -1
+    entries.sort((a, b) => {
+      switch (fsSort.key) {
+        case 'type': {
+          const cmp = a.type_name.localeCompare(b.type_name)
+          if (cmp !== 0) return cmp * dir
+          return a.name.localeCompare(b.name) * dir
+        }
+        case 'size': {
+          const sizeA = fsEntryStats[a.objid]?.size
+          const sizeB = fsEntryStats[b.objid]?.size
+          if (sizeA === undefined && sizeB === undefined) {
+            return a.name.localeCompare(b.name) * dir
+          }
+          if (sizeA === undefined) return 1
+          if (sizeB === undefined) return -1
+          if (sizeA === sizeB) return a.name.localeCompare(b.name) * dir
+          return (sizeA - sizeB) * dir
+        }
+        case 'mtime': {
+          const mA = fsEntryStats[a.objid]?.mtime?.sec
+          const mB = fsEntryStats[b.objid]?.mtime?.sec
+          if (mA === undefined && mB === undefined) {
+            return a.name.localeCompare(b.name) * dir
+          }
+          if (mA === undefined) return 1
+          if (mB === undefined) return -1
+          if (mA === mB) return a.name.localeCompare(b.name) * dir
+          return (mA - mB) * dir
+        }
+        case 'name':
+        default:
+          return a.name.localeCompare(b.name) * dir
+      }
+    })
+    return entries
+  }, [filteredFsEntries, fsSort, fsEntryStats])
 
   const formatAddr = (value: number) => {
     if (formatMode === 'hex') {
@@ -347,6 +440,37 @@ function App() {
     setGraphExpandError(null)
     setShowPhysicalEdges(false)
     setCenterView('explore')
+  }
+
+  const formatTimestamp = (ts?: { sec: number; nsec: number }) => {
+    if (!ts) return '—'
+    const date = new Date(ts.sec * 1000)
+    const ns = ts.nsec.toString().padStart(9, '0')
+    return `${date.toLocaleString()} (${ts.sec}.${ns})`
+  }
+
+  const formatModeOctal = (mode: number) => `0${mode.toString(8)}`
+
+  const formatBytes = (value: number) => {
+    if (!Number.isFinite(value)) return '—'
+    if (value < 1024) return `${value} B`
+    const units = ['KiB', 'MiB', 'GiB', 'TiB']
+    let size = value
+    let unitIndex = -1
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024
+      unitIndex += 1
+    }
+    return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`
+  }
+
+  const toggleFsSort = (key: 'name' | 'type' | 'size' | 'mtime') => {
+    setFsSort(prev => {
+      if (prev.key === key) {
+        return { ...prev, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+      }
+      return { key, dir: 'asc' }
+    })
   }
 
   const pinnedObjects = selectedPool ? pinnedByPool[selectedPool] ?? [] : []
@@ -405,8 +529,10 @@ function App() {
     [navIndex, selectedPool]
   )
 
-  const canGoBack = navIndex > 0
-  const canGoForward = navIndex < navStack.length - 1
+  const isMosMode = leftPaneTab === 'mos'
+  const isFsMode = leftPaneTab === 'fs'
+  const canGoBack = isMosMode && navIndex > 0
+  const canGoForward = isMosMode && navIndex < navStack.length - 1
 
   const goBack = useCallback(() => {
     if (canGoBack) {
@@ -534,10 +660,195 @@ function App() {
   const handleFsEntryClick = (entry: FsEntry) => {
     if (!fsState) return
     if (entry.type_name !== 'dir') {
+      setFsSelected(entry)
+      fetchFsStat(fsState.objsetId, entry.objid)
       return
     }
     const nextPath = [...fsState.path, { name: entry.name, objid: entry.objid }]
     fetchFsDir(fsState.objsetId, entry.objid, nextPath)
+  }
+
+  const resolveFsPathSegments = async (objsetId: number, resolvedPath: string) => {
+    if (!selectedPool || !fsState) return []
+    const parts = resolvedPath.split('/').filter(Boolean)
+    const segments = [{ name: fsState.datasetName, objid: fsState.rootObj }]
+    if (parts.length === 0) {
+      return segments
+    }
+    let currentPath = ''
+    for (const part of parts) {
+      currentPath += `/${part}`
+      try {
+        const res = await fetch(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/objset/${objsetId}/walk?path=${encodeURIComponent(currentPath)}`
+        )
+        if (!res.ok) {
+          segments.push({ name: part, objid: 0 })
+          continue
+        }
+        const data = await res.json()
+        if (!data.found) {
+          segments.push({ name: part, objid: 0 })
+          continue
+        }
+        const objid = Number(data.objid) || 0
+        segments.push({ name: part, objid })
+      } catch {
+        segments.push({ name: part, objid: 0 })
+      }
+    }
+    return segments
+  }
+
+  const fetchFsStat = async (objsetId: number, objid: number) => {
+    if (!selectedPool) return
+    const key = `${objsetId}:${objid}`
+    fsStatKey.current = key
+    setFsStatLoading(true)
+    setFsStatError(null)
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${objsetId}/stat/${objid}`
+      )
+      if (!res.ok) {
+        throw new Error(`FS stat HTTP ${res.status}`)
+      }
+      const data: FsStat = await res.json()
+      if (fsStatKey.current !== key) return
+      setFsStat(data)
+    } catch (err) {
+      if (fsStatKey.current === key) {
+        setFsStatError((err as Error).message)
+        setFsStat(null)
+      }
+    } finally {
+      if (fsStatKey.current === key) {
+        setFsStatLoading(false)
+      }
+    }
+  }
+
+  const fetchFsEntryStats = async (entries: FsEntry[]) => {
+    if (!selectedPool || !fsState || entries.length === 0) return
+    setFsEntryStatsLoading(true)
+    setFsEntryStatsError(null)
+    const pool = selectedPool
+    const objsetId = fsState.objsetId
+    const stats: Record<number, FsStat> = {}
+    let cancelled = false
+
+    const worker = async (queue: FsEntry[]) => {
+      while (queue.length > 0 && !cancelled) {
+        const entry = queue.shift()
+        if (!entry) break
+        try {
+          const res = await fetch(
+            `${API_BASE}/api/pools/${encodeURIComponent(
+              pool
+            )}/objset/${objsetId}/stat/${entry.objid}`
+          )
+          if (!res.ok) {
+            continue
+          }
+          const data: FsStat = await res.json()
+          stats[entry.objid] = data
+        } catch {
+          // ignore per-entry errors
+        }
+      }
+    }
+
+    const queue = [...entries]
+    const workers = Array.from({ length: 4 }, () => worker(queue))
+    try {
+      await Promise.all(workers)
+      if (!cancelled) {
+        setFsEntryStats(stats)
+      }
+    } catch (err) {
+      if (!cancelled) {
+        setFsEntryStatsError((err as Error).message)
+      }
+    } finally {
+      if (!cancelled) {
+        setFsEntryStatsLoading(false)
+      }
+    }
+
+    return () => {
+      cancelled = true
+    }
+  }
+
+  const handleFsPathSubmit = async (pathOverride?: string) => {
+    if (!selectedPool || !fsState) return
+    const rawPath = (pathOverride ?? fsPathInput).trim()
+    if (!rawPath) return
+    const normalized = rawPath.startsWith('/') ? rawPath : `/${rawPath}`
+    setFsPathLoading(true)
+    setFsPathError(null)
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${fsState.objsetId}/walk?path=${encodeURIComponent(normalized)}`
+      )
+      if (!res.ok) {
+        throw new Error(`FS walk HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      if (!data.found) {
+        const remaining = data.remaining ?? ''
+        const message =
+          data.error === 'not_dir'
+            ? `Not a directory: ${data.resolved}`
+            : `Not found: ${remaining}`
+        throw new Error(message)
+      }
+      const objid = Number(data.objid)
+      const typeName = String(data.type_name ?? '')
+      const resolved = String(data.resolved ?? normalized)
+
+      if (typeName === 'dir') {
+        const segments = await resolveFsPathSegments(fsState.objsetId, resolved)
+        if (segments.length === 0) {
+          const fallbackPath = [
+            { name: fsState.datasetName, objid: fsState.rootObj },
+            { name: resolved, objid },
+          ]
+          await fetchFsDir(fsState.objsetId, objid, fallbackPath)
+        } else {
+          const last = segments[segments.length - 1]
+          if (last.objid === 0) {
+            last.objid = objid
+          }
+          await fetchFsDir(fsState.objsetId, objid, segments)
+        }
+      } else {
+        setFsSelected({ name: resolved, objid, type_name: typeName })
+        setFsPathInput(resolved.startsWith('/') ? resolved : `/${resolved}`)
+        fetchFsStat(fsState.objsetId, objid)
+      }
+    } catch (err) {
+      setFsPathError((err as Error).message)
+    } finally {
+      setFsPathLoading(false)
+    }
+  }
+
+  const handleFsGraphSelect = (entry: FsEntry) => {
+    if (!fsState) return
+    if (entry.type_name === 'dir') {
+      const nextPath = [...fsState.path, { name: entry.name, objid: entry.objid }]
+      fetchFsDir(fsState.objsetId, entry.objid, nextPath)
+    } else {
+      setFsSelected(entry)
+      fetchFsStat(fsState.objsetId, entry.objid)
+    }
   }
 
   const fetchFsDir = async (
@@ -563,6 +874,17 @@ function App() {
       const data: FsDirResponse = await res.json()
       setFsEntries(data.entries ?? [])
       setFsNext(data.next ?? null)
+      setFsEntryStats({})
+      setFsEntryStatsError(null)
+      const currentName = path[path.length - 1]?.name ?? 'dir'
+      setFsSelected({ name: currentName, objid: dirObj, type_name: 'dir' })
+      fetchFsStat(objsetId, dirObj)
+      if (path.length > 1) {
+        const rest = path.slice(1).map(seg => seg.name)
+        setFsPathInput(`/${rest.join('/')}`)
+      } else {
+        setFsPathInput('/')
+      }
       setFsState(prev => {
         if (!prev) {
           return null
@@ -583,8 +905,15 @@ function App() {
   const enterFsFromDataset = async (node: DatasetTreeNode) => {
     if (!selectedPool) return
     setLeftPaneTab('fs')
+    resetInspector()
     setFsLoading(true)
     setFsError(null)
+    setFsSelected(null)
+    setFsStat(null)
+    setFsStatError(null)
+    setFsPathInput('/')
+    setFsCenterView('list')
+    setFsSearch('')
     try {
       const headRes = await fetch(
         `${API_BASE}/api/pools/${encodeURIComponent(
@@ -677,6 +1006,19 @@ function App() {
       setFsNext(null)
       setFsLoading(false)
       setFsError(null)
+      setFsSelected(null)
+      setFsStat(null)
+      setFsStatLoading(false)
+      setFsStatError(null)
+      setFsEntryStats({})
+      setFsEntryStatsLoading(false)
+      setFsEntryStatsError(null)
+      setFsPathInput('')
+      setFsPathError(null)
+      setFsPathLoading(false)
+      setFsCenterView('list')
+      setFsSearch('')
+      setFsSort({ key: 'name', dir: 'asc' })
       setNavStack([])
       setNavIndex(-1)
       setShowBlkptrDetails(false)
@@ -815,6 +1157,40 @@ function App() {
     navigateTo(objid)
     setGraphSearch('')
   }
+
+  useEffect(() => {
+    if (!isFsMode) return
+    const handler = (event: KeyboardEvent) => {
+      if (event.key !== '/') return
+      const target = event.target as HTMLElement | null
+      if (target && ['INPUT', 'TEXTAREA'].includes(target.tagName)) return
+      event.preventDefault()
+      setFsCenterView('list')
+      fsFilterRef.current?.focus()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [isFsMode])
+
+  useEffect(() => {
+    if (!isFsMode || !fsState) return
+    if (!['size', 'mtime'].includes(fsSort.key)) return
+    if (fsEntryStatsLoading) return
+    const missing = sortedFsEntries.some(entry => fsEntryStats[entry.objid] === undefined)
+    if (!missing) return
+    const key = `${fsState.currentDir}:${fsSort.key}:${fsSearch}:${sortedFsEntries.length}`
+    if (fsAutoMetaKey.current === key) return
+    fsAutoMetaKey.current = key
+    fetchFsEntryStats(sortedFsEntries)
+  }, [
+    fsEntryStats,
+    fsEntryStatsLoading,
+    fsSearch,
+    fsSort.key,
+    fsState,
+    isFsMode,
+    sortedFsEntries,
+  ])
 
   const semanticEdges = objectInfo?.semantic_edges ?? []
 
@@ -1120,6 +1496,7 @@ function App() {
               setNavStack([])
               setNavIndex(-1)
               setSelectedPool(selectedPool)
+              setLeftPaneTab('datasets')
             }}
             title={`Pool ${selectedPool}`}
           >
@@ -1129,38 +1506,71 @@ function App() {
           <span className="crumb muted">No pool selected</span>
         )}
         <span className="crumb-sep">→</span>
-        <button
-          className="crumb"
-          onClick={() => {
-            resetInspector()
-            setNavStack([])
-            setNavIndex(-1)
-          }}
-          title="MOS object list"
-        >
-          MOS
-        </button>
-        {navStack.slice(0, navIndex + 1).map((objid, idx) => (
-          <span key={`${objid}-${idx}`} className="crumb-group">
-            <span className="crumb-sep">→</span>
+        {leftPaneTab === 'datasets' && (
+          <span className="crumb active">Datasets</span>
+        )}
+        {leftPaneTab === 'fs' && (
+          <>
             <button
-              className={`crumb ${idx === navIndex ? 'active' : ''}`}
-              onClick={() => {
-                if (idx !== navIndex) {
-                  setNavIndex(idx)
-                  setSelectedObject(objid)
-                  fetchInspector(objid)
-                }
-              }}
-              title={`Object ${objid}${mosObjectMap.get(objid)?.type_name ? ` · ${mosObjectMap.get(objid)?.type_name}` : ''}`}
+              className="crumb"
+              onClick={() => setLeftPaneTab('datasets')}
+              title="Datasets"
             >
-              Object {objid}
-              {mosObjectMap.get(objid)?.type_name
-                ? ` (${mosObjectMap.get(objid)?.type_name})`
-                : ''}
+              Datasets
             </button>
-          </span>
-        ))}
+            <span className="crumb-sep">→</span>
+            <span className="crumb active">FS</span>
+            {fsState?.path.map((seg, idx) => (
+              <span key={`${seg.objid}-${idx}`} className="crumb-group">
+                <span className="crumb-sep">→</span>
+                <button
+                  className={`crumb ${idx === fsState.path.length - 1 ? 'active' : ''}`}
+                  onClick={() => handleFsPathClick(idx)}
+                  title={`FS object ${seg.objid}`}
+                >
+                  {seg.name}
+                </button>
+              </span>
+            ))}
+          </>
+        )}
+        {leftPaneTab === 'mos' && (
+          <>
+            <button
+              className="crumb"
+              onClick={() => {
+                resetInspector()
+                setNavStack([])
+                setNavIndex(-1)
+                setLeftPaneTab('mos')
+              }}
+              title="MOS object list"
+            >
+              MOS
+            </button>
+            {navStack.slice(0, navIndex + 1).map((objid, idx) => (
+              <span key={`${objid}-${idx}`} className="crumb-group">
+                <span className="crumb-sep">→</span>
+                <button
+                  className={`crumb ${idx === navIndex ? 'active' : ''}`}
+                  onClick={() => {
+                    if (idx !== navIndex) {
+                      setNavIndex(idx)
+                      setSelectedObject(objid)
+                      fetchInspector(objid)
+                    }
+                  }}
+                  title={`Object ${objid}${mosObjectMap.get(objid)?.type_name ? ` · ${mosObjectMap.get(objid)?.type_name}` : ''}`}
+                >
+                  Object {objid}
+                  {mosObjectMap.get(objid)?.type_name
+                    ? ` (${mosObjectMap.get(objid)?.type_name})`
+                    : ''}
+                </button>
+              </span>
+            ))}
+          </>
+        )}
       </div>
 
       <div className="main-grid">
@@ -1271,7 +1681,22 @@ function App() {
               </div>
               <div className="fs-panel">
                 <h3>Filesystem Navigator</h3>
-                {!fsState && (
+                {fsState && (
+                  <div className="fs-active">
+                    <span className="fs-active-label">Active dataset</span>
+                    <strong>{fsState.datasetName}</strong>
+                    <span className="fs-active-meta">objset {fsState.objsetId}</span>
+                  </div>
+                )}
+                {!fsState && fsLoading && (
+                  <p className="muted">Loading dataset…</p>
+                )}
+                {!fsState && fsError && (
+                  <div className="error">
+                    <strong>Error:</strong> {fsError}
+                  </div>
+                )}
+                {!fsState && !fsLoading && !fsError && (
                   <p className="muted">
                     Select a dataset from the Datasets tab to start browsing.
                   </p>
@@ -1283,16 +1708,60 @@ function App() {
                         <button
                           key={`${seg.objid}-${idx}`}
                           className={`fs-path-seg ${idx === fsState.path.length - 1 ? 'active' : ''}`}
-                          onClick={() => handleFsPathClick(idx)}
+                          onClick={() => {
+                            if (idx === fsState.path.length - 1) return
+                            if (seg.objid === 0) {
+                              const derived =
+                                idx === 0
+                                  ? '/'
+                                  : `/${fsState.path
+                                      .slice(1, idx + 1)
+                                      .map(part => part.name)
+                                      .filter(Boolean)
+                                      .join('/')}`
+                              handleFsPathSubmit(derived)
+                            } else {
+                              handleFsPathClick(idx)
+                            }
+                          }}
                         >
                           {seg.name}
                         </button>
                       ))}
                     </div>
 
+                    <div className="fs-actions">
+                      <div className="fs-path-input">
+                        <input
+                          type="text"
+                          value={fsPathInput}
+                          onChange={e => setFsPathInput(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') {
+                              handleFsPathSubmit()
+                            }
+                          }}
+                          placeholder="/path/to/dir"
+                        />
+                        <button type="button" onClick={() => handleFsPathSubmit()} disabled={fsPathLoading}>
+                          {fsPathLoading ? '…' : 'Go'}
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="fs-meta-btn"
+                        onClick={() => fetchFsEntryStats(fsEntries)}
+                        disabled={fsEntryStatsLoading || fsEntries.length === 0}
+                      >
+                        {fsEntryStatsLoading ? 'Loading…' : 'Load metadata'}
+                      </button>
+                    </div>
+
                     <div className="fs-meta">
                       <span>objset {fsState.objsetId}</span>
                       <span>dir {fsState.currentDir}</span>
+                      {fsEntryStatsError && <span>Error: {fsEntryStatsError}</span>}
+                      {fsPathError && <span>Error: {fsPathError}</span>}
                     </div>
 
                     {fsLoading && <p className="muted">Loading directory…</p>}
@@ -1301,20 +1770,61 @@ function App() {
                     {!fsLoading && !fsError && (
                       <div className="fs-table">
                         <div className="fs-row fs-header">
-                          <div>Name</div>
-                          <div>Type</div>
+                          <button
+                            type="button"
+                            className={`fs-header-btn ${fsSort.key === 'name' ? 'active' : ''}`}
+                            onClick={() => toggleFsSort('name')}
+                          >
+                            Name {fsSort.key === 'name' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
+                          <button
+                            type="button"
+                            className={`fs-header-btn ${fsSort.key === 'type' ? 'active' : ''}`}
+                            onClick={() => toggleFsSort('type')}
+                          >
+                            Type {fsSort.key === 'type' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
                           <div>Object</div>
+                          <button
+                            type="button"
+                            className={`fs-header-btn align-right ${
+                              fsSort.key === 'size' ? 'active' : ''
+                            }`}
+                            onClick={() => toggleFsSort('size')}
+                          >
+                            Size {fsSort.key === 'size' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
+                          <button
+                            type="button"
+                            className={`fs-header-btn ${fsSort.key === 'mtime' ? 'active' : ''}`}
+                            onClick={() => toggleFsSort('mtime')}
+                          >
+                            MTime {fsSort.key === 'mtime' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
                         </div>
                         {fsEntries.map(entry => (
+                          (() => {
+                            const stat = fsEntryStats[entry.objid]
+                            return (
                           <div
                             key={`${entry.name}-${entry.objid}`}
-                            className={`fs-row ${entry.type_name === 'dir' ? 'clickable' : ''}`}
+                            className={`fs-row ${
+                              entry.type_name === 'dir' ? 'clickable' : 'selectable'
+                            } ${fsSelected?.objid === entry.objid ? 'selected' : ''}`}
                             onClick={() => handleFsEntryClick(entry)}
                           >
                             <div className="fs-name">{entry.name}</div>
                             <div className="fs-type">{entry.type_name}</div>
                             <div className="fs-obj">#{entry.objid}</div>
+                            <div className="fs-size">
+                              {stat ? formatBytes(stat.size) : '—'}
+                            </div>
+                            <div className="fs-mtime">
+                              {stat ? formatTimestamp(stat.mtime) : '—'}
+                            </div>
                           </div>
+                            )
+                          })()
                         ))}
                         {fsEntries.length === 0 && (
                           <div className="fs-empty">No entries found.</div>
@@ -1424,120 +1934,281 @@ function App() {
         </aside>
 
         <section className="panel pane-center">
-          <div className="panel-header graph-header">
-            <div>
-              <h2>Object Graph</h2>
-              <span className="muted">1-hop neighborhood</span>
-            </div>
-            <div className="graph-controls">
-              <div className="graph-view-toggle">
-                <button
-                  className={`graph-btn ${centerView === 'explore' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setCenterView('explore')}
-                >
-                  Explore
-                </button>
-                <button
-                  className={`graph-btn ${centerView === 'graph' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setCenterView('graph')}
-                >
-                  Graph
-                </button>
-                <button
-                  className={`graph-btn ${centerView === 'physical' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setCenterView('physical')}
-                >
-                  Physical
-                </button>
-              </div>
-              <input
-                className="graph-search"
-                placeholder="Go to object ID"
-                value={graphSearch}
-                onChange={e => setGraphSearch(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') {
-                    handleGraphSearch()
-                  }
-                }}
-              />
-              <button className="graph-btn" type="button" onClick={handleGraphSearch}>
-                Go
-              </button>
-              {effectiveCenterView !== 'map' && (
-                <>
-                  {effectiveCenterView !== 'physical' && (
+          {leftPaneTab === 'fs' ? (
+            <>
+              <div className="panel-header graph-header">
+                <div>
+                  <h2>Filesystem</h2>
+                  <span className="muted">
+                    {fsState
+                      ? `${fsState.datasetName} · ${fsPathInput || '/'} · ${sortedFsEntries.length} entries`
+                      : 'Select a dataset'}
+                  </span>
+                </div>
+                <div className="graph-controls">
+                  <div className="graph-view-toggle">
                     <button
-                      className="graph-btn"
+                      className={`graph-btn ${fsCenterView === 'list' ? 'active' : ''}`}
                       type="button"
-                      onClick={expandGraph}
-                      disabled={graphExpanding || selectedObject === null}
+                      onClick={() => setFsCenterView('list')}
                     >
-                      {graphExpanding ? 'Expanding…' : 'Expand +1 hop'}
+                      List
                     </button>
-                  )}
-                  {effectiveCenterView !== 'physical' && (
                     <button
-                      className={`graph-btn ${showPhysicalEdges ? 'active' : ''}`}
+                      className={`graph-btn ${fsCenterView === 'graph' ? 'active' : ''}`}
                       type="button"
-                      onClick={() => setShowPhysicalEdges(prev => !prev)}
+                      onClick={() => setFsCenterView('graph')}
                     >
-                      Physical edges
+                      Graph
+                    </button>
+                  </div>
+                  <input
+                    className="graph-search"
+                    placeholder="Filter by name or object id"
+                    value={fsSearch}
+                    ref={fsFilterRef}
+                    onChange={e => setFsSearch(e.target.value)}
+                  />
+                  <select
+                    className="graph-select"
+                    value={fsSort.key}
+                    onChange={e =>
+                      setFsSort(prev => ({
+                        ...prev,
+                        key: e.target.value as 'name' | 'type' | 'size' | 'mtime',
+                      }))
+                    }
+                  >
+                    <option value="name">Name</option>
+                    <option value="type">Type</option>
+                    <option value="size">Size</option>
+                    <option value="mtime">MTime</option>
+                  </select>
+                  <button
+                    className="graph-btn"
+                    type="button"
+                    onClick={() =>
+                      setFsSort(prev => ({
+                        ...prev,
+                        dir: prev.dir === 'asc' ? 'desc' : 'asc',
+                      }))
+                    }
+                    title={`Sort ${fsSort.dir === 'asc' ? 'descending' : 'ascending'}`}
+                  >
+                    {fsSort.dir === 'asc' ? '↑' : '↓'}
+                  </button>
+                  {fsSearch && (
+                    <button className="graph-btn" type="button" onClick={() => setFsSearch('')}>
+                      Clear
                     </button>
                   )}
                   <button
-                    className={`graph-btn ${showBlkptrDetails ? 'active' : ''}`}
+                    className="graph-btn"
                     type="button"
-                    onClick={() => setShowBlkptrDetails(prev => !prev)}
-                    disabled={!showPhysicalEdgesActive}
+                    onClick={() => fetchFsEntryStats(sortedFsEntries)}
+                    disabled={fsEntryStatsLoading || sortedFsEntries.length === 0}
                   >
-                    {showBlkptrDetails ? 'Collapse blkptrs' : 'Expand blkptrs'}
+                    {fsEntryStatsLoading ? 'Loading…' : 'Load metadata'}
                   </button>
-                  {(graphExtraEdges.length > 0 || graphExtraNodes.length > 0) && (
-                    <button className="graph-btn" type="button" onClick={resetGraphExpansion}>
-                      Reset
+                </div>
+              </div>
+              <div className="graph">
+                {fsCenterView === 'graph' && fsState ? (
+                  <FsGraph
+                    dirObj={fsState.currentDir}
+                    dirName={fsState.path[fsState.path.length - 1]?.name ?? 'dir'}
+                    entries={sortedFsEntries}
+                    selectedObjid={fsSelected?.objid ?? null}
+                    onSelectEntry={handleFsGraphSelect}
+                  />
+                ) : (
+                  <div className="fs-center-list">
+                    {!fsState && <p className="muted">Select a dataset to browse.</p>}
+                    {fsState && (
+                      <div className="fs-table">
+                        <div className="fs-row fs-header">
+                          <button
+                            type="button"
+                            className={`fs-header-btn ${fsSort.key === 'name' ? 'active' : ''}`}
+                            onClick={() => toggleFsSort('name')}
+                          >
+                            Name {fsSort.key === 'name' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
+                          <button
+                            type="button"
+                            className={`fs-header-btn ${fsSort.key === 'type' ? 'active' : ''}`}
+                            onClick={() => toggleFsSort('type')}
+                          >
+                            Type {fsSort.key === 'type' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
+                          <div>Object</div>
+                          <button
+                            type="button"
+                            className={`fs-header-btn align-right ${
+                              fsSort.key === 'size' ? 'active' : ''
+                            }`}
+                            onClick={() => toggleFsSort('size')}
+                          >
+                            Size {fsSort.key === 'size' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
+                          <button
+                            type="button"
+                            className={`fs-header-btn ${fsSort.key === 'mtime' ? 'active' : ''}`}
+                            onClick={() => toggleFsSort('mtime')}
+                          >
+                            MTime {fsSort.key === 'mtime' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
+                          </button>
+                        </div>
+                        {sortedFsEntries.map(entry => {
+                          const stat = fsEntryStats[entry.objid]
+                          return (
+                            <div
+                              key={`${entry.name}-${entry.objid}`}
+                              className={`fs-row ${
+                                entry.type_name === 'dir' ? 'clickable' : 'selectable'
+                              } ${fsSelected?.objid === entry.objid ? 'selected' : ''}`}
+                              onClick={() => handleFsEntryClick(entry)}
+                            >
+                              <div className="fs-name">{entry.name}</div>
+                              <div className="fs-type">{entry.type_name}</div>
+                              <div className="fs-obj">#{entry.objid}</div>
+                              <div className="fs-size">
+                                {stat ? formatBytes(stat.size) : '—'}
+                              </div>
+                              <div className="fs-mtime">
+                                {stat ? formatTimestamp(stat.mtime) : '—'}
+                              </div>
+                            </div>
+                          )
+                        })}
+                        {sortedFsEntries.length === 0 && (
+                          <div className="fs-empty">No entries match this filter.</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="panel-header graph-header">
+                <div>
+                  <h2>Object Graph</h2>
+                  <span className="muted">1-hop neighborhood</span>
+                </div>
+                <div className="graph-controls">
+                  <div className="graph-view-toggle">
+                    <button
+                      className={`graph-btn ${centerView === 'explore' ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => setCenterView('explore')}
+                    >
+                      Explore
                     </button>
+                    <button
+                      className={`graph-btn ${centerView === 'graph' ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => setCenterView('graph')}
+                    >
+                      Graph
+                    </button>
+                    <button
+                      className={`graph-btn ${centerView === 'physical' ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => setCenterView('physical')}
+                    >
+                      Physical
+                    </button>
+                  </div>
+                  <input
+                    className="graph-search"
+                    placeholder="Go to object ID"
+                    value={graphSearch}
+                    onChange={e => setGraphSearch(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        handleGraphSearch()
+                      }
+                    }}
+                  />
+                  <button className="graph-btn" type="button" onClick={handleGraphSearch}>
+                    Go
+                  </button>
+                  {effectiveCenterView !== 'map' && (
+                    <>
+                      {effectiveCenterView !== 'physical' && (
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={expandGraph}
+                          disabled={graphExpanding || selectedObject === null}
+                        >
+                          {graphExpanding ? 'Expanding…' : 'Expand +1 hop'}
+                        </button>
+                      )}
+                      {effectiveCenterView !== 'physical' && (
+                        <button
+                          className={`graph-btn ${showPhysicalEdges ? 'active' : ''}`}
+                          type="button"
+                          onClick={() => setShowPhysicalEdges(prev => !prev)}
+                        >
+                          Physical edges
+                        </button>
+                      )}
+                      <button
+                        className={`graph-btn ${showBlkptrDetails ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setShowBlkptrDetails(prev => !prev)}
+                        disabled={!showPhysicalEdgesActive}
+                      >
+                        {showBlkptrDetails ? 'Collapse blkptrs' : 'Expand blkptrs'}
+                      </button>
+                      {(graphExtraEdges.length > 0 || graphExtraNodes.length > 0) && (
+                        <button className="graph-btn" type="button" onClick={resetGraphExpansion}>
+                          Reset
+                        </button>
+                      )}
+                    </>
                   )}
-                </>
-              )}
-            </div>
-          </div>
-          <div className="graph">
-            {effectiveCenterView === 'map' ? (
-              <ZapMapView
-                entries={zapEntries}
-                mosObjectMap={mosObjectMap}
-                onNavigate={navigateTo}
-              />
-            ) : (
-              <ObjectGraph
-                selectedObject={selectedObject}
-                objectTypeName={objectInfo?.type?.name ?? ''}
-                semanticEdges={semanticEdges}
-                zapEntries={zapEntries}
-                blkptrs={blkptrs?.blkptrs ?? []}
-                extraEdges={graphExtraEdges}
-                extraNodes={graphExtraNodes}
-                showSemantic={showSemanticEdges}
-                showZap={showZapEdges}
-                showPhysical={showPhysicalEdgesActive}
-                showBlkptrDetails={showBlkptrDetails}
-                onNavigate={navigateTo}
-              />
-            )}
-            {graphExpandError && <div className="graph-error">{graphExpandError}</div>}
-          </div>
+                </div>
+              </div>
+              <div className="graph">
+                {effectiveCenterView === 'map' ? (
+                  <ZapMapView
+                    entries={zapEntries}
+                    mosObjectMap={mosObjectMap}
+                    onNavigate={navigateTo}
+                  />
+                ) : (
+                  <ObjectGraph
+                    selectedObject={selectedObject}
+                    objectTypeName={objectInfo?.type?.name ?? ''}
+                    semanticEdges={semanticEdges}
+                    zapEntries={zapEntries}
+                    blkptrs={blkptrs?.blkptrs ?? []}
+                    extraEdges={graphExtraEdges}
+                    extraNodes={graphExtraNodes}
+                    showSemantic={showSemanticEdges}
+                    showZap={showZapEdges}
+                    showPhysical={showPhysicalEdgesActive}
+                    showBlkptrDetails={showBlkptrDetails}
+                    onNavigate={navigateTo}
+                  />
+                )}
+                {graphExpandError && <div className="graph-error">{graphExpandError}</div>}
+              </div>
+            </>
+          )}
         </section>
 
         <section className="panel pane-right">
           <div className="panel-header">
             <h2>Inspector</h2>
             <div className="panel-actions">
-              {inspectorLoading && <span className="muted">Loading…</span>}
-              {selectedObject !== null && (
+              {isFsMode && fsStatLoading && <span className="muted">Loading…</span>}
+              {!isFsMode && inspectorLoading && <span className="muted">Loading…</span>}
+              {!isFsMode && selectedObject !== null && (
                 <button
                   type="button"
                   className={`pin-btn ${isPinned ? 'active' : ''}`}
@@ -1550,7 +2221,126 @@ function App() {
             </div>
           </div>
 
-          {selectedPool && selectedObject !== null && (
+          {isFsMode && fsState && (
+            <div className="inspector-content">
+              <div className="inspector-section">
+                <h3>Filesystem Context</h3>
+                <dl className="info-grid">
+                  <div>
+                    <dt>Dataset</dt>
+                    <dd>{fsState.datasetName}</dd>
+                  </div>
+                  <div>
+                    <dt>Objset</dt>
+                    <dd>{fsState.objsetId}</dd>
+                  </div>
+                  <div>
+                    <dt>Dir Obj</dt>
+                    <dd>{fsState.currentDir}</dd>
+                  </div>
+                  <div>
+                    <dt>Root Obj</dt>
+                    <dd>{fsState.rootObj}</dd>
+                  </div>
+                </dl>
+              </div>
+
+              {fsSelected && (
+                <div className="inspector-section">
+                  <h3>Selection</h3>
+                  <dl className="info-grid">
+                    <div>
+                      <dt>Name</dt>
+                      <dd>{fsSelected.name}</dd>
+                    </div>
+                    <div>
+                      <dt>Object</dt>
+                      <dd>#{fsSelected.objid}</dd>
+                    </div>
+                    <div>
+                      <dt>Type</dt>
+                      <dd>{fsSelected.type_name}</dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+
+              {fsStatError && (
+                <div className="error">
+                  <strong>Error:</strong> {fsStatError}
+                </div>
+              )}
+
+              {fsStat && (
+                <div className="inspector-section">
+                  <h3>Metadata</h3>
+                  <dl className="info-grid">
+                    <div>
+                      <dt>Mode</dt>
+                      <dd>{formatModeOctal(fsStat.mode)}</dd>
+                    </div>
+                    <div>
+                      <dt>UID</dt>
+                      <dd>{fsStat.uid}</dd>
+                    </div>
+                    <div>
+                      <dt>GID</dt>
+                      <dd>{fsStat.gid}</dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>{fsStat.size} B</dd>
+                    </div>
+                    <div>
+                      <dt>Links</dt>
+                      <dd>{fsStat.links}</dd>
+                    </div>
+                    <div>
+                      <dt>Parent</dt>
+                      <dd>{fsStat.parent}</dd>
+                    </div>
+                    <div>
+                      <dt>Flags</dt>
+                      <dd>{fsStat.flags}</dd>
+                    </div>
+                    <div>
+                      <dt>Gen</dt>
+                      <dd>{fsStat.gen}</dd>
+                    </div>
+                    <div>
+                      <dt>ATime</dt>
+                      <dd>{formatTimestamp(fsStat.atime)}</dd>
+                    </div>
+                    <div>
+                      <dt>MTime</dt>
+                      <dd>{formatTimestamp(fsStat.mtime)}</dd>
+                    </div>
+                    <div>
+                      <dt>CTime</dt>
+                      <dd>{formatTimestamp(fsStat.ctime)}</dd>
+                    </div>
+                    <div>
+                      <dt>CrTime</dt>
+                      <dd>{formatTimestamp(fsStat.crtime)}</dd>
+                    </div>
+                  </dl>
+                  {fsStat.partial && (
+                    <p className="muted">Partial metadata: some attributes were unavailable.</p>
+                  )}
+                </div>
+              )}
+
+              {!fsStat && !fsStatLoading && !fsStatError && (
+                <p className="muted">Select a file or directory to view metadata.</p>
+              )}
+            </div>
+          )}
+
+          {isFsMode && !fsState && (
+            <p className="muted">Select a dataset to view filesystem metadata.</p>
+          )}
+
+          {!isFsMode && selectedPool && selectedObject !== null && (
             <div className="zdb-hint">
               <code>sudo zdb -dddd {selectedPool} {selectedObject}</code>
               <button
@@ -1564,17 +2354,17 @@ function App() {
             </div>
           )}
 
-          {inspectorError && (
+          {!isFsMode && inspectorError && (
             <div className="error">
               <strong>Error:</strong> {inspectorError}
             </div>
           )}
 
-          {!selectedObject && !inspectorLoading && (
+          {!isFsMode && !selectedObject && !inspectorLoading && (
             <p className="muted">Select a MOS object to inspect its dnode.</p>
           )}
 
-          {selectedObject !== null && objectInfo && (
+          {!isFsMode && selectedObject !== null && objectInfo && (
             <>
               <div className="inspector-tabs">
                 <button
