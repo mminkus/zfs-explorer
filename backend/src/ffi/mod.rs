@@ -193,6 +193,55 @@ pub fn dsl_root_dir(pool: *mut zdx_pool_t) -> ZdxResult {
     ZdxResult::from_raw(raw)
 }
 
+/// Dataset -> objset mapping
+pub fn dataset_objset(pool: *mut zdx_pool_t, dsobj: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dataset_objset(pool, dsobj) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Objset root lookup
+pub fn objset_root(pool: *mut zdx_pool_t, objset_id: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_root(pool, objset_id) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Directory entries from ZPL
+pub fn objset_dir_entries(
+    pool: *mut zdx_pool_t,
+    objset_id: u64,
+    dir_obj: u64,
+    cursor: u64,
+    limit: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_dir_entries(pool, objset_id, dir_obj, cursor, limit) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Walk a path within a ZPL objset
+pub fn objset_walk(pool: *mut zdx_pool_t, objset_id: u64, path: &str) -> Result<ZdxResult, String> {
+    let c_path = CString::new(path).map_err(|_| "path contains NUL".to_string())?;
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_walk(pool, objset_id, c_path.as_ptr()) };
+    Ok(ZdxResult::from_raw(raw))
+}
+
+/// Stat a ZPL znode object
+pub fn objset_stat(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_stat(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Read raw block by vdev + offset
+pub fn read_block(pool: *mut zdx_pool_t, vdev: u64, offset: u64, size: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_read_block(pool, vdev, offset, size) };
+    ZdxResult::from_raw(raw)
+}
+
 /// Get version string
 pub fn version() -> &'static str {
     let _lock = FFI_MUTEX.lock().unwrap();

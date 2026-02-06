@@ -1,4 +1,4 @@
-import { useEffect, useRef, useMemo } from 'react'
+import { useEffect, useRef, useMemo, useState } from 'react'
 import cytoscape, { type Core, type ElementDefinition } from 'cytoscape'
 
 type SemanticEdge = {
@@ -27,6 +27,12 @@ type Props = {
   semanticEdges: SemanticEdge[]
   zapEntries: ZapEntry[]
   blkptrs: BlkptrInfo[]
+  extraEdges: SemanticEdge[]
+  extraNodes: number[]
+  showSemantic: boolean
+  showZap: boolean
+  showPhysical: boolean
+  showBlkptrDetails: boolean
   onNavigate: (objid: number) => void
 }
 
@@ -36,10 +42,21 @@ export function ObjectGraph({
   semanticEdges,
   zapEntries,
   blkptrs,
+  extraEdges,
+  extraNodes,
+  showSemantic,
+  showZap,
+  showPhysical,
+  showBlkptrDetails,
   onNavigate,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
+  const [hoverInfo, setHoverInfo] = useState<{
+    title: string
+    subtitle?: string
+    kind?: string
+  } | null>(null)
 
   // Build graph elements
   const elements = useMemo(() => {
@@ -61,83 +78,213 @@ export function ObjectGraph({
     addedNodes.add(`obj-${selectedObject}`)
 
     // Semantic edges from bonus
-    semanticEdges.forEach(edge => {
+    if (showSemantic) {
+      semanticEdges.forEach(edge => {
+        const targetId = `obj-${edge.target_obj}`
+        if (!addedNodes.has(targetId)) {
+          nodes.push({
+            data: {
+              id: targetId,
+              label: `#${edge.target_obj}`,
+              sublabel: edge.label,
+              type: 'semantic',
+              objid: edge.target_obj,
+            },
+          })
+          addedNodes.add(targetId)
+        }
+        edges.push({
+          data: {
+            id: `edge-bonus-${edge.label}-${edge.target_obj}`,
+            source: `obj-${selectedObject}`,
+            target: targetId,
+            label: edge.label,
+            edgeType: 'bonus',
+          },
+        })
+      })
+    }
+
+    // Extra nodes (expanded graph)
+    if (showSemantic || showZap) {
+      extraNodes.forEach(objid => {
+        const nodeId = `obj-${objid}`
+        if (!addedNodes.has(nodeId)) {
+          nodes.push({
+            data: {
+              id: nodeId,
+              label: `#${objid}`,
+              sublabel: 'expanded',
+              type: 'expanded',
+              objid,
+            },
+          })
+          addedNodes.add(nodeId)
+        }
+      })
+    }
+
+    // Extra edges (expanded graph)
+    extraEdges.forEach(edge => {
+      const edgeType =
+        edge.kind === 'zap' ? 'zap' : edge.kind === 'blkptr' ? 'physical' : 'bonus'
+      if (edgeType === 'zap' && !showZap) return
+      if (edgeType === 'bonus' && !showSemantic) return
+      if (edgeType === 'physical' && !showPhysical) return
+
+      const sourceId = `obj-${edge.source_obj}`
       const targetId = `obj-${edge.target_obj}`
+      if (!addedNodes.has(sourceId)) {
+        nodes.push({
+          data: {
+            id: sourceId,
+            label: `#${edge.source_obj}`,
+            sublabel: 'expanded',
+            type: 'expanded',
+            objid: edge.source_obj,
+          },
+        })
+        addedNodes.add(sourceId)
+      }
       if (!addedNodes.has(targetId)) {
         nodes.push({
           data: {
             id: targetId,
             label: `#${edge.target_obj}`,
-            sublabel: edge.label,
-            type: 'semantic',
+            sublabel: 'expanded',
+            type: 'expanded',
             objid: edge.target_obj,
           },
         })
         addedNodes.add(targetId)
       }
+
       edges.push({
         data: {
-          id: `edge-bonus-${edge.label}-${edge.target_obj}`,
-          source: `obj-${selectedObject}`,
+          id: `edge-extra-${edge.kind}-${edge.label}-${edge.source_obj}-${edge.target_obj}`,
+          source: sourceId,
           target: targetId,
           label: edge.label,
-          edgeType: 'bonus',
+          edgeType,
         },
       })
     })
 
     // ZAP entry refs
-    const zapRefs = zapEntries.filter(e => e.maybe_object_ref && e.target_obj !== null)
-    zapRefs.forEach(entry => {
-      const targetId = `obj-${entry.target_obj}`
-      if (!addedNodes.has(targetId)) {
-        nodes.push({
+    if (showZap) {
+      const zapRefs = zapEntries.filter(e => e.maybe_object_ref && e.target_obj !== null)
+      const maxZapRefs = 25
+      const visibleZapRefs = zapRefs.slice(0, maxZapRefs)
+      const remaining = zapRefs.length - visibleZapRefs.length
+
+      visibleZapRefs.forEach(entry => {
+        const targetId = `obj-${entry.target_obj}`
+        if (!addedNodes.has(targetId)) {
+          nodes.push({
+            data: {
+              id: targetId,
+              label: `${entry.name}\n#${entry.target_obj}`,
+              sublabel: entry.name,
+              type: 'zap',
+              objid: entry.target_obj,
+            },
+          })
+          addedNodes.add(targetId)
+        }
+        edges.push({
           data: {
-            id: targetId,
-            label: `#${entry.target_obj}`,
-            sublabel: entry.name,
-            type: 'zap',
-            objid: entry.target_obj,
+            id: `edge-zap-${entry.name}-${entry.target_obj}`,
+            source: `obj-${selectedObject}`,
+            target: targetId,
+            label: entry.name,
+            edgeType: 'zap',
           },
         })
-        addedNodes.add(targetId)
-      }
-      edges.push({
-        data: {
-          id: `edge-zap-${entry.name}-${entry.target_obj}`,
-          source: `obj-${selectedObject}`,
-          target: targetId,
-          label: entry.name,
-          edgeType: 'zap',
-        },
       })
-    })
 
-    // Collapsed blkptr node
-    const validBlkptrs = blkptrs.filter(bp => !bp.is_hole)
-    if (validBlkptrs.length > 0) {
-      const blkptrId = `blkptrs-${selectedObject}`
-      nodes.push({
-        data: {
-          id: blkptrId,
-          label: `blkptrs (${validBlkptrs.length})`,
-          sublabel: `${validBlkptrs.reduce((sum, bp) => sum + bp.ndvas, 0)} DVAs`,
-          type: 'physical',
-        },
-      })
-      edges.push({
-        data: {
-          id: `edge-blkptr-${selectedObject}`,
-          source: `obj-${selectedObject}`,
-          target: blkptrId,
-          label: 'data',
-          edgeType: 'physical',
-        },
-      })
+      if (remaining > 0) {
+        const moreId = `zap-more-${selectedObject}`
+        nodes.push({
+          data: {
+            id: moreId,
+            label: `+${remaining} more`,
+            type: 'zap-more',
+          },
+        })
+        edges.push({
+          data: {
+            id: `edge-zap-more-${selectedObject}`,
+            source: `obj-${selectedObject}`,
+            target: moreId,
+            label: 'more',
+            edgeType: 'zap',
+          },
+        })
+      }
+    }
+
+    // Physical edges (collapsed or expanded)
+    if (showPhysical) {
+      const validBlkptrs = blkptrs.filter(bp => !bp.is_hole)
+      if (validBlkptrs.length > 0) {
+        if (showBlkptrDetails) {
+          validBlkptrs.forEach(bp => {
+            const blkptrId = `blkptr-${selectedObject}-${bp.index}`
+            nodes.push({
+              data: {
+                id: blkptrId,
+                label: bp.is_spill ? 'spill' : `blkptr ${bp.index}`,
+                sublabel: `${bp.ndvas} DVA${bp.ndvas === 1 ? '' : 's'}`,
+                type: 'physical-detail',
+              },
+            })
+            edges.push({
+              data: {
+                id: `edge-blkptr-${selectedObject}-${bp.index}`,
+                source: `obj-${selectedObject}`,
+                target: blkptrId,
+                label: bp.is_spill ? 'spill' : `blkptr ${bp.index}`,
+                edgeType: 'physical',
+              },
+            })
+          })
+        } else {
+          const blkptrId = `blkptrs-${selectedObject}`
+          nodes.push({
+            data: {
+              id: blkptrId,
+              label: `blkptrs (${validBlkptrs.length})`,
+              sublabel: `${validBlkptrs.reduce((sum, bp) => sum + bp.ndvas, 0)} DVAs`,
+              type: 'physical',
+            },
+          })
+          edges.push({
+            data: {
+              id: `edge-blkptr-${selectedObject}`,
+              source: `obj-${selectedObject}`,
+              target: blkptrId,
+              label: 'data',
+              edgeType: 'physical',
+            },
+          })
+        }
+      }
     }
 
     return [...nodes, ...edges]
-  }, [selectedObject, objectTypeName, semanticEdges, zapEntries, blkptrs])
+  }, [
+    selectedObject,
+    objectTypeName,
+    semanticEdges,
+    zapEntries,
+    blkptrs,
+    extraEdges,
+    extraNodes,
+    showSemantic,
+    showZap,
+    showPhysical,
+    showBlkptrDetails,
+  ])
 
   // Initialize/update cytoscape
   useEffect(() => {
@@ -198,6 +345,19 @@ export function ObjectGraph({
           },
         },
         {
+          selector: 'node[type="zap-more"]',
+          style: {
+            'background-color': 'rgba(255, 255, 255, 0.05)',
+            'border-color': 'rgba(255, 255, 255, 0.2)',
+            'border-style': 'dashed',
+            shape: 'rectangle',
+            width: 70,
+            height: 36,
+            'font-size': '10px',
+            color: '#9aa3b2',
+          },
+        },
+        {
           selector: 'node[type="physical"]',
           style: {
             'background-color': 'rgba(149, 117, 205, 0.15)',
@@ -208,6 +368,36 @@ export function ObjectGraph({
           },
         },
         {
+          selector: 'node[type="expanded"]',
+          style: {
+            'background-color': 'rgba(77, 208, 225, 0.08)',
+            'border-color': '#4dd0e1',
+            width: 70,
+            height: 70,
+          },
+        },
+        {
+          selector: 'node[type="physical-detail"]',
+          style: {
+            'background-color': 'rgba(149, 117, 205, 0.08)',
+            'border-color': '#9575cd',
+            shape: 'rectangle',
+            width: 70,
+            height: 44,
+            'font-size': '9px',
+          },
+        },
+        {
+          selector: 'node:selected',
+          style: {
+            'border-width': 4,
+            'border-color': '#ffd166',
+            'shadow-blur': 12,
+            'shadow-color': '#ffd166',
+            'shadow-opacity': 0.6,
+          },
+        },
+        {
           selector: 'edge',
           style: {
             width: 2,
@@ -215,11 +405,17 @@ export function ObjectGraph({
             'target-arrow-color': '#4dd0e1',
             'target-arrow-shape': 'triangle',
             'curve-style': 'bezier',
-            label: 'data(label)',
+            label: '',
             'font-size': '9px',
             color: '#9aa3b2',
             'text-rotation': 'autorotate',
             'text-margin-y': -10,
+          },
+        },
+        {
+          selector: 'edge:selected, edge:hover',
+          style: {
+            label: 'data(label)',
           },
         },
         {
@@ -244,15 +440,32 @@ export function ObjectGraph({
             'line-style': 'dashed',
           },
         },
-      ],
-      layout: {
-        name: 'cose',
-        animate: false,
-        padding: 30,
-        nodeRepulsion: () => 8000,
-        idealEdgeLength: () => 120,
-        nodeOverlap: 20,
-      },
+      ] as any,
+      layout: (() => {
+        const normalized = objectTypeName.toLowerCase()
+        if (normalized.includes('child map')) {
+          return {
+            name: 'breadthfirst',
+            directed: true,
+            spacingFactor: 1.3,
+            padding: 40,
+          }
+        }
+        if (normalized.includes('zap')) {
+          return {
+            name: 'circle',
+            padding: 40,
+          }
+        }
+        return {
+          name: 'cose',
+          animate: false,
+          padding: 30,
+          nodeRepulsion: () => 8000,
+          idealEdgeLength: () => 120,
+          nodeOverlap: 20,
+        }
+      })(),
       userZoomingEnabled: true,
       userPanningEnabled: true,
       boxSelectionEnabled: false,
@@ -278,6 +491,37 @@ export function ObjectGraph({
       }
     })
 
+    const typeLabels: Record<string, string> = {
+      center: 'Selected object',
+      semantic: 'Semantic edge',
+      zap: 'ZAP reference',
+      physical: 'Physical block',
+      'physical-detail': 'Block pointer',
+      expanded: 'Expanded node',
+      'zap-more': 'More ZAP refs',
+    }
+
+    cy.on('mouseover', 'node', evt => {
+      const data = evt.target.data()
+      const rawLabel = typeof data.label === 'string' ? data.label : ''
+      const labelFirst = rawLabel.split('\n')[0] || rawLabel
+      const objid = data.objid as number | undefined
+      const kind = data.type ? typeLabels[data.type] ?? data.type : undefined
+
+      setHoverInfo({
+        title: objid !== undefined ? `Object ${objid}` : labelFirst,
+        subtitle:
+          objid !== undefined && labelFirst && labelFirst !== `#${objid}`
+            ? labelFirst
+            : data.sublabel,
+        kind,
+      })
+    })
+
+    cy.on('mouseout', 'node', () => {
+      setHoverInfo(null)
+    })
+
     cyRef.current = cy
 
     return () => {
@@ -293,5 +537,38 @@ export function ObjectGraph({
     )
   }
 
-  return <div ref={containerRef} className="cytoscape-container" />
+  return (
+    <div className="graph-canvas">
+      <div ref={containerRef} className="cytoscape-container" />
+      {hoverInfo && (
+        <div className="graph-tooltip">
+          <div className="graph-tooltip-title">{hoverInfo.title}</div>
+          {hoverInfo.subtitle && <div className="graph-tooltip-sub">{hoverInfo.subtitle}</div>}
+          {hoverInfo.kind && <div className="graph-tooltip-kind">{hoverInfo.kind}</div>}
+        </div>
+      )}
+      <div className="graph-legend">
+        <div className="legend-row">
+          <span className="legend-swatch legend-center" />
+          Selected
+        </div>
+        <div className="legend-row">
+          <span className="legend-swatch legend-semantic" />
+          Semantic
+        </div>
+        <div className="legend-row">
+          <span className="legend-swatch legend-zap" />
+          ZAP ref
+        </div>
+        <div className="legend-row">
+          <span className="legend-swatch legend-physical" />
+          Physical
+        </div>
+        <div className="legend-row">
+          <span className="legend-line legend-physical-line" />
+          Physical edge
+        </div>
+      </div>
+    </div>
+  )
 }

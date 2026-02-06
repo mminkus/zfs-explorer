@@ -54,6 +54,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(api::dsl_dir_head),
         )
         .route("/api/pools/{pool}/dsl/root", get(api::dsl_root_dir))
+        .route("/api/pools/{pool}/datasets/tree", get(api::dataset_tree))
+        .route("/api/pools/{pool}/dataset/{objid}/head", get(api::dataset_head))
+        .route("/api/pools/{pool}/objset/{objset_id}/root", get(api::objset_root))
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/dir/{dir_obj}/entries",
+            get(api::objset_dir_entries),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/walk",
+            get(api::objset_walk),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/stat/{objid}",
+            get(api::objset_stat),
+        )
+        .route("/api/pools/{pool}/block", get(api::read_block))
         .route("/api/pools/{pool}/graph/from/{objid}", get(api::graph_from))
         .route("/api/mos/types", get(api::list_dmu_types))
         .with_state(state)

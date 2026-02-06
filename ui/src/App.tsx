@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState, useCallback } from 'react'
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import './App.css'
 import { ObjectGraph } from './components/ObjectGraph'
+import { ZapMapView } from './components/ZapMapView'
 
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
@@ -91,6 +92,48 @@ type BlkptrResponse = {
   blkptrs: BlkptrInfo[]
 }
 
+type RawBlockResponse = {
+  vdev: number
+  offset: number
+  size: number
+  asize: number
+  requested: number
+  truncated: boolean
+  data_hex: string
+}
+
+type DatasetTreeNode = {
+  name: string
+  dsl_dir_obj: number
+  head_dataset_obj: number | null
+  child_dir_zapobj: number | null
+  children: DatasetTreeNode[]
+}
+
+type DatasetTreeResponse = {
+  root: DatasetTreeNode
+  depth: number
+  limit: number
+  truncated: boolean
+  count: number
+}
+
+type FsEntry = {
+  name: string
+  objid: number
+  type: number
+  type_name: string
+}
+
+type FsDirResponse = {
+  objset_id: number
+  dir_obj: number
+  cursor: number
+  next: number | null
+  count: number
+  entries: FsEntry[]
+}
+
 type ZapInfo = {
   object: number
   kind: string
@@ -139,6 +182,17 @@ type SemanticEdge = {
   notes?: string
 }
 
+type GraphNode = {
+  objid: number
+  type: number | null
+  bonus_type: number | null
+}
+
+type GraphResponse = {
+  nodes: GraphNode[]
+  edges: SemanticEdge[]
+}
+
 type BonusDecodedDslDir = {
   kind: 'dsl_dir'
   head_dataset_obj: number
@@ -158,6 +212,11 @@ type BonusDecodedDslDataset = {
 
 type BonusDecoded = BonusDecodedDslDir | BonusDecodedDslDataset | { kind: string }
 
+type PinnedObject = {
+  objid: number
+  typeName?: string
+}
+
 function App() {
   const [pools, setPools] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -165,7 +224,6 @@ function App() {
   const [selectedPool, setSelectedPool] = useState<string | null>(null)
   const [formatMode, setFormatMode] = useState<'dec' | 'hex'>('dec')
   const [typeFilter, setTypeFilter] = useState<number | null>(null)
-  const [typeInput, setTypeInput] = useState('')
   const [dmuTypes, setDmuTypes] = useState<DmuType[]>([])
   const [typesError, setTypesError] = useState<string | null>(null)
   const [mosObjects, setMosObjects] = useState<MosObject[]>([])
@@ -182,19 +240,43 @@ function App() {
   const [zapNext, setZapNext] = useState<number | null>(null)
   const [zapLoading, setZapLoading] = useState(false)
   const [zapError, setZapError] = useState<string | null>(null)
-  const [dslRoot, setDslRoot] = useState<{ root_dataset_obj: number; root_dir_obj: number } | null>(
-    null
-  )
-  const [dslChildren, setDslChildren] = useState<Record<number, { name: string; dir_objid: number }[]>>(
-    {}
-  )
-  const [dslExpanded, setDslExpanded] = useState<Record<number, boolean>>({})
-  const [dslLoading, setDslLoading] = useState(false)
-  const [dslError, setDslError] = useState<string | null>(null)
+  const [datasetTree, setDatasetTree] = useState<DatasetTreeResponse | null>(null)
+  const [datasetExpanded, setDatasetExpanded] = useState<Record<number, boolean>>({})
+  const [datasetLoading, setDatasetLoading] = useState(false)
+  const [datasetError, setDatasetError] = useState<string | null>(null)
+  const [fsState, setFsState] = useState<{
+    datasetName: string
+    dslDirObj: number
+    headDatasetObj: number
+    objsetId: number
+    rootObj: number
+    currentDir: number
+    path: { name: string; objid: number }[]
+  } | null>(null)
+  const [fsEntries, setFsEntries] = useState<FsEntry[]>([])
+  const [fsNext, setFsNext] = useState<number | null>(null)
+  const [fsLoading, setFsLoading] = useState(false)
+  const [fsError, setFsError] = useState<string | null>(null)
   const [navStack, setNavStack] = useState<number[]>([])
   const [navIndex, setNavIndex] = useState(-1)
   const [inspectorTab, setInspectorTab] = useState<'summary' | 'zap' | 'blkptr' | 'raw'>('summary')
+  const [rawView, setRawView] = useState<'json' | 'hex'>('json')
+  const [hexDump, setHexDump] = useState<RawBlockResponse | null>(null)
+  const [hexLoading, setHexLoading] = useState(false)
+  const [hexError, setHexError] = useState<string | null>(null)
   const [zdbCopied, setZdbCopied] = useState(false)
+  const [leftPaneTab, setLeftPaneTab] = useState<'datasets' | 'mos' | 'fs'>('datasets')
+  const [pinnedByPool, setPinnedByPool] = useState<Record<string, PinnedObject[]>>({})
+  const [graphSearch, setGraphSearch] = useState('')
+  const [showBlkptrDetails, setShowBlkptrDetails] = useState(false)
+  const [showPhysicalEdges, setShowPhysicalEdges] = useState(false)
+  const [graphExtraEdges, setGraphExtraEdges] = useState<SemanticEdge[]>([])
+  const [graphExtraNodes, setGraphExtraNodes] = useState<number[]>([])
+  const [graphExpandedFrom, setGraphExpandedFrom] = useState<number[]>([])
+  const [graphExpanding, setGraphExpanding] = useState(false)
+  const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
+  const [centerView, setCenterView] = useState<'explore' | 'graph' | 'physical'>('explore')
+  const hexRequestKey = useRef<string | null>(null)
 
   const zapObjectKeys = useMemo(
     () =>
@@ -227,6 +309,27 @@ function App() {
   const formatDvaZdb = (dva: DvaInfo) =>
     `<${dva.vdev}:${formatHexNoPrefix(dva.offset)}:${formatHexNoPrefix(dva.asize)}>`
 
+  const formatHexDump = (hex: string, baseOffset: number) => {
+    const bytesPerLine = 16
+    const lines: string[] = []
+    for (let i = 0; i < hex.length; i += bytesPerLine * 2) {
+      const slice = hex.slice(i, i + bytesPerLine * 2)
+      const bytes = slice.match(/.{1,2}/g) ?? []
+      const hexPart = bytes.map(b => b.padEnd(2, ' ')).join(' ')
+      const asciiPart = bytes
+        .map(b => {
+          const val = Number.parseInt(b, 16)
+          if (Number.isNaN(val)) return '.'
+          return val >= 32 && val <= 126 ? String.fromCharCode(val) : '.'
+        })
+        .join('')
+      const offset = (baseOffset + i / 2).toString(16).padStart(8, '0')
+      const paddedHex = hexPart.padEnd(bytesPerLine * 3 - 1, ' ')
+      lines.push(`${offset}  ${paddedHex}  ${asciiPart}`)
+    }
+    return lines.join('\n')
+  }
+
   const resetInspector = () => {
     setSelectedObject(null)
     setObjectInfo(null)
@@ -235,7 +338,20 @@ function App() {
     setZapEntries([])
     setZapNext(null)
     setZapError(null)
+    setHexDump(null)
+    setHexLoading(false)
+    setHexError(null)
+    setGraphExtraEdges([])
+    setGraphExtraNodes([])
+    setGraphExpandedFrom([])
+    setGraphExpandError(null)
+    setShowPhysicalEdges(false)
+    setCenterView('explore')
   }
+
+  const pinnedObjects = selectedPool ? pinnedByPool[selectedPool] ?? [] : []
+  const isPinned =
+    selectedObject !== null && pinnedObjects.some(entry => entry.objid === selectedObject)
 
   const navigateTo = useCallback(
     (
@@ -352,70 +468,169 @@ function App() {
     }
   }, [pools, selectedPool])
 
-  const fetchDslRoot = async (pool: string) => {
-    setDslLoading(true)
-    setDslError(null)
+  const fetchDatasetTree = async (pool: string) => {
+    setDatasetLoading(true)
+    setDatasetError(null)
     try {
-      const res = await fetch(`${API_BASE}/api/pools/${encodeURIComponent(pool)}/dsl/root`)
-      if (!res.ok) {
-        throw new Error(`DSL root HTTP ${res.status}`)
-      }
-      const data = await res.json()
-      setDslRoot(data)
-      setDslChildren({})
-      setDslExpanded({})
-    } catch (err) {
-      setDslError((err as Error).message)
-    } finally {
-      setDslLoading(false)
-    }
-  }
-
-  const fetchDslChildren = async (pool: string, dirObj: number) => {
-    try {
+      const params = new URLSearchParams()
+      params.set('depth', '4')
+      params.set('limit', '500')
       const res = await fetch(
-        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/dsl/dir/${dirObj}/children`
+        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/datasets/tree?${params.toString()}`
       )
       if (!res.ok) {
-        throw new Error(`DSL children HTTP ${res.status}`)
+        throw new Error(`Dataset tree HTTP ${res.status}`)
       }
-      const data = await res.json()
-      setDslChildren(prev => ({ ...prev, [dirObj]: data.children ?? [] }))
+      const data: DatasetTreeResponse = await res.json()
+      setDatasetTree(data)
+      setDatasetExpanded({ [data.root.dsl_dir_obj]: true })
     } catch (err) {
-      setDslError((err as Error).message)
+      setDatasetError((err as Error).message)
+    } finally {
+      setDatasetLoading(false)
     }
   }
 
-  const toggleDslNode = (pool: string, dirObj: number) => {
-    setDslExpanded(prev => {
-      const next = { ...prev, [dirObj]: !prev[dirObj] }
-      return next
-    })
-    if (!dslChildren[dirObj]) {
-      fetchDslChildren(pool, dirObj)
-    }
+  const toggleDatasetNode = (dirObj: number) => {
+    setDatasetExpanded(prev => ({ ...prev, [dirObj]: !prev[dirObj] }))
   }
 
-  const renderDslNode = (pool: string, name: string, dirObj: number, depth: number) => {
-    const expanded = dslExpanded[dirObj]
-    const children = dslChildren[dirObj] ?? []
+  const renderDatasetNode = (node: DatasetTreeNode, depth: number) => {
+    const expanded = datasetExpanded[node.dsl_dir_obj] ?? depth === 0
+    const children = node.children ?? []
+    const hasChildren = children.length > 0
 
     return (
-      <div key={`${dirObj}-${name}`} className="dsl-node" style={{ marginLeft: depth * 12 }}>
-        <button className="dsl-toggle" onClick={() => toggleDslNode(pool, dirObj)}>
-          {expanded ? '▾' : '▸'}
-        </button>
-        <button className="dsl-name" onClick={() => navigateTo(dirObj)}>
-          {name}
-        </button>
-        <span className="dsl-id">#{dirObj}</span>
-        {expanded && children.length > 0 && (
+      <div key={`${node.dsl_dir_obj}-${node.name}`} style={{ marginLeft: depth * 12 }}>
+        <div className="dsl-node">
+          <button
+            className="dsl-toggle"
+            onClick={() => toggleDatasetNode(node.dsl_dir_obj)}
+            disabled={!hasChildren}
+          >
+            {hasChildren ? (expanded ? '▾' : '▸') : '•'}
+          </button>
+          <button className="dsl-name" onClick={() => enterFsFromDataset(node)}>
+            {node.name}
+          </button>
+          <span className="dsl-id">#{node.dsl_dir_obj}</span>
+        </div>
+        {expanded && hasChildren && (
           <div className="dsl-children">
-            {children.map(child => renderDslNode(pool, child.name, child.dir_objid, depth + 1))}
+            {children.map(child => renderDatasetNode(child, depth + 1))}
           </div>
         )}
       </div>
     )
+  }
+
+  const handleFsPathClick = (index: number) => {
+    if (!fsState) return
+    const nextPath = fsState.path.slice(0, index + 1)
+    const target = nextPath[nextPath.length - 1]
+    fetchFsDir(fsState.objsetId, target.objid, nextPath)
+  }
+
+  const handleFsEntryClick = (entry: FsEntry) => {
+    if (!fsState) return
+    if (entry.type_name !== 'dir') {
+      return
+    }
+    const nextPath = [...fsState.path, { name: entry.name, objid: entry.objid }]
+    fetchFsDir(fsState.objsetId, entry.objid, nextPath)
+  }
+
+  const fetchFsDir = async (
+    objsetId: number,
+    dirObj: number,
+    path: { name: string; objid: number }[]
+  ) => {
+    if (!selectedPool) return
+    setFsLoading(true)
+    setFsError(null)
+    try {
+      const params = new URLSearchParams()
+      params.set('cursor', '0')
+      params.set('limit', '500')
+      const res = await fetch(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${objsetId}/dir/${dirObj}/entries?${params.toString()}`
+      )
+      if (!res.ok) {
+        throw new Error(`FS entries HTTP ${res.status}`)
+      }
+      const data: FsDirResponse = await res.json()
+      setFsEntries(data.entries ?? [])
+      setFsNext(data.next ?? null)
+      setFsState(prev => {
+        if (!prev) {
+          return null
+        }
+        return {
+          ...prev,
+          currentDir: dirObj,
+          path,
+        }
+      })
+    } catch (err) {
+      setFsError((err as Error).message)
+    } finally {
+      setFsLoading(false)
+    }
+  }
+
+  const enterFsFromDataset = async (node: DatasetTreeNode) => {
+    if (!selectedPool) return
+    setLeftPaneTab('fs')
+    setFsLoading(true)
+    setFsError(null)
+    try {
+      const headRes = await fetch(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/dataset/${node.dsl_dir_obj}/head`
+      )
+      if (!headRes.ok) {
+        throw new Error(`Dataset head HTTP ${headRes.status}`)
+      }
+      const headData = await headRes.json()
+      const objsetId = Number(headData.objset_id)
+      const headDatasetObj = Number(headData.head_dataset_obj)
+      if (!objsetId) {
+        throw new Error('Missing objset_id from dataset head')
+      }
+
+      const rootRes = await fetch(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${objsetId}/root`
+      )
+      if (!rootRes.ok) {
+        throw new Error(`Objset root HTTP ${rootRes.status}`)
+      }
+      const rootData = await rootRes.json()
+      const rootObj = Number(rootData.root_obj)
+      if (!rootObj) {
+        throw new Error('Missing root_obj from objset root')
+      }
+
+      setFsState({
+        datasetName: node.name,
+        dslDirObj: node.dsl_dir_obj,
+        headDatasetObj,
+        objsetId,
+        rootObj,
+        currentDir: rootObj,
+        path: [{ name: node.name, objid: rootObj }],
+      })
+
+      await fetchFsDir(objsetId, rootObj, [{ name: node.name, objid: rootObj }])
+    } catch (err) {
+      setFsError((err as Error).message)
+    } finally {
+      setFsLoading(false)
+    }
   }
 
   const typeOptions = useMemo(() => {
@@ -455,16 +670,22 @@ function App() {
     if (!selectedPool) {
       setMosObjects([])
       setMosNext(null)
-      setDslRoot(null)
-      setDslChildren({})
-      setDslExpanded({})
+      setDatasetTree(null)
+      setDatasetExpanded({})
+      setFsState(null)
+      setFsEntries([])
+      setFsNext(null)
+      setFsLoading(false)
+      setFsError(null)
       setNavStack([])
       setNavIndex(-1)
+      setShowBlkptrDetails(false)
       return
     }
     resetInspector()
     setNavStack([])
     setNavIndex(-1)
+    setShowBlkptrDetails(false)
     fetchMosObjects(0, false)
   }, [selectedPool, typeFilter])
 
@@ -472,7 +693,7 @@ function App() {
     if (!selectedPool) {
       return
     }
-    fetchDslRoot(selectedPool)
+    fetchDatasetTree(selectedPool)
   }, [selectedPool])
 
   const fetchZapInfo = async (objid: number) => {
@@ -515,6 +736,16 @@ function App() {
     if (!selectedPool) return
     setInspectorLoading(true)
     setInspectorError(null)
+    setShowBlkptrDetails(false)
+    setShowPhysicalEdges(false)
+    setHexDump(null)
+    setHexLoading(false)
+    setHexError(null)
+    setGraphExtraEdges([])
+    setGraphExtraNodes([])
+    setGraphExpandedFrom([])
+    setGraphExpandError(null)
+    setCenterView('explore')
     setZapInfo(null)
     setZapEntries([])
     setZapNext(null)
@@ -554,6 +785,202 @@ function App() {
     navigateTo(objid, { reset: true })
   }
 
+  const pinSelectedObject = () => {
+    if (!selectedPool || selectedObject === null) return
+    setPinnedByPool(prev => {
+      const current = prev[selectedPool] ?? []
+      if (current.some(entry => entry.objid === selectedObject)) {
+        return prev
+      }
+      const typeName =
+        objectInfo?.type?.name ?? mosObjectMap.get(selectedObject)?.type_name ?? undefined
+      const updated = [{ objid: selectedObject, typeName }, ...current]
+      return { ...prev, [selectedPool]: updated }
+    })
+  }
+
+  const unpinObject = (objid: number) => {
+    if (!selectedPool) return
+    setPinnedByPool(prev => {
+      const current = prev[selectedPool] ?? []
+      return { ...prev, [selectedPool]: current.filter(entry => entry.objid !== objid) }
+    })
+  }
+
+  const handleGraphSearch = () => {
+    const trimmed = graphSearch.trim()
+    if (!trimmed) return
+    const objid = Number.parseInt(trimmed, 0)
+    if (Number.isNaN(objid)) return
+    navigateTo(objid)
+    setGraphSearch('')
+  }
+
+  const semanticEdges = objectInfo?.semantic_edges ?? []
+
+  const baseNeighborIds = useMemo(() => {
+    const ids = new Set<number>()
+    semanticEdges.forEach(edge => {
+      if (edge.target_obj !== undefined) ids.add(edge.target_obj)
+    })
+    zapEntries.forEach(entry => {
+      if (entry.maybe_object_ref && entry.target_obj !== null) {
+        ids.add(entry.target_obj)
+      }
+    })
+    return Array.from(ids)
+  }, [semanticEdges, zapEntries])
+
+  const effectiveCenterView = useMemo(() => {
+    if (centerView === 'explore') {
+      return objectInfo?.is_zap ? 'map' : 'graph'
+    }
+    return centerView
+  }, [centerView, objectInfo?.is_zap])
+
+  const showSemanticEdges = effectiveCenterView !== 'physical'
+  const showZapEdges = effectiveCenterView !== 'physical'
+  const showPhysicalEdgesActive =
+    effectiveCenterView === 'physical' ? true : showPhysicalEdges
+
+  const firstDataDva = useMemo(() => {
+    const list = blkptrs?.blkptrs ?? []
+    for (const bp of list) {
+      if (!bp.is_hole && bp.dvas.length > 0) {
+        return { bpIndex: bp.index, dvaIndex: 0, dva: bp.dvas[0] }
+      }
+    }
+    return null
+  }, [blkptrs])
+
+  const formattedHexDump = useMemo(() => {
+    if (!hexDump) return ''
+    return formatHexDump(hexDump.data_hex, hexDump.offset)
+  }, [hexDump])
+
+  useEffect(() => {
+    if (!selectedPool || selectedObject === null || rawView !== 'hex') {
+      return
+    }
+
+    if (!firstDataDva) {
+      setHexError('No readable DVA found for this object.')
+      return
+    }
+
+    const { dva } = firstDataDva
+    const limit = 64 * 1024
+    const key = `${selectedPool}:${selectedObject}:${dva.vdev}:${dva.offset}:${dva.asize}:${limit}`
+    if (hexRequestKey.current === key) {
+      return
+    }
+
+    hexRequestKey.current = key
+    setHexLoading(true)
+    setHexError(null)
+
+    const params = new URLSearchParams()
+    params.set('vdev', String(dva.vdev))
+    params.set('offset', String(dva.offset))
+    params.set('asize', String(dva.asize))
+    params.set('limit', String(limit))
+
+    fetch(`${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/block?${params}`)
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`Raw block HTTP ${res.status}`)
+        }
+        return res.json()
+      })
+      .then((data: RawBlockResponse) => {
+        setHexDump(data)
+      })
+      .catch(err => {
+        setHexError((err as Error).message)
+      })
+      .finally(() => {
+        setHexLoading(false)
+      })
+  }, [selectedPool, selectedObject, rawView, firstDataDva])
+
+  useEffect(() => {
+    if (!showPhysicalEdgesActive) {
+      setShowBlkptrDetails(false)
+    }
+  }, [showPhysicalEdgesActive])
+
+  const expandGraph = async () => {
+    if (!selectedPool || selectedObject === null || graphExpanding) return
+
+    const knownNodes = new Set<number>([selectedObject, ...baseNeighborIds, ...graphExtraNodes])
+    graphExtraEdges.forEach(edge => {
+      knownNodes.add(edge.source_obj)
+      knownNodes.add(edge.target_obj)
+    })
+
+    const alreadyExpanded = new Set(graphExpandedFrom)
+    const frontier = Array.from(knownNodes)
+      .filter(objid => objid !== selectedObject && !alreadyExpanded.has(objid))
+      .slice(0, 8)
+
+    if (frontier.length === 0) {
+      setGraphExpandError('No additional nodes to expand yet.')
+      return
+    }
+
+    setGraphExpanding(true)
+    setGraphExpandError(null)
+
+    try {
+      const results = await Promise.all(
+        frontier.map(async objid => {
+          const res = await fetch(
+            `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/graph/from/${objid}?include=semantic,zap`
+          )
+          if (!res.ok) {
+            throw new Error(`Graph expand HTTP ${res.status}`)
+          }
+          return (await res.json()) as GraphResponse
+        })
+      )
+
+      const newNodes = new Set<number>(graphExtraNodes)
+      const newEdges = new Map<string, SemanticEdge>()
+
+      graphExtraEdges.forEach(edge => {
+        const key = `${edge.kind}:${edge.source_obj}:${edge.target_obj}:${edge.label}`
+        newEdges.set(key, edge)
+      })
+
+      results.forEach(result => {
+        result.nodes?.forEach(node => {
+          if (node.objid !== selectedObject) {
+            newNodes.add(node.objid)
+          }
+        })
+        result.edges?.forEach(edge => {
+          const key = `${edge.kind}:${edge.source_obj}:${edge.target_obj}:${edge.label}`
+          newEdges.set(key, edge)
+        })
+      })
+
+      setGraphExtraNodes(Array.from(newNodes))
+      setGraphExtraEdges(Array.from(newEdges.values()))
+      setGraphExpandedFrom(prev => Array.from(new Set([...prev, ...frontier])))
+    } catch (err) {
+      setGraphExpandError((err as Error).message)
+    } finally {
+      setGraphExpanding(false)
+    }
+  }
+
+  const resetGraphExpansion = () => {
+    setGraphExtraEdges([])
+    setGraphExtraNodes([])
+    setGraphExpandedFrom([])
+    setGraphExpandError(null)
+  }
+
   const handleCopyZdbCommand = () => {
     if (selectedPool && selectedObject !== null) {
       const cmd = `sudo zdb -dddd ${selectedPool} ${selectedObject}`
@@ -566,8 +993,6 @@ function App() {
 
   const isZapObjectKey = (entry: ZapEntry) =>
     zapObjectKeys.has(entry.name) && entry.maybe_object_ref && entry.target_obj !== null
-
-  const semanticEdges = objectInfo?.semantic_edges ?? []
 
   const bonusEntries = useMemo(() => {
     const bonus = objectInfo?.bonus_decoded
@@ -601,37 +1026,59 @@ function App() {
     }))
   }, [objectInfo?.bonus_decoded])
 
-  const handleTypeInput = (value: string) => {
-    setTypeInput(value)
-    const parsed = Number(value)
-    if (!Number.isNaN(parsed) && value.trim() !== '') {
-      setTypeFilter(parsed)
-    } else if (value.trim() === '') {
-      setTypeFilter(null)
-    }
+  const renderPinnedSection = () => {
+    if (!selectedPool) return null
+    return (
+      <div className="pinned-section">
+        <h3>Pinned Objects</h3>
+        {pinnedObjects.length === 0 && <p className="muted">No pinned objects yet.</p>}
+        {pinnedObjects.length > 0 && (
+          <ul className="pinned-list">
+            {pinnedObjects.map(entry => (
+              <li key={entry.objid} className="pinned-item">
+                <button className="pinned-link" onClick={() => navigateTo(entry.objid)}>
+                  Object {entry.objid}
+                </button>
+                {entry.typeName && <span className="pinned-hint">({entry.typeName})</span>}
+                <button
+                  className="pinned-remove"
+                  onClick={() => unpinObject(entry.objid)}
+                  title="Remove pin"
+                >
+                  ✕
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    )
   }
 
   return (
     <div className="app">
       <header className="topbar">
         <div>
-          <h1>ZFS Explorer</h1>
-          <p className="subtitle">Milestone 1: MOS Object Browser</p>
+          <strong>ZFS Explorer</strong>
+          <p className="subtitle">Milestone 6: Filesystem Navigation</p>
         </div>
         <div className="status">
-          <div className="format-toggle">
-            <button
-              className={formatMode === 'dec' ? 'toggle active' : 'toggle'}
-              onClick={() => setFormatMode('dec')}
-            >
-              DEC
-            </button>
-            <button
-              className={formatMode === 'hex' ? 'toggle active' : 'toggle'}
-              onClick={() => setFormatMode('hex')}
-            >
-              HEX
-            </button>
+          <div className="status-item">
+            <span>Format</span>
+            <div className="format-toggle">
+              <button
+                className={formatMode === 'dec' ? 'toggle active' : 'toggle'}
+                onClick={() => setFormatMode('dec')}
+              >
+                DEC
+              </button>
+              <button
+                className={formatMode === 'hex' ? 'toggle active' : 'toggle'}
+                onClick={() => setFormatMode('hex')}
+              >
+                HEX
+              </button>
+            </div>
           </div>
           <div className="status-item">
             <span>Backend</span>
@@ -674,6 +1121,7 @@ function App() {
               setNavIndex(-1)
               setSelectedPool(selectedPool)
             }}
+            title={`Pool ${selectedPool}`}
           >
             Pool {selectedPool}
           </button>
@@ -688,6 +1136,7 @@ function App() {
             setNavStack([])
             setNavIndex(-1)
           }}
+          title="MOS object list"
         >
           MOS
         </button>
@@ -703,6 +1152,7 @@ function App() {
                   fetchInspector(objid)
                 }
               }}
+              title={`Object ${objid}${mosObjectMap.get(objid)?.type_name ? ` · ${mosObjectMap.get(objid)?.type_name}` : ''}`}
             >
               Object {objid}
               {mosObjectMap.get(objid)?.type_name
@@ -715,148 +1165,389 @@ function App() {
 
       <div className="main-grid">
         <aside className="panel pane-left">
-          <h2>Tree</h2>
-          <div className="tree">
-            <details open>
-              <summary>Pools</summary>
-              {loading && <p className="muted">Loading pools...</p>}
-              {error && (
-                <div className="error">
-                  <strong>Error:</strong> {error}
-                  <p className="hint">
-                    Make sure the API backend is running on <code>localhost:9000</code>
-                  </p>
-                </div>
-              )}
-              {!loading && !error && pools.length === 0 && (
-                <p className="muted">No pools found</p>
-              )}
-              {!loading && !error && pools.length > 0 && (
-                <ul className="tree-list">
-                  {pools.map(pool => (
-                    <li key={pool}>
-                      <details open={selectedPool === pool}>
-                        <summary
-                          className={`tree-item ${selectedPool === pool ? 'active' : ''}`}
-                          onClick={e => {
-                            e.preventDefault()
-                            setSelectedPool(pool)
-                          }}
-                        >
-                          {pool}
-                        </summary>
-                        <div className="tree-sub">
-                          <div className="tree-label">MOS</div>
-                          <div className="type-filter">
-                            <label>Type filter</label>
-                            <input
-                              type="text"
-                              placeholder="Type id (blank = all)"
-                              value={typeInput}
-                              onChange={e => handleTypeInput(e.target.value)}
-                            />
-                          </div>
-                          {typesError && (
-                            <p className="muted">Type list: {typesError}</p>
-                          )}
-                          <div className="type-chips">
-                            <button
-                              className={typeFilter === null ? 'chip active' : 'chip'}
-                              onClick={() => {
-                                setTypeInput('')
-                                setTypeFilter(null)
-                              }}
-                            >
-                              All
-                            </button>
-                            {typeOptions.slice(0, 12).map(option => (
-                              <button
-                                key={option.id}
-                                className={typeFilter === option.id ? 'chip active' : 'chip'}
-                                onClick={() => {
-                                  setTypeInput(String(option.id))
-                                  setTypeFilter(option.id)
-                                }}
-                                title={`DMU type ${option.id}`}
-                              >
-                                {option.name}
-                              </button>
-                            ))}
-                          </div>
-                          <div className="tree-sub">
-                            <div className="tree-label">Datasets</div>
-                            {dslLoading && <p className="muted">Loading dataset tree...</p>}
-                            {dslError && <p className="muted">Dataset tree: {dslError}</p>}
-                            {dslRoot &&
-                              renderDslNode(pool, pool, dslRoot.root_dir_obj, 0)}
-                          </div>
-                        </div>
-                      </details>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </details>
+          <div className="panel-header">
+            <h2>Navigator</h2>
           </div>
 
-          <div className="divider" />
+          <div className="left-pane-tabs">
+            <button
+              className={`tab ${leftPaneTab === 'datasets' ? 'active' : ''}`}
+              onClick={() => setLeftPaneTab('datasets')}
+            >
+              Datasets
+            </button>
+            <button
+              className={`tab ${leftPaneTab === 'fs' ? 'active' : ''}`}
+              onClick={() => setLeftPaneTab('fs')}
+            >
+              FS
+            </button>
+            <button
+              className={`tab ${leftPaneTab === 'mos' ? 'active' : ''}`}
+              onClick={() => setLeftPaneTab('mos')}
+            >
+              MOS
+            </button>
+          </div>
 
-          <h2>MOS Objects</h2>
+          {leftPaneTab === 'datasets' && (
+            <div className="left-pane-content">
+              {renderPinnedSection()}
+              <div className="pool-selector">
+                <label>Pool</label>
+                {loading && <p className="muted">Loading pools...</p>}
+                {error && (
+                  <div className="error">
+                    <strong>Error:</strong> {error}
+                    <p className="hint">
+                      Make sure the API backend is running on <code>localhost:9000</code>
+                    </p>
+                  </div>
+                )}
+                {!loading && !error && pools.length === 0 && (
+                  <p className="muted">No pools found</p>
+                )}
+                {!loading && !error && pools.length > 0 && (
+                  <select
+                    value={selectedPool ?? ''}
+                    onChange={e => setSelectedPool(e.target.value)}
+                    className="pool-select"
+                  >
+                    {pools.map(pool => (
+                      <option key={pool} value={pool}>
+                        {pool}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
 
-          {mosLoading && <p className="muted">Loading MOS objects...</p>}
-          {mosError && (
-            <div className="error">
-              <strong>Error:</strong> {mosError}
+              {selectedPool && (
+                <div className="dataset-tree">
+                  <h3>Dataset Tree</h3>
+                  {datasetLoading && <p className="muted">Loading dataset tree...</p>}
+                  {datasetError && <p className="muted">Error: {datasetError}</p>}
+                  {datasetTree && renderDatasetNode(datasetTree.root, 0)}
+                  {datasetTree?.truncated && (
+                    <p className="muted">
+                      Tree truncated at {datasetTree.count} nodes (limit {datasetTree.limit}).
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
-          <ul className="object-list">
-            {mosObjects.map(obj => (
-              <li
-                key={obj.id}
-                className={`object-item ${selectedObject === obj.id ? 'active' : ''}`}
-                onClick={() => handleSelectObject(obj.id)}
-              >
-                <div>
-                  <span className="object-id">#{obj.id}</span>
-                  <span className="object-type">{obj.type_name}</span>
-                </div>
-                <span className="object-meta">bonus {obj.bonus_type_name}</span>
-              </li>
-            ))}
-          </ul>
+          {leftPaneTab === 'fs' && (
+            <div className="left-pane-content">
+              {renderPinnedSection()}
+              <div className="pool-selector">
+                <label>Pool</label>
+                {loading && <p className="muted">Loading pools...</p>}
+                {error && (
+                  <div className="error">
+                    <strong>Error:</strong> {error}
+                    <p className="hint">
+                      Make sure the API backend is running on <code>localhost:9000</code>
+                    </p>
+                  </div>
+                )}
+                {!loading && !error && pools.length === 0 && (
+                  <p className="muted">No pools found</p>
+                )}
+                {!loading && !error && pools.length > 0 && (
+                  <select
+                    value={selectedPool ?? ''}
+                    onChange={e => setSelectedPool(e.target.value)}
+                    className="pool-select"
+                  >
+                    {pools.map(pool => (
+                      <option key={pool} value={pool}>
+                        {pool}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              <div className="fs-panel">
+                <h3>Filesystem Navigator</h3>
+                {!fsState && (
+                  <p className="muted">
+                    Select a dataset from the Datasets tab to start browsing.
+                  </p>
+                )}
+                {fsState && (
+                  <>
+                    <div className="fs-path">
+                      {fsState.path.map((seg, idx) => (
+                        <button
+                          key={`${seg.objid}-${idx}`}
+                          className={`fs-path-seg ${idx === fsState.path.length - 1 ? 'active' : ''}`}
+                          onClick={() => handleFsPathClick(idx)}
+                        >
+                          {seg.name}
+                        </button>
+                      ))}
+                    </div>
 
-          {mosNext !== null && !mosLoading && (
-            <button
-              className="load-more"
-              onClick={() => fetchMosObjects(mosNext, true)}
-            >
-              Load more
-            </button>
+                    <div className="fs-meta">
+                      <span>objset {fsState.objsetId}</span>
+                      <span>dir {fsState.currentDir}</span>
+                    </div>
+
+                    {fsLoading && <p className="muted">Loading directory…</p>}
+                    {fsError && <p className="muted">Error: {fsError}</p>}
+
+                    {!fsLoading && !fsError && (
+                      <div className="fs-table">
+                        <div className="fs-row fs-header">
+                          <div>Name</div>
+                          <div>Type</div>
+                          <div>Object</div>
+                        </div>
+                        {fsEntries.map(entry => (
+                          <div
+                            key={`${entry.name}-${entry.objid}`}
+                            className={`fs-row ${entry.type_name === 'dir' ? 'clickable' : ''}`}
+                            onClick={() => handleFsEntryClick(entry)}
+                          >
+                            <div className="fs-name">{entry.name}</div>
+                            <div className="fs-type">{entry.type_name}</div>
+                            <div className="fs-obj">#{entry.objid}</div>
+                          </div>
+                        ))}
+                        {fsEntries.length === 0 && (
+                          <div className="fs-empty">No entries found.</div>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {leftPaneTab === 'mos' && (
+            <div className="left-pane-content">
+              {renderPinnedSection()}
+              <div className="pool-selector">
+                <label>Pool</label>
+                {loading && <p className="muted">Loading pools...</p>}
+                {error && (
+                  <div className="error">
+                    <strong>Error:</strong> {error}
+                    <p className="hint">
+                      Make sure the API backend is running on <code>localhost:9000</code>
+                    </p>
+                  </div>
+                )}
+                {!loading && !error && pools.length === 0 && (
+                  <p className="muted">No pools found</p>
+                )}
+                {!loading && !error && pools.length > 0 && (
+                  <select
+                    value={selectedPool ?? ''}
+                    onChange={e => setSelectedPool(e.target.value)}
+                    className="pool-select"
+                  >
+                    {pools.map(pool => (
+                      <option key={pool} value={pool}>
+                        {pool}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              {selectedPool && (
+                <>
+                  <div className="type-filter-section">
+                    <label>Type filter</label>
+                    {typesError && <p className="muted">Error: {typesError}</p>}
+                    {!typesError && (
+                      <select
+                        value={typeFilter === null ? '' : String(typeFilter)}
+                        onChange={e => {
+                          const val = e.target.value
+                          setTypeFilter(val === '' ? null : Number(val))
+                        }}
+                        className="pool-select"
+                      >
+                        <option value="">All types</option>
+                        {typeOptions.map(option => (
+                          <option key={option.id} value={option.id}>
+                            {option.name} ({option.id})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+
+                  <div className="mos-objects-section">
+                    <h3>MOS Objects</h3>
+                    {mosLoading && <p className="muted">Loading MOS objects...</p>}
+                    {mosError && (
+                      <div className="error">
+                        <strong>Error:</strong> {mosError}
+                      </div>
+                    )}
+
+                    <ul className="object-list">
+                      {mosObjects.map(obj => (
+                        <li
+                          key={obj.id}
+                          className={`object-item ${selectedObject === obj.id ? 'active' : ''}`}
+                          onClick={() => handleSelectObject(obj.id)}
+                        >
+                          <div>
+                            <span className="object-id">#{obj.id}</span>
+                            <span className="object-type">{obj.type_name}</span>
+                          </div>
+                          <span className="object-meta">bonus {obj.bonus_type_name}</span>
+                        </li>
+                      ))}
+                    </ul>
+
+                    {mosNext !== null && !mosLoading && (
+                      <button
+                        className="load-more"
+                        onClick={() => fetchMosObjects(mosNext, true)}
+                      >
+                        Load more
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           )}
         </aside>
 
         <section className="panel pane-center">
-          <div className="panel-header">
-            <h2>Object Graph</h2>
-            <span className="muted">1-hop neighborhood</span>
+          <div className="panel-header graph-header">
+            <div>
+              <h2>Object Graph</h2>
+              <span className="muted">1-hop neighborhood</span>
+            </div>
+            <div className="graph-controls">
+              <div className="graph-view-toggle">
+                <button
+                  className={`graph-btn ${centerView === 'explore' ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setCenterView('explore')}
+                >
+                  Explore
+                </button>
+                <button
+                  className={`graph-btn ${centerView === 'graph' ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setCenterView('graph')}
+                >
+                  Graph
+                </button>
+                <button
+                  className={`graph-btn ${centerView === 'physical' ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setCenterView('physical')}
+                >
+                  Physical
+                </button>
+              </div>
+              <input
+                className="graph-search"
+                placeholder="Go to object ID"
+                value={graphSearch}
+                onChange={e => setGraphSearch(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    handleGraphSearch()
+                  }
+                }}
+              />
+              <button className="graph-btn" type="button" onClick={handleGraphSearch}>
+                Go
+              </button>
+              {effectiveCenterView !== 'map' && (
+                <>
+                  {effectiveCenterView !== 'physical' && (
+                    <button
+                      className="graph-btn"
+                      type="button"
+                      onClick={expandGraph}
+                      disabled={graphExpanding || selectedObject === null}
+                    >
+                      {graphExpanding ? 'Expanding…' : 'Expand +1 hop'}
+                    </button>
+                  )}
+                  {effectiveCenterView !== 'physical' && (
+                    <button
+                      className={`graph-btn ${showPhysicalEdges ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => setShowPhysicalEdges(prev => !prev)}
+                    >
+                      Physical edges
+                    </button>
+                  )}
+                  <button
+                    className={`graph-btn ${showBlkptrDetails ? 'active' : ''}`}
+                    type="button"
+                    onClick={() => setShowBlkptrDetails(prev => !prev)}
+                    disabled={!showPhysicalEdgesActive}
+                  >
+                    {showBlkptrDetails ? 'Collapse blkptrs' : 'Expand blkptrs'}
+                  </button>
+                  {(graphExtraEdges.length > 0 || graphExtraNodes.length > 0) && (
+                    <button className="graph-btn" type="button" onClick={resetGraphExpansion}>
+                      Reset
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
           </div>
           <div className="graph">
-            <ObjectGraph
-              selectedObject={selectedObject}
-              objectTypeName={objectInfo?.type?.name ?? ''}
-              semanticEdges={semanticEdges}
-              zapEntries={zapEntries}
-              blkptrs={blkptrs?.blkptrs ?? []}
-              onNavigate={navigateTo}
-            />
+            {effectiveCenterView === 'map' ? (
+              <ZapMapView
+                entries={zapEntries}
+                mosObjectMap={mosObjectMap}
+                onNavigate={navigateTo}
+              />
+            ) : (
+              <ObjectGraph
+                selectedObject={selectedObject}
+                objectTypeName={objectInfo?.type?.name ?? ''}
+                semanticEdges={semanticEdges}
+                zapEntries={zapEntries}
+                blkptrs={blkptrs?.blkptrs ?? []}
+                extraEdges={graphExtraEdges}
+                extraNodes={graphExtraNodes}
+                showSemantic={showSemanticEdges}
+                showZap={showZapEdges}
+                showPhysical={showPhysicalEdgesActive}
+                showBlkptrDetails={showBlkptrDetails}
+                onNavigate={navigateTo}
+              />
+            )}
+            {graphExpandError && <div className="graph-error">{graphExpandError}</div>}
           </div>
         </section>
 
         <section className="panel pane-right">
           <div className="panel-header">
             <h2>Inspector</h2>
-            {inspectorLoading && <span className="muted">Loading…</span>}
+            <div className="panel-actions">
+              {inspectorLoading && <span className="muted">Loading…</span>}
+              {selectedObject !== null && (
+                <button
+                  type="button"
+                  className={`pin-btn ${isPinned ? 'active' : ''}`}
+                  onClick={pinSelectedObject}
+                  disabled={isPinned}
+                >
+                  {isPinned ? 'Pinned' : 'Pin'}
+                </button>
+              )}
+            </div>
           </div>
 
           {selectedPool && selectedObject !== null && (
@@ -1117,11 +1808,59 @@ function App() {
                 )}
 
                 {inspectorTab === 'raw' && (
-                  <div className="inspector-section">
-                    <p className="muted">Hex dump coming soon...</p>
-                    <pre className="raw-preview">
-                      {JSON.stringify(objectInfo, null, 2)}
-                    </pre>
+                  <div className="inspector-section raw-section">
+                    <div className="raw-tabs">
+                      <button
+                        className={`tab ${rawView === 'json' ? 'active' : ''}`}
+                        onClick={() => setRawView('json')}
+                      >
+                        JSON
+                      </button>
+                      <button
+                        className={`tab ${rawView === 'hex' ? 'active' : ''}`}
+                        onClick={() => setRawView('hex')}
+                      >
+                        Hex
+                      </button>
+                    </div>
+                    <div className="raw-panel">
+                      {rawView === 'json' && (
+                        <pre className="raw-preview">
+                          {JSON.stringify(objectInfo, null, 2)}
+                        </pre>
+                      )}
+                    {rawView === 'hex' && (
+                      <div className="raw-preview raw-hex-container">
+                          {hexLoading && <p className="muted">Loading hex dump…</p>}
+                          {hexError && (
+                            <p className="muted">
+                              Error: {hexError}
+                            </p>
+                          )}
+                          {!hexLoading && !hexError && hexDump && (
+                            <div className="raw-hex">
+                              <div className="raw-hex-meta">
+                                {firstDataDva && (
+                                  <span>
+                                    blkptr {firstDataDva.bpIndex} · DVA {firstDataDva.dvaIndex}
+                                  </span>
+                                )}
+                                <span>vdev {hexDump.vdev}</span>
+                                <span>off {formatAddr(hexDump.offset)}</span>
+                                <span>
+                                  read {formatAddr(hexDump.size)} / {formatAddr(hexDump.asize)} B
+                                </span>
+                                {hexDump.truncated && <span>truncated</span>}
+                              </div>
+                              <pre className="raw-hex-dump">{formattedHexDump}</pre>
+                            </div>
+                          )}
+                          {!hexLoading && !hexError && !hexDump && (
+                            <p className="muted">No hex data available.</p>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -1131,10 +1870,7 @@ function App() {
       </div>
 
       <footer>
-        <p>
-          Backend: <code>GET /api/pools</code>
-        </p>
-        <p>OpenZFS commit: 21bbe7cb6</p>
+        <p>v0.01, OpenZFS commit: 21bbe7cb6</p>
       </footer>
     </div>
   )

@@ -49,10 +49,25 @@ zdx_result_t zdx_zap_info(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_zap_entries(zdx_pool_t *pool, uint64_t objid,
                              uint64_t cursor, uint64_t limit);
 
+/* === Raw block read === */
+zdx_result_t zdx_read_block(zdx_pool_t *pool, uint64_t vdev,
+                            uint64_t offset, uint64_t size);
+
 /* === DSL traversal === */
 zdx_result_t zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_dsl_root_dir(zdx_pool_t *pool);
+
+/* === Dataset / Objset === */
+zdx_result_t zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj);
+zdx_result_t zdx_objset_root(zdx_pool_t *pool, uint64_t objset_id);
+zdx_result_t zdx_objset_dir_entries(zdx_pool_t *pool, uint64_t objset_id,
+                                    uint64_t dir_obj, uint64_t cursor,
+                                    uint64_t limit);
+zdx_result_t zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id,
+                             const char *path);
+zdx_result_t zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id,
+                             uint64_t objid);
 
 /* === Version info === */
 const char *zdx_version(void); /* returns OpenZFS commit hash (injected at build time) */
