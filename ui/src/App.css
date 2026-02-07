@@ -150,12 +150,55 @@ footer code {
 }
 
 .main-grid {
-  display: grid;
-  grid-template-columns: 320px minmax(0, 1fr) 360px;
-  gap: 1.5rem;
+  display: flex;
+  gap: 0;
   flex: 1;
   min-height: 0; /* Critical: allow flex item to shrink below content size */
   overflow: hidden;
+}
+
+.resize-handle {
+  position: relative;
+  background: transparent;
+  flex: 0 0 12px;
+  transition: background 0.15s ease;
+}
+
+.resize-handle::before {
+  content: '';
+  position: absolute;
+  top: 10%;
+  bottom: 10%;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: transparent;
+  border-radius: 999px;
+  opacity: 0;
+}
+
+.resize-handle.horizontal {
+  cursor: col-resize;
+}
+
+.resize-handle.vertical {
+  flex-basis: 12px;
+  width: 100%;
+  cursor: row-resize;
+}
+
+.resize-handle.vertical::before {
+  left: 10%;
+  right: 10%;
+  top: 50%;
+  bottom: auto;
+  width: auto;
+  height: 2px;
+  transform: translateY(-50%);
+}
+
+.resize-handle:hover {
+  background: transparent;
 }
 
 .panel {
@@ -164,6 +207,7 @@ footer code {
   border-radius: 16px;
   padding: 1.25rem;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  height: 100%;
   min-height: 0; /* Critical: allow panel to shrink */
   overflow: hidden;
   display: flex;
@@ -401,6 +445,7 @@ footer code {
   overflow-y: auto;
   overflow-x: hidden;
   min-width: 0;
+  min-height: 0;
   flex: 1;
 }
 
@@ -588,6 +633,44 @@ footer code {
   flex-wrap: wrap;
   font-size: 0.7rem;
   color: var(--muted);
+}
+
+.fs-object-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+
+.fs-object-link:hover {
+  color: var(--accent-2);
+}
+
+.fs-actions {
+  margin-top: 0.6rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.fs-action-btn {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(12, 14, 18, 0.7);
+  color: var(--text);
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.fs-action-btn:hover {
+  border-color: rgba(255, 140, 66, 0.6);
+  color: var(--accent-2);
+  background: rgba(255, 140, 66, 0.12);
 }
 
 .fs-table {
@@ -800,6 +883,10 @@ footer code {
   gap: 0.75rem;
   min-height: 0;
   flex: 1;
+}
+
+.mos-objects-scroll {
+  padding-right: 0.25rem;
 }
 
 .mos-objects-section h3 {
@@ -1620,6 +1707,8 @@ footer code {
   margin: 0;
   font-family: var(--mono);
   font-size: 0.85rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .blkptr-list {
@@ -1693,7 +1782,7 @@ footer p {
 
 @media (max-width: 1200px) {
   .main-grid {
-    grid-template-columns: 1fr;
+    flex-direction: column;
     overflow-y: auto;
   }
 
@@ -1702,6 +1791,10 @@ footer p {
   .pane-right {
     min-height: 300px;
     overflow: visible;
+  }
+
+  .resize-handle {
+    flex-basis: 10px;
   }
 }
 

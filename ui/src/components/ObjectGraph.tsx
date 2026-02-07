@@ -196,7 +196,7 @@ export function ObjectGraph({
             id: `edge-zap-${entry.name}-${entry.target_obj}`,
             source: `obj-${selectedObject}`,
             target: targetId,
-            label: entry.name,
+            label: '',
             edgeType: 'zap',
           },
         })
@@ -216,7 +216,7 @@ export function ObjectGraph({
             id: `edge-zap-more-${selectedObject}`,
             source: `obj-${selectedObject}`,
             target: moreId,
-            label: 'more',
+            label: '',
             edgeType: 'zap',
           },
         })

@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
+import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import './App.css'
 import { ObjectGraph } from './components/ObjectGraph'
 import { ZapMapView } from './components/ZapMapView'
 import { FsGraph } from './components/FsGraph'
+import type {
+  BrowserNavState,
+  FsLocation,
+  FsPathSegment,
+  NavigatorMode,
+} from './types/navigation'
 
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
@@ -238,6 +245,16 @@ type PinnedObject = {
   typeName?: string
 }
 
+const isSameFsLocation = (a: FsLocation, b: FsLocation) => {
+  if (a.objsetId !== b.objsetId) return false
+  if (a.currentDir !== b.currentDir) return false
+  if (a.path.length !== b.path.length) return false
+  return a.path.every((seg, idx) => {
+    const other = b.path[idx]
+    return seg.objid === other.objid && seg.name === other.name
+  })
+}
+
 function App() {
   const [pools, setPools] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -265,17 +282,10 @@ function App() {
   const [datasetExpanded, setDatasetExpanded] = useState<Record<number, boolean>>({})
   const [datasetLoading, setDatasetLoading] = useState(false)
   const [datasetError, setDatasetError] = useState<string | null>(null)
-  const [fsState, setFsState] = useState<{
-    datasetName: string
-    dslDirObj: number
-    headDatasetObj: number
-    objsetId: number
-    rootObj: number
-    currentDir: number
-    path: { name: string; objid: number }[]
-  } | null>(null)
+  const [fsState, setFsState] = useState<FsLocation | null>(null)
+  const [fsHistory, setFsHistory] = useState<FsLocation[]>([])
+  const [fsHistoryIndex, setFsHistoryIndex] = useState(-1)
   const [fsEntries, setFsEntries] = useState<FsEntry[]>([])
-  const [fsNext, setFsNext] = useState<number | null>(null)
   const [fsLoading, setFsLoading] = useState(false)
   const [fsError, setFsError] = useState<string | null>(null)
   const [fsPathInput, setFsPathInput] = useState('')
@@ -306,7 +316,7 @@ function App() {
   const [hexLoading, setHexLoading] = useState(false)
   const [hexError, setHexError] = useState<string | null>(null)
   const [zdbCopied, setZdbCopied] = useState(false)
-  const [leftPaneTab, setLeftPaneTab] = useState<'datasets' | 'mos' | 'fs'>('datasets')
+  const [leftPaneTab, setLeftPaneTab] = useState<NavigatorMode>('datasets')
   const [pinnedByPool, setPinnedByPool] = useState<Record<string, PinnedObject[]>>({})
   const [graphSearch, setGraphSearch] = useState('')
   const [showBlkptrDetails, setShowBlkptrDetails] = useState(false)
@@ -317,10 +327,17 @@ function App() {
   const [graphExpanding, setGraphExpanding] = useState(false)
   const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
   const [centerView, setCenterView] = useState<'explore' | 'graph' | 'physical'>('explore')
+  const [isNarrow, setIsNarrow] = useState(false)
   const hexRequestKey = useRef<string | null>(null)
   const fsStatKey = useRef<string | null>(null)
   const fsFilterRef = useRef<HTMLInputElement | null>(null)
   const fsAutoMetaKey = useRef<string | null>(null)
+  const suppressBrowserHistory = useRef(false)
+  const historyInitialized = useRef(false)
+  const initialHistoryApplied = useRef(false)
+  const pendingBrowserState = useRef<BrowserNavState | null>(null)
+  const lastBrowserState = useRef<string | null>(null)
+  const skipNextHistoryPush = useRef(false)
 
   const zapObjectKeys = useMemo(
     () =>
@@ -340,6 +357,33 @@ function App() {
     mosObjects.forEach(obj => map.set(obj.id, obj))
     return map
   }, [mosObjects])
+
+  const datasetIndex = useMemo(() => {
+    const nodeById = new Map<number, DatasetTreeNode>()
+    const fullNameById = new Map<number, string>()
+    const childZapToNode = new Map<number, DatasetTreeNode>()
+    if (!datasetTree) {
+      return { nodeById, fullNameById, childZapToNode }
+    }
+
+    const walk = (node: DatasetTreeNode, prefix: string) => {
+      const fullName = prefix ? `${prefix}/${node.name}` : node.name
+      nodeById.set(node.dsl_dir_obj, node)
+      fullNameById.set(node.dsl_dir_obj, fullName)
+      if (node.child_dir_zapobj) {
+        childZapToNode.set(node.child_dir_zapobj, node)
+      }
+      node.children?.forEach(child => walk(child, fullName))
+    }
+
+    walk(datasetTree.root, '')
+    return { nodeById, fullNameById, childZapToNode }
+  }, [datasetTree])
+
+  const datasetForChildMap = useMemo(() => {
+    if (selectedObject === null) return null
+    return datasetIndex.childZapToNode.get(selectedObject) ?? null
+  }, [datasetIndex, selectedObject])
 
   const filteredFsEntries = useMemo(() => {
     const term = fsSearch.trim().toLowerCase()
@@ -464,6 +508,14 @@ function App() {
     return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`
   }
 
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 1200px)')
+    const update = () => setIsNarrow(media.matches)
+    update()
+    media.addEventListener('change', update)
+    return () => media.removeEventListener('change', update)
+  }, [])
+
   const toggleFsSort = (key: 'name' | 'type' | 'size' | 'mtime') => {
     setFsSort(prev => {
       if (prev.key === key) {
@@ -473,6 +525,99 @@ function App() {
     })
   }
 
+  const updateFsHistory = useCallback(
+    (
+      next: FsLocation,
+      opts?: {
+        reset?: boolean
+        replace?: boolean
+        navAction?: 'back' | 'forward'
+      }
+    ) => {
+      if (opts?.navAction === 'back' || opts?.navAction === 'forward') {
+        return
+      }
+      if (opts?.reset) {
+        setFsHistory([next])
+        setFsHistoryIndex(0)
+        return
+      }
+      if (opts?.replace) {
+        setFsHistory(prev => {
+          if (prev.length === 0) return [next]
+          const idx = fsHistoryIndex >= 0 ? fsHistoryIndex : prev.length - 1
+          const updated = [...prev]
+          updated[idx] = next
+          return updated
+        })
+        return
+      }
+
+      setFsHistory(prev => {
+        const base = fsHistoryIndex >= 0 ? prev.slice(0, fsHistoryIndex + 1) : prev
+        const last = base[base.length - 1]
+        if (last && isSameFsLocation(last, next)) {
+          return base
+        }
+        return [...base, next]
+      })
+      setFsHistoryIndex(prev => (prev >= 0 ? prev + 1 : 0))
+    },
+    [fsHistoryIndex]
+  )
+
+  const applyBrowserState = useCallback(
+    (state: BrowserNavState) => {
+      const pool = state.pool ?? null
+      if ((selectedPool ?? null) !== pool) {
+        pendingBrowserState.current = state
+        setSelectedPool(pool)
+        return
+      }
+
+      if (state.mode === 'datasets') {
+        setLeftPaneTab('datasets')
+        return
+      }
+
+      if (state.mode === 'mos') {
+        setLeftPaneTab('mos')
+        if (state.objid) {
+          setNavStack([state.objid])
+          setNavIndex(0)
+          setSelectedObject(state.objid)
+          fetchInspector(state.objid)
+        } else {
+          setSelectedObject(null)
+          resetInspector()
+        }
+        return
+      }
+
+      if (state.mode === 'fs') {
+        setLeftPaneTab('fs')
+        if (state.fs) {
+          setFsHistory([state.fs])
+          setFsHistoryIndex(0)
+          setFsState(state.fs)
+          fetchFsDir(state.fs.objsetId, state.fs.currentDir, state.fs.path, {
+            baseState: state.fs,
+            history: 'none',
+            browser: 'none',
+          })
+        } else {
+          setFsHistory([])
+          setFsHistoryIndex(-1)
+          setFsState(null)
+          setFsEntries([])
+          setFsSelected(null)
+          setFsStat(null)
+        }
+      }
+    },
+    [selectedPool, fetchInspector, fetchFsDir]
+  )
+
   const pinnedObjects = selectedPool ? pinnedByPool[selectedPool] ?? [] : []
   const isPinned =
     selectedObject !== null && pinnedObjects.some(entry => entry.objid === selectedObject)
@@ -480,7 +625,12 @@ function App() {
   const navigateTo = useCallback(
     (
       objid: number,
-      opts?: { reset?: boolean; replace?: boolean; navAction?: 'back' | 'forward' | 'jump'; jumpIndex?: number }
+      opts?: {
+        reset?: boolean
+        replace?: boolean
+        navAction?: 'back' | 'forward' | 'jump'
+        jumpIndex?: number
+      }
     ) => {
       setSelectedObject(objid)
       fetchInspector(objid)
@@ -498,6 +648,10 @@ function App() {
       if (opts?.reset) {
         setNavStack([objid])
         setNavIndex(0)
+        commitBrowserState(
+          { mode: 'mos', pool: selectedPool ?? null, objid },
+          'replace'
+        )
         return
       }
 
@@ -508,6 +662,10 @@ function App() {
           return newStack
         })
         // Index stays the same
+        commitBrowserState(
+          { mode: 'mos', pool: selectedPool ?? null, objid },
+          'replace'
+        )
         return
       }
 
@@ -525,34 +683,18 @@ function App() {
         const base = prev >= 0 ? prev : -1
         return base + 1
       })
+      commitBrowserState({ mode: 'mos', pool: selectedPool ?? null, objid })
     },
-    [navIndex, selectedPool]
+    [navIndex, selectedPool, commitBrowserState]
   )
 
   const isMosMode = leftPaneTab === 'mos'
-  const isFsMode = leftPaneTab === 'fs'
-  const canGoBack = isMosMode && navIndex > 0
-  const canGoForward = isMosMode && navIndex < navStack.length - 1
-
-  const goBack = useCallback(() => {
-    if (canGoBack) {
-      const newIndex = navIndex - 1
-      const objid = navStack[newIndex]
-      setNavIndex(newIndex)
-      setSelectedObject(objid)
-      fetchInspector(objid)
-    }
-  }, [canGoBack, navIndex, navStack, selectedPool])
-
-  const goForward = useCallback(() => {
-    if (canGoForward) {
-      const newIndex = navIndex + 1
-      const objid = navStack[newIndex]
-      setNavIndex(newIndex)
-      setSelectedObject(objid)
-      fetchInspector(objid)
-    }
-  }, [canGoForward, navIndex, navStack, selectedPool])
+  const isFsMode = leftPaneTab !== 'mos'
+  const canGoBack =
+    (isMosMode && navIndex > 0) || (isFsMode && fsHistoryIndex > 0)
+  const canGoForward =
+    (isMosMode && navIndex < navStack.length - 1) ||
+    (isFsMode && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1)
 
   useEffect(() => {
     fetch(`${API_BASE}/api/pools`)
@@ -571,6 +713,68 @@ function App() {
         setLoading(false)
       })
   }, [])
+
+  useEffect(() => {
+    if (initialHistoryApplied.current) return
+    const existing = history.state as BrowserNavState | null
+    if (!existing) {
+      initialHistoryApplied.current = true
+      return
+    }
+    suppressBrowserHistory.current = true
+    skipNextHistoryPush.current = true
+    applyBrowserState(existing)
+    lastBrowserState.current = JSON.stringify(existing)
+    historyInitialized.current = true
+    requestAnimationFrame(() => {
+      suppressBrowserHistory.current = false
+    })
+    initialHistoryApplied.current = true
+  }, [applyBrowserState])
+
+  useEffect(() => {
+    if (!pendingBrowserState.current) return
+    const pending = pendingBrowserState.current
+    if ((pending.pool ?? null) !== (selectedPool ?? null)) return
+    pendingBrowserState.current = null
+    applyBrowserState(pending)
+  }, [selectedPool, applyBrowserState])
+
+  useEffect(() => {
+    const handler = (event: PopStateEvent) => {
+      const state = event.state as BrowserNavState | null
+      if (!state) return
+      suppressBrowserHistory.current = true
+      skipNextHistoryPush.current = true
+      applyBrowserState(state)
+      lastBrowserState.current = JSON.stringify(state)
+      requestAnimationFrame(() => {
+        suppressBrowserHistory.current = false
+      })
+    }
+
+    window.addEventListener('popstate', handler)
+    return () => window.removeEventListener('popstate', handler)
+  }, [applyBrowserState])
+
+  function commitBrowserState(state: BrowserNavState, mode: 'push' | 'replace' = 'push') {
+    if (suppressBrowserHistory.current) return
+    if (skipNextHistoryPush.current) {
+      skipNextHistoryPush.current = false
+      return
+    }
+    const serialized = JSON.stringify(state)
+    if (lastBrowserState.current === serialized) return
+    lastBrowserState.current = serialized
+
+    if (!historyInitialized.current || mode === 'replace') {
+      history.replaceState(state, '', window.location.href)
+      historyInitialized.current = true
+      return
+    }
+
+    history.pushState(state, '', window.location.href)
+  }
 
   useEffect(() => {
     fetch(`${API_BASE}/api/mos/types`)
@@ -621,6 +825,30 @@ function App() {
     setDatasetExpanded(prev => ({ ...prev, [dirObj]: !prev[dirObj] }))
   }
 
+  const handlePoolSelect = (pool: string) => {
+    if (!pool) return
+    setSelectedPool(pool)
+    setLeftPaneTab('datasets')
+    setNavStack([])
+    setNavIndex(-1)
+    setFsHistory([])
+    setFsHistoryIndex(-1)
+    commitBrowserState({ mode: 'datasets', pool })
+  }
+
+  const setLeftPaneTabWithHistory = (mode: NavigatorMode) => {
+    setLeftPaneTab(mode)
+    if (mode === 'mos') {
+      commitBrowserState({ mode: 'mos', pool: selectedPool ?? null, objid: selectedObject })
+      return
+    }
+    if (mode === 'fs') {
+      commitBrowserState({ mode: 'fs', pool: selectedPool ?? null, fs: fsState ?? null })
+      return
+    }
+    commitBrowserState({ mode: 'datasets', pool: selectedPool ?? null })
+  }
+
   const renderDatasetNode = (node: DatasetTreeNode, depth: number) => {
     const expanded = datasetExpanded[node.dsl_dir_obj] ?? depth === 0
     const children = node.children ?? []
@@ -659,6 +887,14 @@ function App() {
 
   const handleFsEntryClick = (entry: FsEntry) => {
     if (!fsState) return
+    if (entry.type_name === 'dir') {
+      const currentNode = datasetIndex.nodeById.get(fsState.dslDirObj)
+      const childDataset = currentNode?.children?.find(child => child.name === entry.name)
+      if (childDataset) {
+        enterFsFromDataset(childDataset)
+        return
+      }
+    }
     if (entry.type_name !== 'dir') {
       setFsSelected(entry)
       fetchFsStat(fsState.objsetId, entry.objid)
@@ -843,6 +1079,12 @@ function App() {
   const handleFsGraphSelect = (entry: FsEntry) => {
     if (!fsState) return
     if (entry.type_name === 'dir') {
+      const currentNode = datasetIndex.nodeById.get(fsState.dslDirObj)
+      const childDataset = currentNode?.children?.find(child => child.name === entry.name)
+      if (childDataset) {
+        enterFsFromDataset(childDataset)
+        return
+      }
       const nextPath = [...fsState.path, { name: entry.name, objid: entry.objid }]
       fetchFsDir(fsState.objsetId, entry.objid, nextPath)
     } else {
@@ -851,11 +1093,22 @@ function App() {
     }
   }
 
-  const fetchFsDir = async (
+  const openFsSelectionAsObject = () => {
+    if (!fsSelected) return
+    setLeftPaneTab('mos')
+    navigateTo(fsSelected.objid, { reset: true })
+  }
+
+  async function fetchFsDir(
     objsetId: number,
     dirObj: number,
-    path: { name: string; objid: number }[]
-  ) => {
+    path: FsPathSegment[],
+    opts?: {
+      baseState?: FsLocation | null
+      history?: 'push' | 'replace' | 'reset' | 'none'
+      browser?: 'push' | 'replace' | 'none'
+    }
+  ) {
     if (!selectedPool) return
     setFsLoading(true)
     setFsError(null)
@@ -873,7 +1126,6 @@ function App() {
       }
       const data: FsDirResponse = await res.json()
       setFsEntries(data.entries ?? [])
-      setFsNext(data.next ?? null)
       setFsEntryStats({})
       setFsEntryStatsError(null)
       const currentName = path[path.length - 1]?.name ?? 'dir'
@@ -885,22 +1137,105 @@ function App() {
       } else {
         setFsPathInput('/')
       }
-      setFsState(prev => {
-        if (!prev) {
-          return null
-        }
-        return {
-          ...prev,
+      const baseState = opts?.baseState ?? fsState
+      if (baseState) {
+        const nextState: FsLocation = {
+          ...baseState,
           currentDir: dirObj,
           path,
         }
-      })
+        setFsState(nextState)
+        const mode = opts?.history ?? 'push'
+        if (mode === 'reset') {
+          updateFsHistory(nextState, { reset: true })
+        } else if (mode === 'replace') {
+          updateFsHistory(nextState, { replace: true })
+        } else if (mode !== 'none') {
+          updateFsHistory(nextState)
+        }
+
+        const browserMode = opts?.browser ?? 'push'
+        if (browserMode !== 'none') {
+          commitBrowserState(
+            { mode: 'fs', pool: selectedPool ?? null, fs: nextState },
+            browserMode === 'replace' ? 'replace' : 'push'
+          )
+        }
+      }
     } catch (err) {
       setFsError((err as Error).message)
     } finally {
       setFsLoading(false)
     }
   }
+
+  const goBack = useCallback(() => {
+    if (isMosMode && navIndex > 0) {
+      skipNextHistoryPush.current = true
+      const newIndex = navIndex - 1
+      const objid = navStack[newIndex]
+      setNavIndex(newIndex)
+      setSelectedObject(objid)
+      fetchInspector(objid)
+      return
+    }
+
+    if (isFsMode && fsHistoryIndex > 0) {
+      skipNextHistoryPush.current = true
+      const newIndex = fsHistoryIndex - 1
+      const location = fsHistory[newIndex]
+      setFsHistoryIndex(newIndex)
+      setFsState(location)
+      fetchFsDir(location.objsetId, location.currentDir, location.path, {
+        baseState: location,
+        history: 'none',
+        browser: 'none',
+      })
+    }
+  }, [
+    isMosMode,
+    isFsMode,
+    navIndex,
+    navStack,
+    fsHistory,
+    fsHistoryIndex,
+    fetchInspector,
+    fetchFsDir,
+  ])
+
+  const goForward = useCallback(() => {
+    if (isMosMode && navIndex < navStack.length - 1) {
+      skipNextHistoryPush.current = true
+      const newIndex = navIndex + 1
+      const objid = navStack[newIndex]
+      setNavIndex(newIndex)
+      setSelectedObject(objid)
+      fetchInspector(objid)
+      return
+    }
+
+    if (isFsMode && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1) {
+      skipNextHistoryPush.current = true
+      const newIndex = fsHistoryIndex + 1
+      const location = fsHistory[newIndex]
+      setFsHistoryIndex(newIndex)
+      setFsState(location)
+      fetchFsDir(location.objsetId, location.currentDir, location.path, {
+        baseState: location,
+        history: 'none',
+        browser: 'none',
+      })
+    }
+  }, [
+    isMosMode,
+    isFsMode,
+    navIndex,
+    navStack,
+    fsHistory,
+    fsHistoryIndex,
+    fetchInspector,
+    fetchFsDir,
+  ])
 
   const enterFsFromDataset = async (node: DatasetTreeNode) => {
     if (!selectedPool) return
@@ -914,6 +1249,8 @@ function App() {
     setFsPathInput('/')
     setFsCenterView('list')
     setFsSearch('')
+    setFsHistory([])
+    setFsHistoryIndex(-1)
     try {
       const headRes = await fetch(
         `${API_BASE}/api/pools/${encodeURIComponent(
@@ -944,22 +1281,34 @@ function App() {
         throw new Error('Missing root_obj from objset root')
       }
 
-      setFsState({
-        datasetName: node.name,
+      const fullName =
+        datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
+      const baseState: FsLocation = {
+        datasetName: fullName,
         dslDirObj: node.dsl_dir_obj,
         headDatasetObj,
         objsetId,
         rootObj,
         currentDir: rootObj,
-        path: [{ name: node.name, objid: rootObj }],
-      })
+        path: [{ name: fullName, objid: rootObj }],
+      }
+      setFsState(baseState)
 
-      await fetchFsDir(objsetId, rootObj, [{ name: node.name, objid: rootObj }])
+      await fetchFsDir(objsetId, rootObj, baseState.path, {
+        baseState,
+        history: 'reset',
+        browser: 'replace',
+      })
     } catch (err) {
       setFsError((err as Error).message)
     } finally {
       setFsLoading(false)
     }
+  }
+
+  const openFsFromMos = () => {
+    if (!datasetForChildMap) return
+    enterFsFromDataset(datasetForChildMap)
   }
 
   const typeOptions = useMemo(() => {
@@ -1002,8 +1351,9 @@ function App() {
       setDatasetTree(null)
       setDatasetExpanded({})
       setFsState(null)
+      setFsHistory([])
+      setFsHistoryIndex(-1)
       setFsEntries([])
-      setFsNext(null)
       setFsLoading(false)
       setFsError(null)
       setFsSelected(null)
@@ -1027,6 +1377,8 @@ function App() {
     resetInspector()
     setNavStack([])
     setNavIndex(-1)
+    setFsHistory([])
+    setFsHistoryIndex(-1)
     setShowBlkptrDetails(false)
     fetchMosObjects(0, false)
   }, [selectedPool, typeFilter])
@@ -1074,7 +1426,7 @@ function App() {
     }
   }
 
-  const fetchInspector = async (objid: number) => {
+  async function fetchInspector(objid: number) {
     if (!selectedPool) return
     setInspectorLoading(true)
     setInspectorError(null)
@@ -1495,8 +1847,11 @@ function App() {
               resetInspector()
               setNavStack([])
               setNavIndex(-1)
-              setSelectedPool(selectedPool)
-              setLeftPaneTab('datasets')
+              if (selectedPool) {
+                handlePoolSelect(selectedPool)
+              } else {
+                setLeftPaneTabWithHistory('datasets')
+              }
             }}
             title={`Pool ${selectedPool}`}
           >
@@ -1506,14 +1861,14 @@ function App() {
           <span className="crumb muted">No pool selected</span>
         )}
         <span className="crumb-sep">→</span>
-        {leftPaneTab === 'datasets' && (
+        {leftPaneTab !== 'mos' && !fsState && (
           <span className="crumb active">Datasets</span>
         )}
-        {leftPaneTab === 'fs' && (
+        {leftPaneTab !== 'mos' && fsState && (
           <>
             <button
               className="crumb"
-              onClick={() => setLeftPaneTab('datasets')}
+              onClick={() => setLeftPaneTabWithHistory('datasets')}
               title="Datasets"
             >
               Datasets
@@ -1542,7 +1897,7 @@ function App() {
                 resetInspector()
                 setNavStack([])
                 setNavIndex(-1)
-                setLeftPaneTab('mos')
+                setLeftPaneTabWithHistory('mos')
               }}
               title="MOS object list"
             >
@@ -1573,34 +1928,32 @@ function App() {
         )}
       </div>
 
-      <div className="main-grid">
-        <aside className="panel pane-left">
+      <PanelGroup
+        className="main-grid"
+        direction={isNarrow ? 'vertical' : 'horizontal'}
+      >
+        <Panel defaultSize={isNarrow ? 32 : 22} minSize={isNarrow ? 22 : 16}>
+          <aside className="panel pane-left">
           <div className="panel-header">
             <h2>Navigator</h2>
           </div>
 
           <div className="left-pane-tabs">
             <button
-              className={`tab ${leftPaneTab === 'datasets' ? 'active' : ''}`}
-              onClick={() => setLeftPaneTab('datasets')}
+              className={`tab ${leftPaneTab !== 'mos' ? 'active' : ''}`}
+              onClick={() => setLeftPaneTabWithHistory('datasets')}
             >
               Datasets
             </button>
             <button
-              className={`tab ${leftPaneTab === 'fs' ? 'active' : ''}`}
-              onClick={() => setLeftPaneTab('fs')}
-            >
-              FS
-            </button>
-            <button
               className={`tab ${leftPaneTab === 'mos' ? 'active' : ''}`}
-              onClick={() => setLeftPaneTab('mos')}
+              onClick={() => setLeftPaneTabWithHistory('mos')}
             >
               MOS
             </button>
           </div>
 
-          {leftPaneTab === 'datasets' && (
+          {leftPaneTab !== 'mos' && (
             <div className="left-pane-content">
               {renderPinnedSection()}
               <div className="pool-selector">
@@ -1620,7 +1973,7 @@ function App() {
                 {!loading && !error && pools.length > 0 && (
                   <select
                     value={selectedPool ?? ''}
-                    onChange={e => setSelectedPool(e.target.value)}
+                    onChange={e => handlePoolSelect(e.target.value)}
                     className="pool-select"
                   >
                     {pools.map(pool => (
@@ -1645,40 +1998,6 @@ function App() {
                   )}
                 </div>
               )}
-            </div>
-          )}
-
-          {leftPaneTab === 'fs' && (
-            <div className="left-pane-content">
-              {renderPinnedSection()}
-              <div className="pool-selector">
-                <label>Pool</label>
-                {loading && <p className="muted">Loading pools...</p>}
-                {error && (
-                  <div className="error">
-                    <strong>Error:</strong> {error}
-                    <p className="hint">
-                      Make sure the API backend is running on <code>localhost:9000</code>
-                    </p>
-                  </div>
-                )}
-                {!loading && !error && pools.length === 0 && (
-                  <p className="muted">No pools found</p>
-                )}
-                {!loading && !error && pools.length > 0 && (
-                  <select
-                    value={selectedPool ?? ''}
-                    onChange={e => setSelectedPool(e.target.value)}
-                    className="pool-select"
-                  >
-                    {pools.map(pool => (
-                      <option key={pool} value={pool}>
-                        {pool}
-                      </option>
-                    ))}
-                  </select>
-                )}
-              </div>
               <div className="fs-panel">
                 <h3>Filesystem Navigator</h3>
                 {fsState && (
@@ -1857,7 +2176,7 @@ function App() {
                 {!loading && !error && pools.length > 0 && (
                   <select
                     value={selectedPool ?? ''}
-                    onChange={e => setSelectedPool(e.target.value)}
+                    onChange={e => handlePoolSelect(e.target.value)}
                     className="pool-select"
                   >
                     {pools.map(pool => (
@@ -1902,39 +2221,47 @@ function App() {
                       </div>
                     )}
 
-                    <ul className="object-list">
-                      {mosObjects.map(obj => (
-                        <li
-                          key={obj.id}
-                          className={`object-item ${selectedObject === obj.id ? 'active' : ''}`}
-                          onClick={() => handleSelectObject(obj.id)}
-                        >
-                          <div>
-                            <span className="object-id">#{obj.id}</span>
-                            <span className="object-type">{obj.type_name}</span>
-                          </div>
-                          <span className="object-meta">bonus {obj.bonus_type_name}</span>
-                        </li>
-                      ))}
-                    </ul>
+                    <div className="pane-scroll mos-objects-scroll">
+                      <ul className="object-list">
+                        {mosObjects.map(obj => (
+                          <li
+                            key={obj.id}
+                            className={`object-item ${selectedObject === obj.id ? 'active' : ''}`}
+                            onClick={() => handleSelectObject(obj.id)}
+                          >
+                            <div>
+                              <span className="object-id">#{obj.id}</span>
+                              <span className="object-type">{obj.type_name}</span>
+                            </div>
+                            <span className="object-meta">bonus {obj.bonus_type_name}</span>
+                          </li>
+                        ))}
+                      </ul>
 
-                    {mosNext !== null && !mosLoading && (
-                      <button
-                        className="load-more"
-                        onClick={() => fetchMosObjects(mosNext, true)}
-                      >
-                        Load more
-                      </button>
-                    )}
+                      {mosNext !== null && !mosLoading && (
+                        <button
+                          className="load-more"
+                          onClick={() => fetchMosObjects(mosNext, true)}
+                        >
+                          Load more
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </>
               )}
             </div>
           )}
-        </aside>
+          </aside>
+        </Panel>
 
-        <section className="panel pane-center">
-          {leftPaneTab === 'fs' ? (
+        <PanelResizeHandle
+          className={`resize-handle ${isNarrow ? 'vertical' : 'horizontal'}`}
+        />
+
+        <Panel defaultSize={isNarrow ? 40 : 56} minSize={isNarrow ? 26 : 32}>
+          <section className="panel pane-center">
+          {leftPaneTab !== 'mos' ? (
             <>
               <div className="panel-header graph-header">
                 <div>
@@ -2200,9 +2527,15 @@ function App() {
               </div>
             </>
           )}
-        </section>
+          </section>
+        </Panel>
 
-        <section className="panel pane-right">
+        <PanelResizeHandle
+          className={`resize-handle ${isNarrow ? 'vertical' : 'horizontal'}`}
+        />
+
+        <Panel defaultSize={isNarrow ? 28 : 22} minSize={isNarrow ? 22 : 16}>
+          <section className="panel pane-right">
           <div className="panel-header">
             <h2>Inspector</h2>
             <div className="panel-actions">
@@ -2255,13 +2588,31 @@ function App() {
                     </div>
                     <div>
                       <dt>Object</dt>
-                      <dd>#{fsSelected.objid}</dd>
+                      <dd>
+                        <button
+                          type="button"
+                          className="fs-object-link"
+                          onClick={openFsSelectionAsObject}
+                          title="Open as MOS object"
+                        >
+                          #{fsSelected.objid}
+                        </button>
+                      </dd>
                     </div>
                     <div>
                       <dt>Type</dt>
                       <dd>{fsSelected.type_name}</dd>
                     </div>
                   </dl>
+                  <div className="fs-actions">
+                    <button
+                      type="button"
+                      className="fs-action-btn"
+                      onClick={openFsSelectionAsObject}
+                    >
+                      Open as object
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -2451,6 +2802,26 @@ function App() {
                         </div>
                       </dl>
                     </div>
+
+                    {datasetForChildMap && (
+                      <div className="inspector-section">
+                        <h3>Dataset Link</h3>
+                        <div className="fs-actions">
+                          <span className="muted">
+                            {datasetIndex.fullNameById.get(
+                              datasetForChildMap.dsl_dir_obj
+                            ) ?? datasetForChildMap.name}
+                          </span>
+                          <button
+                            type="button"
+                            className="fs-action-btn"
+                            onClick={openFsFromMos}
+                          >
+                            Open in FS
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     {bonusEntries.length > 0 && (
                       <div className="inspector-section">
@@ -2656,8 +3027,9 @@ function App() {
               </div>
             </>
           )}
-        </section>
-      </div>
+          </section>
+        </Panel>
+      </PanelGroup>
 
       <footer>
         <p>v0.01, OpenZFS commit: 21bbe7cb6</p>

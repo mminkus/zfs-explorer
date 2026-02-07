@@ -4,6 +4,7 @@ import cytoscape, { type Core, type ElementDefinition } from 'cytoscape'
 type FsEntry = {
   name: string
   objid: number
+  type: number
   type_name: string
 }
 
@@ -33,7 +34,7 @@ export function FsGraph({
     const edges: ElementDefinition[] = []
     const entryMap = new Map<number, FsEntry>()
 
-    const rootEntry: FsEntry = { name: dirName, objid: dirObj, type_name: 'dir' }
+    const rootEntry: FsEntry = { name: dirName, objid: dirObj, type: 0, type_name: 'dir' }
     entryMap.set(dirObj, rootEntry)
 
     nodes.push({
@@ -100,7 +101,7 @@ export function FsGraph({
             style: {
               label: 'data(label)',
               'text-wrap': 'wrap',
-              'text-max-width': 120,
+              'text-max-width': '120px',
               'text-valign': 'center',
               'text-halign': 'center',
               'font-size': 10,

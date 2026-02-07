@@ -464,6 +464,7 @@ zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
         err = dmu_object_next(mos, &object, B_FALSE, 0);
         if (err != 0)
             break;
+        last_obj = object;
 
         dmu_object_info_t doi;
         if (dmu_object_info(mos, object, &doi) != 0)
@@ -509,10 +510,13 @@ zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
         free(array);
         array = new_array;
         count++;
-        last_obj = object;
     }
 
-    if (err != 0 && err != ENOENT && err != ESRCH && err != EXDEV) {
+    if (err != 0 && err != ENOENT && err != ESRCH && err != EXDEV
+#ifdef EBADE
+        && err != EBADE
+#endif
+    ) {
         free(array);
         return make_error(err, "dmu_object_next failed: %s", strerror(err));
     }
