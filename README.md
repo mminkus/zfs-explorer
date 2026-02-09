@@ -1,6 +1,31 @@
 # ZFS Explorer
 
-A web-based ZFS on-disk structure explorer ("Wireshark for ZFS").
+**ZFS Explorer** is a web-based, read-only explorer for ZFS on-disk structures —
+a visual frontend for `zdb`.
+
+It allows interactive inspection of ZFS internals while preserving full
+object-level accuracy. The goal is not to abstract ZFS, but to make its on-disk
+format explorable, navigable, and debuggable.
+
+ZFS Explorer currently supports:
+
+- MOS object browsing and inspection
+- Dnode and blkptr decoding
+- ZAP visualization
+- Dataset and DSL graph traversal
+- ZPL filesystem walking (directories and files)
+- Raw block hex inspection via DVAs
+
+The design is intentionally **read-only**. Long-term goals include supporting
+analysis of **unimported or damaged pools**, enabling forensic inspection and
+file recovery without ever importing the pool.
+
+You can think of this project as:
+
+- **`zdb`, visualized**
+- **A filesystem browser that never lies**
+- **A teaching and debugging tool for ZFS internals**
+- **A foundation for ZFS recovery and forensic workflows**
 
 **Current Status:** Active development (MOS browser, ZAP decoding, DSL edges, hex dump, dataset tree, FS navigation in progress)
 

@@ -9,6 +9,9 @@ use std::collections::HashSet;
 
 use crate::AppState;
 
+const DEFAULT_PAGE_LIMIT: u64 = 200;
+const MAX_PAGE_LIMIT: u64 = 10_000;
+
 /// GET /api/pools - List all imported pools
 pub async fn list_pools() -> Result<Json<Value>, (StatusCode, String)> {
     let result = crate::ffi::list_pools();
@@ -35,12 +38,58 @@ pub async fn list_pools() -> Result<Json<Value>, (StatusCode, String)> {
     Ok(Json(value))
 }
 
+/// GET /api/pools/:pool/datasets
+pub async fn list_pool_datasets(
+    State(state): State<AppState>,
+    Path(pool): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::pool_datasets(pool_ptr);
+    json_from_result(result)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MosListQuery {
     #[serde(rename = "type")]
     pub type_filter: Option<i32>,
     pub start: Option<u64>,
     pub limit: Option<u64>,
+}
+
+fn parse_json_value(json_str: &str) -> Result<Value, (StatusCode, String)> {
+    serde_json::from_str(json_str).map_err(|e| {
+        tracing::error!("Failed to parse JSON: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("JSON parse error: {}", e),
+        )
+    })
+}
+
+fn normalize_limit(limit: Option<u64>) -> u64 {
+    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
+}
+
+fn normalize_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (u64, u64) {
+    (cursor.unwrap_or(0), normalize_limit(limit))
+}
+
+fn parse_graph_include(include: Option<&str>) -> (bool, bool, bool) {
+    let include = include.unwrap_or("semantic,physical");
+    (
+        include.contains("semantic"),
+        include.contains("physical"),
+        include.contains("zap"),
+    )
+}
+
+fn build_dataset_objset_response(dir_obj: u64, head_obj: u64, objset_value: &Value) -> Value {
+    serde_json::json!({
+        "dsl_dir_obj": dir_obj,
+        "head_dataset_obj": head_obj,
+        "objset_id": objset_value["objset_id"],
+        "rootbp": objset_value["rootbp"]
+    })
 }
 
 fn json_from_result(result: crate::ffi::ZdxResult) -> Result<Json<Value>, (StatusCode, String)> {
@@ -55,13 +104,7 @@ fn json_from_result(result: crate::ffi::ZdxResult) -> Result<Json<Value>, (Statu
         "Missing JSON in result".to_string(),
     ))?;
 
-    let value: Value = serde_json::from_str(json_str).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let value = parse_json_value(json_str)?;
 
     Ok(Json(value))
 }
@@ -102,7 +145,7 @@ pub async fn mos_list_objects(
 
     let type_filter = params.type_filter.unwrap_or(-1);
     let start = params.start.unwrap_or(0);
-    let limit = params.limit.unwrap_or(200);
+    let limit = normalize_limit(params.limit);
 
     let result = crate::ffi::mos_list_objects(pool_ptr, type_filter, start, limit);
     json_from_result(result)
@@ -167,8 +210,7 @@ pub async fn zap_entries(
     Query(params): Query<ZapEntriesQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pool_ptr = ensure_pool(&state, &pool)?;
-    let cursor = params.cursor.unwrap_or(0);
-    let limit = params.limit.unwrap_or(200);
+    let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
     let result = crate::ffi::zap_entries(pool_ptr, objid, cursor, limit);
     json_from_result(result)
 }
@@ -423,7 +465,24 @@ pub async fn dataset_head(
     Path((pool, dir_obj)): Path<(String, u64)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pool_ptr = ensure_pool(&state, &pool)?;
+    let response = resolve_dataset_objset(pool_ptr, dir_obj)?;
+    Ok(Json(response))
+}
 
+/// GET /api/pools/:pool/dataset/:dsl_dir_obj/objset
+pub async fn dataset_objset(
+    State(state): State<AppState>,
+    Path((pool, dir_obj)): Path<(String, u64)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let response = resolve_dataset_objset(pool_ptr, dir_obj)?;
+    Ok(Json(response))
+}
+
+fn resolve_dataset_objset(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    dir_obj: u64,
+) -> Result<Value, (StatusCode, String)> {
     let head_result = crate::ffi::dsl_dir_head(pool_ptr, dir_obj);
     if !head_result.is_ok() {
         let err_msg = head_result.error_msg().unwrap_or("Unknown error");
@@ -470,14 +529,9 @@ pub async fn dataset_head(
         )
     })?;
 
-    let response = serde_json::json!({
-        "dsl_dir_obj": dir_obj,
-        "head_dataset_obj": head_obj,
-        "objset_id": objset_value["objset_id"],
-        "rootbp": objset_value["rootbp"]
-    });
+    let response = build_dataset_objset_response(dir_obj, head_obj, &objset_value);
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// GET /api/pools/:pool/objset/:objset_id/root
@@ -528,8 +582,7 @@ pub async fn objset_dir_entries(
     Query(params): Query<DirEntriesQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pool_ptr = ensure_pool(&state, &pool)?;
-    let cursor = params.cursor.unwrap_or(0);
-    let limit = params.limit.unwrap_or(200);
+    let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
     let result = crate::ffi::objset_dir_entries(pool_ptr, objset_id, dir_obj, cursor, limit);
     json_from_result(result)
 }
@@ -572,9 +625,7 @@ pub async fn graph_from(
     let pool_ptr = ensure_pool(&state, &pool)?;
     let include = params.include.unwrap_or_else(|| "semantic,physical".to_string());
     let _depth = params.depth.unwrap_or(1);
-    let include_semantic = include.contains("semantic");
-    let include_physical = include.contains("physical");
-    let include_zap = include.contains("zap");
+    let (include_semantic, include_physical, include_zap) = parse_graph_include(Some(&include));
 
     let result = crate::ffi::obj_get(pool_ptr, objid);
     if !result.is_ok() {
@@ -672,4 +723,60 @@ pub async fn graph_from(
     });
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_limit_uses_default_and_bounds() {
+        assert_eq!(normalize_limit(None), DEFAULT_PAGE_LIMIT);
+        assert_eq!(normalize_limit(Some(0)), 1);
+        assert_eq!(normalize_limit(Some(17)), 17);
+        assert_eq!(normalize_limit(Some(MAX_PAGE_LIMIT + 1)), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn normalize_cursor_limit_defaults_cursor_and_limit() {
+        assert_eq!(
+            normalize_cursor_limit(None, None),
+            (0, DEFAULT_PAGE_LIMIT)
+        );
+        assert_eq!(normalize_cursor_limit(Some(42), Some(64)), (42, 64));
+    }
+
+    #[test]
+    fn parse_graph_include_handles_defaults_and_flags() {
+        assert_eq!(parse_graph_include(None), (true, true, false));
+        assert_eq!(parse_graph_include(Some("semantic,zap")), (true, false, true));
+        assert_eq!(parse_graph_include(Some("physical")), (false, true, false));
+    }
+
+    #[test]
+    fn parse_json_value_maps_errors_to_http_500() {
+        let err = parse_json_value("{bad json").unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.starts_with("JSON parse error:"));
+    }
+
+    #[test]
+    fn dataset_objset_response_shape_is_stable() {
+        let payload = build_dataset_objset_response(
+            32,
+            54,
+            &json!({
+                "objset_id": 54,
+                "rootbp": {
+                    "ndvas": 2
+                }
+            }),
+        );
+
+        assert_eq!(payload["dsl_dir_obj"], 32);
+        assert_eq!(payload["head_dataset_obj"], 54);
+        assert_eq!(payload["objset_id"], 54);
+        assert_eq!(payload["rootbp"]["ndvas"], 2);
+    }
 }

@@ -92,6 +92,13 @@ pub fn list_pools() -> ZdxResult {
     ZdxResult::from_raw(raw)
 }
 
+/// List datasets in an open pool (behind mutex)
+pub fn pool_datasets(pool: *mut zdx_pool_t) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_pool_datasets(pool) };
+    ZdxResult::from_raw(raw)
+}
+
 /// Open a pool (behind mutex)
 pub fn pool_open(name: &str) -> Result<PoolHandle, (i32, String)> {
     let _lock = FFI_MUTEX.lock().unwrap();

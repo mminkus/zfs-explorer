@@ -635,6 +635,44 @@ footer code {
   color: var(--muted);
 }
 
+.fs-pathbar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 0.8rem;
+}
+
+.fs-path-view {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.fs-path-view-toggle {
+  display: inline-flex;
+  gap: 0.35rem;
+}
+
+.fs-path-view-value {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 0.2rem 0.45rem;
+  max-width: min(100%, 460px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-path-error {
+  color: #ff8c42;
+  font-size: 0.7rem;
+}
+
 .fs-object-link {
   border: none;
   background: transparent;
@@ -1207,6 +1245,11 @@ footer code {
 .graph-tooltip-sub {
   color: var(--muted);
   font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
+.graph-tooltip-detail {
+  color: var(--muted);
   font-size: 0.72rem;
 }
 

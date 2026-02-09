@@ -34,6 +34,7 @@ type Props = {
   showPhysical: boolean
   showBlkptrDetails: boolean
   onNavigate: (objid: number) => void
+  objTypeMap?: Map<number, string>
 }
 
 export function ObjectGraph({
@@ -49,14 +50,21 @@ export function ObjectGraph({
   showPhysical,
   showBlkptrDetails,
   onNavigate,
+  objTypeMap,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const cyRef = useRef<Core | null>(null)
+  const [zapLimit, setZapLimit] = useState(25)
   const [hoverInfo, setHoverInfo] = useState<{
     title: string
     subtitle?: string
     kind?: string
+    detail?: string
   } | null>(null)
+
+  useEffect(() => {
+    setZapLimit(25)
+  }, [selectedObject, zapEntries])
 
   // Build graph elements
   const elements = useMemo(() => {
@@ -73,6 +81,7 @@ export function ObjectGraph({
         label: `#${selectedObject}`,
         sublabel: objectTypeName,
         type: 'center',
+        typeName: objectTypeName,
       },
     })
     addedNodes.add(`obj-${selectedObject}`)
@@ -89,6 +98,7 @@ export function ObjectGraph({
               sublabel: edge.label,
               type: 'semantic',
               objid: edge.target_obj,
+              typeName: objTypeMap?.get(edge.target_obj),
             },
           })
           addedNodes.add(targetId)
@@ -109,18 +119,19 @@ export function ObjectGraph({
     if (showSemantic || showZap) {
       extraNodes.forEach(objid => {
         const nodeId = `obj-${objid}`
-        if (!addedNodes.has(nodeId)) {
-          nodes.push({
-            data: {
-              id: nodeId,
-              label: `#${objid}`,
-              sublabel: 'expanded',
-              type: 'expanded',
-              objid,
-            },
-          })
-          addedNodes.add(nodeId)
-        }
+      if (!addedNodes.has(nodeId)) {
+        nodes.push({
+          data: {
+            id: nodeId,
+            label: `#${objid}`,
+            sublabel: 'expanded',
+            type: 'expanded',
+            objid,
+            typeName: objTypeMap?.get(objid),
+          },
+        })
+        addedNodes.add(nodeId)
+      }
       })
     }
 
@@ -142,6 +153,7 @@ export function ObjectGraph({
             sublabel: 'expanded',
             type: 'expanded',
             objid: edge.source_obj,
+            typeName: objTypeMap?.get(edge.source_obj),
           },
         })
         addedNodes.add(sourceId)
@@ -154,6 +166,7 @@ export function ObjectGraph({
             sublabel: 'expanded',
             type: 'expanded',
             objid: edge.target_obj,
+            typeName: objTypeMap?.get(edge.target_obj),
           },
         })
         addedNodes.add(targetId)
@@ -172,9 +185,11 @@ export function ObjectGraph({
 
     // ZAP entry refs
     if (showZap) {
-      const zapRefs = zapEntries.filter(e => e.maybe_object_ref && e.target_obj !== null)
-      const maxZapRefs = 25
-      const visibleZapRefs = zapRefs.slice(0, maxZapRefs)
+      const zapRefs = zapEntries.filter(
+        (e): e is ZapEntry & { target_obj: number } =>
+          e.maybe_object_ref && typeof e.target_obj === 'number'
+      )
+      const visibleZapRefs = zapRefs.slice(0, zapLimit)
       const remaining = zapRefs.length - visibleZapRefs.length
 
       visibleZapRefs.forEach(entry => {
@@ -187,6 +202,7 @@ export function ObjectGraph({
               sublabel: entry.name,
               type: 'zap',
               objid: entry.target_obj,
+              typeName: objTypeMap?.get(entry.target_obj),
             },
           })
           addedNodes.add(targetId)
@@ -284,6 +300,8 @@ export function ObjectGraph({
     showZap,
     showPhysical,
     showBlkptrDetails,
+    zapLimit,
+    objTypeMap,
   ])
 
   // Initialize/update cytoscape
@@ -442,6 +460,15 @@ export function ObjectGraph({
         },
       ] as any,
       layout: (() => {
+        const physicalOnly = showPhysical && !showSemantic && !showZap
+        if (physicalOnly) {
+          return {
+            name: 'concentric',
+            padding: 40,
+            minNodeSpacing: 30,
+            startAngle: (3 / 2) * Math.PI,
+          }
+        }
         const normalized = objectTypeName.toLowerCase()
         if (normalized.includes('child map')) {
           return {
@@ -479,6 +506,10 @@ export function ObjectGraph({
       }
     })
 
+    cy.on('tap', 'node[type="zap-more"]', () => {
+      setZapLimit(prev => prev + 25)
+    })
+
     // Hover cursor
     cy.on('mouseover', 'node[objid]', () => {
       if (containerRef.current) {
@@ -508,12 +539,18 @@ export function ObjectGraph({
       const objid = data.objid as number | undefined
       const kind = data.type ? typeLabels[data.type] ?? data.type : undefined
 
+      const rawTypeName = typeof data.typeName === 'string' ? data.typeName : undefined
+      const typeName =
+        rawTypeName && rawTypeName !== data.sublabel && rawTypeName !== labelFirst
+          ? rawTypeName
+          : undefined
       setHoverInfo({
         title: objid !== undefined ? `Object ${objid}` : labelFirst,
         subtitle:
           objid !== undefined && labelFirst && labelFirst !== `#${objid}`
             ? labelFirst
             : data.sublabel,
+        detail: typeName,
         kind,
       })
     })
@@ -544,6 +581,7 @@ export function ObjectGraph({
         <div className="graph-tooltip">
           <div className="graph-tooltip-title">{hoverInfo.title}</div>
           {hoverInfo.subtitle && <div className="graph-tooltip-sub">{hoverInfo.subtitle}</div>}
+          {hoverInfo.detail && <div className="graph-tooltip-detail">{hoverInfo.detail}</div>}
           {hoverInfo.kind && <div className="graph-tooltip-kind">{hoverInfo.kind}</div>}
         </div>
       )}

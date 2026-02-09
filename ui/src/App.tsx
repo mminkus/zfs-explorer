@@ -126,6 +126,13 @@ type DatasetTreeResponse = {
   count: number
 }
 
+type DatasetCatalogEntry = {
+  name: string
+  type: string
+  mountpoint: string | null
+  mounted: boolean | null
+}
+
 type FsEntry = {
   name: string
   objid: number
@@ -278,7 +285,9 @@ function App() {
   const [zapNext, setZapNext] = useState<number | null>(null)
   const [zapLoading, setZapLoading] = useState(false)
   const [zapError, setZapError] = useState<string | null>(null)
+  const [zapMapFilter, setZapMapFilter] = useState('')
   const [datasetTree, setDatasetTree] = useState<DatasetTreeResponse | null>(null)
+  const [datasetCatalog, setDatasetCatalog] = useState<Record<string, DatasetCatalogEntry>>({})
   const [datasetExpanded, setDatasetExpanded] = useState<Record<number, boolean>>({})
   const [datasetLoading, setDatasetLoading] = useState(false)
   const [datasetError, setDatasetError] = useState<string | null>(null)
@@ -289,6 +298,7 @@ function App() {
   const [fsLoading, setFsLoading] = useState(false)
   const [fsError, setFsError] = useState<string | null>(null)
   const [fsPathInput, setFsPathInput] = useState('')
+  const [fsPathView, setFsPathView] = useState<'zpl' | 'mount'>('zpl')
   const [fsPathError, setFsPathError] = useState<string | null>(null)
   const [fsPathLoading, setFsPathLoading] = useState(false)
   const [fsSelected, setFsSelected] = useState<{
@@ -358,6 +368,12 @@ function App() {
     return map
   }, [mosObjects])
 
+  const mosTypeMap = useMemo(() => {
+    const map = new Map<number, string>()
+    mosObjects.forEach(obj => map.set(obj.id, obj.type_name))
+    return map
+  }, [mosObjects])
+
   const datasetIndex = useMemo(() => {
     const nodeById = new Map<number, DatasetTreeNode>()
     const fullNameById = new Map<number, string>()
@@ -380,9 +396,13 @@ function App() {
     return { nodeById, fullNameById, childZapToNode }
   }, [datasetTree])
 
-  const datasetForChildMap = useMemo(() => {
+  const datasetForMos = useMemo(() => {
     if (selectedObject === null) return null
-    return datasetIndex.childZapToNode.get(selectedObject) ?? null
+    return (
+      datasetIndex.nodeById.get(selectedObject) ??
+      datasetIndex.childZapToNode.get(selectedObject) ??
+      null
+    )
   }, [datasetIndex, selectedObject])
 
   const filteredFsEntries = useMemo(() => {
@@ -433,6 +453,26 @@ function App() {
     })
     return entries
   }, [filteredFsEntries, fsSort, fsEntryStats])
+
+  const fsDisplayPath = useMemo(() => {
+    if (!fsState) return '/'
+
+    const relative = fsPathInput
+      ? fsPathInput.startsWith('/')
+        ? fsPathInput
+        : `/${fsPathInput}`
+      : '/'
+
+    if (fsPathView === 'mount' && fsState.mountpoint) {
+      const base =
+        fsState.mountpoint.endsWith('/') && relative !== '/'
+          ? fsState.mountpoint.slice(0, -1)
+          : fsState.mountpoint
+      return relative === '/' ? base : `${base}${relative}`
+    }
+
+    return relative === '/' ? fsState.datasetName : `${fsState.datasetName}${relative}`
+  }, [fsState, fsPathInput, fsPathView])
 
   const formatAddr = (value: number) => {
     if (formatMode === 'hex') {
@@ -689,12 +729,14 @@ function App() {
   )
 
   const isMosMode = leftPaneTab === 'mos'
+  const isFsTab = leftPaneTab === 'fs'
+  const isDatasetsTab = leftPaneTab === 'datasets'
   const isFsMode = leftPaneTab !== 'mos'
   const canGoBack =
-    (isMosMode && navIndex > 0) || (isFsMode && fsHistoryIndex > 0)
+    (isMosMode && navIndex > 0) || (isFsTab && fsHistoryIndex > 0)
   const canGoForward =
     (isMosMode && navIndex < navStack.length - 1) ||
-    (isFsMode && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1)
+    (isFsTab && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1)
 
   useEffect(() => {
     fetch(`${API_BASE}/api/pools`)
@@ -821,6 +863,24 @@ function App() {
     }
   }
 
+  const fetchDatasetCatalog = async (pool: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/pools/${encodeURIComponent(pool)}/datasets`)
+      if (!res.ok) {
+        throw new Error(`Dataset list HTTP ${res.status}`)
+      }
+      const data = (await res.json()) as DatasetCatalogEntry[]
+      const next: Record<string, DatasetCatalogEntry> = {}
+      data.forEach(entry => {
+        next[entry.name] = entry
+      })
+      setDatasetCatalog(next)
+    } catch (err) {
+      console.warn('Failed to fetch dataset catalog:', err)
+      setDatasetCatalog({})
+    }
+  }
+
   const toggleDatasetNode = (dirObj: number) => {
     setDatasetExpanded(prev => ({ ...prev, [dirObj]: !prev[dirObj] }))
   }
@@ -853,6 +913,10 @@ function App() {
     const expanded = datasetExpanded[node.dsl_dir_obj] ?? depth === 0
     const children = node.children ?? []
     const hasChildren = children.length > 0
+    const fullName =
+      datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
+    const catalog = datasetCatalog[fullName]
+    const mountHint = catalog?.mountpoint ? ` · ${catalog.mountpoint}` : ''
 
     return (
       <div key={`${node.dsl_dir_obj}-${node.name}`} style={{ marginLeft: depth * 12 }}>
@@ -864,7 +928,11 @@ function App() {
           >
             {hasChildren ? (expanded ? '▾' : '▸') : '•'}
           </button>
-          <button className="dsl-name" onClick={() => enterFsFromDataset(node)}>
+          <button
+            className="dsl-name"
+            onClick={() => enterFsFromDataset(node)}
+            title={`Dataset ${fullName} (#${node.dsl_dir_obj})${mountHint}`}
+          >
             {node.name}
           </button>
           <span className="dsl-id">#{node.dsl_dir_obj}</span>
@@ -900,14 +968,17 @@ function App() {
       fetchFsStat(fsState.objsetId, entry.objid)
       return
     }
-    const nextPath = [...fsState.path, { name: entry.name, objid: entry.objid }]
+    const nextPath = [
+      ...fsState.path,
+      { name: entry.name, objid: entry.objid, kind: entry.type_name },
+    ]
     fetchFsDir(fsState.objsetId, entry.objid, nextPath)
   }
 
   const resolveFsPathSegments = async (objsetId: number, resolvedPath: string) => {
     if (!selectedPool || !fsState) return []
     const parts = resolvedPath.split('/').filter(Boolean)
-    const segments = [{ name: fsState.datasetName, objid: fsState.rootObj }]
+    const segments = [{ name: fsState.datasetName, objid: fsState.rootObj, kind: 'dir' }]
     if (parts.length === 0) {
       return segments
     }
@@ -921,18 +992,22 @@ function App() {
           )}/objset/${objsetId}/walk?path=${encodeURIComponent(currentPath)}`
         )
         if (!res.ok) {
-          segments.push({ name: part, objid: 0 })
+          segments.push({ name: part, objid: 0, kind: 'dir' })
           continue
         }
         const data = await res.json()
         if (!data.found) {
-          segments.push({ name: part, objid: 0 })
+          segments.push({ name: part, objid: 0, kind: 'dir' })
           continue
         }
         const objid = Number(data.objid) || 0
-        segments.push({ name: part, objid })
+        segments.push({
+          name: part,
+          objid,
+          kind: typeof data.type_name === 'string' ? data.type_name : 'dir',
+        })
       } catch {
-        segments.push({ name: part, objid: 0 })
+        segments.push({ name: part, objid: 0, kind: 'dir' })
       }
     }
     return segments
@@ -1053,14 +1128,17 @@ function App() {
         const segments = await resolveFsPathSegments(fsState.objsetId, resolved)
         if (segments.length === 0) {
           const fallbackPath = [
-            { name: fsState.datasetName, objid: fsState.rootObj },
-            { name: resolved, objid },
+            { name: fsState.datasetName, objid: fsState.rootObj, kind: 'dir' },
+            { name: resolved, objid, kind: 'dir' },
           ]
           await fetchFsDir(fsState.objsetId, objid, fallbackPath)
         } else {
           const last = segments[segments.length - 1]
           if (last.objid === 0) {
             last.objid = objid
+          }
+          if (!last.kind) {
+            last.kind = 'dir'
           }
           await fetchFsDir(fsState.objsetId, objid, segments)
         }
@@ -1180,7 +1258,7 @@ function App() {
       return
     }
 
-    if (isFsMode && fsHistoryIndex > 0) {
+    if (isFsTab && fsHistoryIndex > 0) {
       skipNextHistoryPush.current = true
       const newIndex = fsHistoryIndex - 1
       const location = fsHistory[newIndex]
@@ -1194,7 +1272,7 @@ function App() {
     }
   }, [
     isMosMode,
-    isFsMode,
+    isFsTab,
     navIndex,
     navStack,
     fsHistory,
@@ -1214,7 +1292,7 @@ function App() {
       return
     }
 
-    if (isFsMode && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1) {
+    if (isFsTab && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1) {
       skipNextHistoryPush.current = true
       const newIndex = fsHistoryIndex + 1
       const location = fsHistory[newIndex]
@@ -1228,7 +1306,7 @@ function App() {
     }
   }, [
     isMosMode,
-    isFsMode,
+    isFsTab,
     navIndex,
     navStack,
     fsHistory,
@@ -1283,14 +1361,17 @@ function App() {
 
       const fullName =
         datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
+      const catalog = datasetCatalog[fullName]
       const baseState: FsLocation = {
         datasetName: fullName,
+        mountpoint: catalog?.mountpoint ?? null,
+        mounted: catalog?.mounted ?? null,
         dslDirObj: node.dsl_dir_obj,
         headDatasetObj,
         objsetId,
         rootObj,
         currentDir: rootObj,
-        path: [{ name: fullName, objid: rootObj }],
+        path: [{ name: fullName, objid: rootObj, kind: 'dir' }],
       }
       setFsState(baseState)
 
@@ -1307,8 +1388,8 @@ function App() {
   }
 
   const openFsFromMos = () => {
-    if (!datasetForChildMap) return
-    enterFsFromDataset(datasetForChildMap)
+    if (!datasetForMos) return
+    enterFsFromDataset(datasetForMos)
   }
 
   const typeOptions = useMemo(() => {
@@ -1349,6 +1430,7 @@ function App() {
       setMosObjects([])
       setMosNext(null)
       setDatasetTree(null)
+      setDatasetCatalog({})
       setDatasetExpanded({})
       setFsState(null)
       setFsHistory([])
@@ -1364,6 +1446,7 @@ function App() {
       setFsEntryStatsLoading(false)
       setFsEntryStatsError(null)
       setFsPathInput('')
+      setFsPathView('zpl')
       setFsPathError(null)
       setFsPathLoading(false)
       setFsCenterView('list')
@@ -1388,6 +1471,7 @@ function App() {
       return
     }
     fetchDatasetTree(selectedPool)
+    fetchDatasetCatalog(selectedPool)
   }, [selectedPool])
 
   const fetchZapInfo = async (objid: number) => {
@@ -1511,7 +1595,7 @@ function App() {
   }
 
   useEffect(() => {
-    if (!isFsMode) return
+    if (!isFsTab) return
     const handler = (event: KeyboardEvent) => {
       if (event.key !== '/') return
       const target = event.target as HTMLElement | null
@@ -1522,10 +1606,10 @@ function App() {
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [isFsMode])
+  }, [isFsTab])
 
   useEffect(() => {
-    if (!isFsMode || !fsState) return
+    if (!isFsTab || !fsState) return
     if (!['size', 'mtime'].includes(fsSort.key)) return
     if (fsEntryStatsLoading) return
     const missing = sortedFsEntries.some(entry => fsEntryStats[entry.objid] === undefined)
@@ -1540,7 +1624,7 @@ function App() {
     fsSearch,
     fsSort.key,
     fsState,
-    isFsMode,
+    isFsTab,
     sortedFsEntries,
   ])
 
@@ -1861,10 +1945,10 @@ function App() {
           <span className="crumb muted">No pool selected</span>
         )}
         <span className="crumb-sep">→</span>
-        {leftPaneTab !== 'mos' && !fsState && (
+        {isDatasetsTab && (
           <span className="crumb active">Datasets</span>
         )}
-        {leftPaneTab !== 'mos' && fsState && (
+        {isFsTab && (
           <>
             <button
               className="crumb"
@@ -1874,14 +1958,20 @@ function App() {
               Datasets
             </button>
             <span className="crumb-sep">→</span>
-            <span className="crumb active">FS</span>
+            <span className="crumb active" title="Filesystem view">
+              FS
+            </span>
             {fsState?.path.map((seg, idx) => (
               <span key={`${seg.objid}-${idx}`} className="crumb-group">
                 <span className="crumb-sep">→</span>
                 <button
                   className={`crumb ${idx === fsState.path.length - 1 ? 'active' : ''}`}
                   onClick={() => handleFsPathClick(idx)}
-                  title={`FS object ${seg.objid}`}
+                  title={
+                    seg.objid
+                      ? `FS ${seg.kind ?? 'object'} #${seg.objid}`
+                      : 'Unresolved path'
+                  }
                 >
                   {seg.name}
                 </button>
@@ -1946,7 +2036,7 @@ function App() {
               Datasets
             </button>
             <button
-              className={`tab ${leftPaneTab === 'mos' ? 'active' : ''}`}
+              className={`tab ${isMosMode ? 'active' : ''}`}
               onClick={() => setLeftPaneTabWithHistory('mos')}
             >
               MOS
@@ -1998,161 +2088,7 @@ function App() {
                   )}
                 </div>
               )}
-              <div className="fs-panel">
-                <h3>Filesystem Navigator</h3>
-                {fsState && (
-                  <div className="fs-active">
-                    <span className="fs-active-label">Active dataset</span>
-                    <strong>{fsState.datasetName}</strong>
-                    <span className="fs-active-meta">objset {fsState.objsetId}</span>
-                  </div>
-                )}
-                {!fsState && fsLoading && (
-                  <p className="muted">Loading dataset…</p>
-                )}
-                {!fsState && fsError && (
-                  <div className="error">
-                    <strong>Error:</strong> {fsError}
-                  </div>
-                )}
-                {!fsState && !fsLoading && !fsError && (
-                  <p className="muted">
-                    Select a dataset from the Datasets tab to start browsing.
-                  </p>
-                )}
-                {fsState && (
-                  <>
-                    <div className="fs-path">
-                      {fsState.path.map((seg, idx) => (
-                        <button
-                          key={`${seg.objid}-${idx}`}
-                          className={`fs-path-seg ${idx === fsState.path.length - 1 ? 'active' : ''}`}
-                          onClick={() => {
-                            if (idx === fsState.path.length - 1) return
-                            if (seg.objid === 0) {
-                              const derived =
-                                idx === 0
-                                  ? '/'
-                                  : `/${fsState.path
-                                      .slice(1, idx + 1)
-                                      .map(part => part.name)
-                                      .filter(Boolean)
-                                      .join('/')}`
-                              handleFsPathSubmit(derived)
-                            } else {
-                              handleFsPathClick(idx)
-                            }
-                          }}
-                        >
-                          {seg.name}
-                        </button>
-                      ))}
-                    </div>
-
-                    <div className="fs-actions">
-                      <div className="fs-path-input">
-                        <input
-                          type="text"
-                          value={fsPathInput}
-                          onChange={e => setFsPathInput(e.target.value)}
-                          onKeyDown={e => {
-                            if (e.key === 'Enter') {
-                              handleFsPathSubmit()
-                            }
-                          }}
-                          placeholder="/path/to/dir"
-                        />
-                        <button type="button" onClick={() => handleFsPathSubmit()} disabled={fsPathLoading}>
-                          {fsPathLoading ? '…' : 'Go'}
-                        </button>
-                      </div>
-                      <button
-                        type="button"
-                        className="fs-meta-btn"
-                        onClick={() => fetchFsEntryStats(fsEntries)}
-                        disabled={fsEntryStatsLoading || fsEntries.length === 0}
-                      >
-                        {fsEntryStatsLoading ? 'Loading…' : 'Load metadata'}
-                      </button>
-                    </div>
-
-                    <div className="fs-meta">
-                      <span>objset {fsState.objsetId}</span>
-                      <span>dir {fsState.currentDir}</span>
-                      {fsEntryStatsError && <span>Error: {fsEntryStatsError}</span>}
-                      {fsPathError && <span>Error: {fsPathError}</span>}
-                    </div>
-
-                    {fsLoading && <p className="muted">Loading directory…</p>}
-                    {fsError && <p className="muted">Error: {fsError}</p>}
-
-                    {!fsLoading && !fsError && (
-                      <div className="fs-table">
-                        <div className="fs-row fs-header">
-                          <button
-                            type="button"
-                            className={`fs-header-btn ${fsSort.key === 'name' ? 'active' : ''}`}
-                            onClick={() => toggleFsSort('name')}
-                          >
-                            Name {fsSort.key === 'name' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
-                          </button>
-                          <button
-                            type="button"
-                            className={`fs-header-btn ${fsSort.key === 'type' ? 'active' : ''}`}
-                            onClick={() => toggleFsSort('type')}
-                          >
-                            Type {fsSort.key === 'type' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
-                          </button>
-                          <div>Object</div>
-                          <button
-                            type="button"
-                            className={`fs-header-btn align-right ${
-                              fsSort.key === 'size' ? 'active' : ''
-                            }`}
-                            onClick={() => toggleFsSort('size')}
-                          >
-                            Size {fsSort.key === 'size' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
-                          </button>
-                          <button
-                            type="button"
-                            className={`fs-header-btn ${fsSort.key === 'mtime' ? 'active' : ''}`}
-                            onClick={() => toggleFsSort('mtime')}
-                          >
-                            MTime {fsSort.key === 'mtime' ? (fsSort.dir === 'asc' ? '↑' : '↓') : ''}
-                          </button>
-                        </div>
-                        {fsEntries.map(entry => (
-                          (() => {
-                            const stat = fsEntryStats[entry.objid]
-                            return (
-                          <div
-                            key={`${entry.name}-${entry.objid}`}
-                            className={`fs-row ${
-                              entry.type_name === 'dir' ? 'clickable' : 'selectable'
-                            } ${fsSelected?.objid === entry.objid ? 'selected' : ''}`}
-                            onClick={() => handleFsEntryClick(entry)}
-                          >
-                            <div className="fs-name">{entry.name}</div>
-                            <div className="fs-type">{entry.type_name}</div>
-                            <div className="fs-obj">#{entry.objid}</div>
-                            <div className="fs-size">
-                              {stat ? formatBytes(stat.size) : '—'}
-                            </div>
-                            <div className="fs-mtime">
-                              {stat ? formatTimestamp(stat.mtime) : '—'}
-                            </div>
-                          </div>
-                            )
-                          })()
-                        ))}
-                        {fsEntries.length === 0 && (
-                          <div className="fs-empty">No entries found.</div>
-                        )}
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
+              {/* Filesystem navigation lives in the center pane now */}
             </div>
           )}
 
@@ -2268,7 +2204,7 @@ function App() {
                   <h2>Filesystem</h2>
                   <span className="muted">
                     {fsState
-                      ? `${fsState.datasetName} · ${fsPathInput || '/'} · ${sortedFsEntries.length} entries`
+                      ? `${fsState.datasetName}${fsState.mountpoint ? ` (${fsState.mountpoint})` : ''} · ${fsPathInput || '/'} · ${sortedFsEntries.length} entries`
                       : 'Select a dataset'}
                   </span>
                 </div>
@@ -2339,6 +2275,92 @@ function App() {
                   </button>
                 </div>
               </div>
+              {fsState && (
+                <div className="fs-pathbar">
+                  <div className="fs-path">
+                    {fsState.path.map((seg, idx) => (
+                      <button
+                        key={`${seg.objid}-${idx}`}
+                        className={`fs-path-seg ${idx === fsState.path.length - 1 ? 'active' : ''}`}
+                        onClick={() => {
+                          if (idx === fsState.path.length - 1) return
+                          if (seg.objid === 0) {
+                            const derived =
+                              idx === 0
+                                ? '/'
+                                : `/${fsState.path
+                                    .slice(1, idx + 1)
+                                    .map(part => part.name)
+                                    .filter(Boolean)
+                                    .join('/')}`
+                            handleFsPathSubmit(derived)
+                          } else {
+                            handleFsPathClick(idx)
+                          }
+                        }}
+                      >
+                        {seg.name}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="fs-actions">
+                    <div className="fs-path-input">
+                      <input
+                        type="text"
+                        value={fsPathInput}
+                        onChange={e => setFsPathInput(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') {
+                            handleFsPathSubmit()
+                          }
+                        }}
+                        placeholder="/path/to/dir"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleFsPathSubmit()}
+                        disabled={fsPathLoading}
+                      >
+                        {fsPathLoading ? '…' : 'Go'}
+                      </button>
+                    </div>
+                    {fsPathError && <span className="fs-path-error">Error: {fsPathError}</span>}
+                    <div className="fs-path-view">
+                      <div className="fs-path-view-toggle">
+                        <button
+                          type="button"
+                          className={`graph-btn ${fsPathView === 'zpl' ? 'active' : ''}`}
+                          onClick={() => setFsPathView('zpl')}
+                        >
+                          ZPL
+                        </button>
+                        <button
+                          type="button"
+                          className={`graph-btn ${fsPathView === 'mount' ? 'active' : ''}`}
+                          onClick={() => setFsPathView('mount')}
+                          disabled={!fsState.mountpoint}
+                        >
+                          Mount
+                        </button>
+                      </div>
+                      <code className="fs-path-view-value">{fsDisplayPath}</code>
+                    </div>
+                  </div>
+
+                  <div className="fs-meta">
+                    <span>objset {fsState.objsetId}</span>
+                    <span>dir {fsState.currentDir}</span>
+                    {fsEntryStatsError && <span>Error: {fsEntryStatsError}</span>}
+                  </div>
+                </div>
+              )}
+              {fsLoading && <p className="muted">Loading filesystem…</p>}
+              {fsError && (
+                <div className="error">
+                  <strong>Error:</strong> {fsError}
+                </div>
+              )}
               <div className="graph">
                 {fsCenterView === 'graph' && fsState ? (
                   <FsGraph
@@ -2448,20 +2470,42 @@ function App() {
                       Physical
                     </button>
                   </div>
-                  <input
-                    className="graph-search"
-                    placeholder="Go to object ID"
-                    value={graphSearch}
-                    onChange={e => setGraphSearch(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') {
-                        handleGraphSearch()
-                      }
-                    }}
-                  />
-                  <button className="graph-btn" type="button" onClick={handleGraphSearch}>
-                    Go
-                  </button>
+                  {effectiveCenterView === 'map' ? (
+                    <>
+                      <input
+                        className="graph-search"
+                        placeholder="Filter ZAP keys"
+                        value={zapMapFilter}
+                        onChange={e => setZapMapFilter(e.target.value)}
+                      />
+                      {zapMapFilter && (
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() => setZapMapFilter('')}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <input
+                        className="graph-search"
+                        placeholder="Go to object ID"
+                        value={graphSearch}
+                        onChange={e => setGraphSearch(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') {
+                            handleGraphSearch()
+                          }
+                        }}
+                      />
+                      <button className="graph-btn" type="button" onClick={handleGraphSearch}>
+                        Go
+                      </button>
+                    </>
+                  )}
                   {effectiveCenterView !== 'map' && (
                     <>
                       {effectiveCenterView !== 'physical' && (
@@ -2505,6 +2549,7 @@ function App() {
                   <ZapMapView
                     entries={zapEntries}
                     mosObjectMap={mosObjectMap}
+                    filter={zapMapFilter}
                     onNavigate={navigateTo}
                   />
                 ) : (
@@ -2521,6 +2566,7 @@ function App() {
                     showPhysical={showPhysicalEdgesActive}
                     showBlkptrDetails={showBlkptrDetails}
                     onNavigate={navigateTo}
+                    objTypeMap={mosTypeMap}
                   />
                 )}
                 {graphExpandError && <div className="graph-error">{graphExpandError}</div>}
@@ -2564,8 +2610,22 @@ function App() {
                     <dd>{fsState.datasetName}</dd>
                   </div>
                   <div>
+                    <dt>Mountpoint</dt>
+                    <dd>{fsState.mountpoint ?? '—'}</dd>
+                  </div>
+                  <div>
                     <dt>Objset</dt>
                     <dd>{fsState.objsetId}</dd>
+                  </div>
+                  <div>
+                    <dt>Mounted</dt>
+                    <dd>
+                      {fsState.mounted === null || fsState.mounted === undefined
+                        ? 'unknown'
+                        : fsState.mounted
+                        ? 'yes'
+                        : 'no'}
+                    </dd>
                   </div>
                   <div>
                     <dt>Dir Obj</dt>
@@ -2803,14 +2863,14 @@ function App() {
                       </dl>
                     </div>
 
-                    {datasetForChildMap && (
+                    {datasetForMos && (
                       <div className="inspector-section">
                         <h3>Dataset Link</h3>
                         <div className="fs-actions">
                           <span className="muted">
                             {datasetIndex.fullNameById.get(
-                              datasetForChildMap.dsl_dir_obj
-                            ) ?? datasetForChildMap.name}
+                              datasetForMos.dsl_dir_obj
+                            ) ?? datasetForMos.name}
                           </span>
                           <button
                             type="button"

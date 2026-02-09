@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the router
     let app = Router::new()
         .route("/api/pools", get(api::list_pools))
+        .route("/api/pools/{pool}/datasets", get(api::list_pool_datasets))
         .route("/api/pools/{pool}/mos/objects", get(api::mos_list_objects))
         .route("/api/pools/{pool}/obj/{objid}", get(api::mos_get_object))
         .route("/api/pools/{pool}/obj/{objid}/full", get(api::obj_get_full))
@@ -56,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/pools/{pool}/dsl/root", get(api::dsl_root_dir))
         .route("/api/pools/{pool}/datasets/tree", get(api::dataset_tree))
         .route("/api/pools/{pool}/dataset/{objid}/head", get(api::dataset_head))
+        .route("/api/pools/{pool}/dataset/{objid}/objset", get(api::dataset_objset))
         .route("/api/pools/{pool}/objset/{objset_id}/root", get(api::objset_root))
         .route(
             "/api/pools/{pool}/objset/{objset_id}/dir/{dir_obj}/entries",

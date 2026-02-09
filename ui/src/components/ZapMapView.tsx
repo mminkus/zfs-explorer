@@ -13,14 +13,28 @@ type MosObject = {
 type Props = {
   entries: ZapEntry[]
   mosObjectMap: Map<number, MosObject>
+  filter?: string
   onNavigate: (objid: number) => void
 }
 
-export function ZapMapView({ entries, mosObjectMap, onNavigate }: Props) {
-  if (!entries || entries.length === 0) {
+export function ZapMapView({ entries, mosObjectMap, filter, onNavigate }: Props) {
+  const term = (filter ?? '').trim().toLowerCase()
+  const filtered = term
+    ? entries.filter(entry => {
+        const value = entry.value_preview?.toLowerCase() ?? ''
+        const target = entry.target_obj?.toString() ?? ''
+        return (
+          entry.name.toLowerCase().includes(term) ||
+          value.includes(term) ||
+          target.includes(term)
+        )
+      })
+    : entries
+
+  if (!filtered || filtered.length === 0) {
     return (
       <div className="zap-map-empty">
-        <p className="muted">No ZAP entries loaded.</p>
+        <p className="muted">{entries.length ? 'No matches.' : 'No ZAP entries loaded.'}</p>
       </div>
     )
   }
@@ -31,7 +45,7 @@ export function ZapMapView({ entries, mosObjectMap, onNavigate }: Props) {
         <div>Key</div>
         <div>Target</div>
       </div>
-      {entries.map(entry => {
+      {filtered.map(entry => {
         const ref = entry.target_obj ?? 0
         const hint = mosObjectMap.get(ref)?.type_name
         return (

@@ -3,10 +3,13 @@ export type NavigatorMode = 'datasets' | 'mos' | 'fs'
 export type FsPathSegment = {
   name: string
   objid: number
+  kind?: string
 }
 
 export type FsLocation = {
   datasetName: string
+  mountpoint?: string | null
+  mounted?: boolean | null
   dslDirObj: number
   headDatasetObj: number
   objsetId: number
