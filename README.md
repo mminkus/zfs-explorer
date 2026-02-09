@@ -149,7 +149,27 @@ zfs-explorer/
 
 ## Build from Scratch
 
-If you need to rebuild everything:
+Canonical build entrypoint:
+
+```bash
+# Full build (native + backend + UI build)
+./build/build.sh
+```
+
+Fast local rebuild loop:
+
+```bash
+# Equivalent to: native clean+make, backend build, UI build
+./build/build.sh --quick
+```
+
+If you need to bootstrap vendored OpenZFS userland as well:
+
+```bash
+./build/build.sh --bootstrap-openzfs
+```
+
+Manual equivalent (reference):
 
 ```bash
 # 1. Build OpenZFS userland (one time)
@@ -177,6 +197,55 @@ cd ..
 cd ui
 npm install
 ```
+
+## Packaging for Remote Hosts
+
+Build a portable backend bundle (binary + required shared libraries):
+
+```bash
+# debug bundle
+./build/package.sh
+
+# release bundle
+./build/package.sh --profile release
+
+# package existing artifacts without rebuilding
+./build/package.sh --skip-build
+```
+
+Output:
+
+- Bundle directory: `dist/zfs-explorer-<profile>-linux-<arch>/`
+- Tarball: `dist/zfs-explorer-<profile>-linux-<arch>.tar.gz`
+
+Run backend from the bundle with:
+
+```bash
+./run-backend.sh
+```
+
+If your host requires elevated privileges to access pools, run:
+
+```bash
+sudo ./run-backend.sh
+```
+
+Typical remote-host flow:
+
+```bash
+# on build machine
+./build/package.sh --profile release
+rsync -av dist/zfs-explorer-release-linux-$(uname -m).tar.gz USER@HOST:/tmp/
+
+# on target host
+cd /opt
+sudo tar -xzf /tmp/zfs-explorer-release-linux-$(uname -m).tar.gz
+cd zfs-explorer-release-linux-$(uname -m)
+sudo ./run-backend.sh
+```
+
+Note: full static backend linking is not the primary target right now.
+See `docs/PACKAGING_STATIC_FEASIBILITY.md` for the current packaging decision.
 
 ## Security Model
 

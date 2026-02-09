@@ -180,3 +180,6 @@ vgcore.*
 Session.vim
 tags
 TAGS
+
+# Build/package artifacts
+dist/
