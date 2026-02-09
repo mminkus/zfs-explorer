@@ -42,6 +42,53 @@ log_step() {
   echo "==> $*"
 }
 
+version_gt() {
+  [[ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" && "$1" != "$2" ]]
+}
+
+host_glibc_version() {
+  local ver
+  ver="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+  if [[ -z "${ver:-}" ]]; then
+    ver="$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)"
+  fi
+  echo "${ver:-}"
+}
+
+required_glibc_for_vendored_openzfs() {
+  local max_ver=""
+  local lib
+  for lib in "$OPENZFS_PREFIX_DIR/lib/libzfs.so" \
+             "$OPENZFS_PREFIX_DIR/lib/libzpool.so" \
+             "$OPENZFS_PREFIX_DIR/lib/libnvpair.so"; do
+    [[ -f "$lib" ]] || continue
+    while IFS= read -r sym; do
+      local cur
+      cur="${sym#GLIBC_}"
+      if [[ -z "$max_ver" ]] || version_gt "$cur" "$max_ver"; then
+        max_ver="$cur"
+      fi
+    done < <(readelf -V "$lib" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -u)
+  done
+  echo "$max_ver"
+}
+
+check_openzfs_glibc_compat() {
+  local required host
+  required="$(required_glibc_for_vendored_openzfs)"
+  host="$(host_glibc_version)"
+
+  if [[ -z "$required" || -z "$host" ]]; then
+    return
+  fi
+
+  if version_gt "$required" "$host"; then
+    echo "error: vendored OpenZFS libs require GLIBC_$required but host provides GLIBC_$host." >&2
+    echo "hint: rebuild OpenZFS locally via: build/build.sh --bootstrap-openzfs" >&2
+    exit 1
+  fi
+}
+
 ensure_cargo() {
   if command -v cargo >/dev/null 2>&1; then
     return
@@ -77,9 +124,8 @@ bootstrap_openzfs() {
 build_native() {
   log_step "Building native library"
   cd "$ROOT_DIR/native"
-  if [[ "$QUICK_MODE" -eq 1 ]]; then
-    make clean
-  fi
+  # Always rebuild native artifacts to avoid stale .so reuse across hosts.
+  make clean
   make
 }
 
@@ -136,6 +182,8 @@ done
 if [[ "$BOOTSTRAP_OPENZFS" -eq 1 ]]; then
   bootstrap_openzfs
 fi
+
+check_openzfs_glibc_compat
 
 build_native
 build_backend

@@ -1,4 +1,4 @@
-export type NavigatorMode = 'datasets' | 'mos' | 'fs'
+export type NavigatorMode = 'pool' | 'datasets' | 'mos' | 'fs'
 
 export type FsPathSegment = {
   name: string
@@ -19,6 +19,7 @@ export type FsLocation = {
 }
 
 export type BrowserNavState =
+  | { mode: 'pool'; pool: string | null }
   | { mode: 'datasets'; pool: string | null }
   | { mode: 'mos'; pool: string | null; objid: number | null }
   | { mode: 'fs'; pool: string | null; fs: FsLocation | null }

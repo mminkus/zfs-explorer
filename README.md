@@ -9,6 +9,8 @@ format explorable, navigable, and debuggable.
 
 ZFS Explorer currently supports:
 
+- Pool configuration summary (zdb-style fields + vdev tree)
+- Persistent pool error-log browsing (paged, with optional path resolution)
 - MOS object browsing and inspection
 - Dnode and blkptr decoding
 - ZAP visualization
@@ -31,7 +33,7 @@ You can think of this project as:
 - **A teaching and debugging tool for ZFS internals**
 - **A foundation for ZFS recovery and forensic workflows**
 
-**Current Status:** Active development (MOS browser, ZAP decoding, DSL edges, hex dump, dataset tree, FS navigation in progress)
+**Current Status:** Active development (Milestones 0-6 complete; Release Readiness + Offline Mode work in progress)
 
 ## Guided Tour
 
@@ -65,20 +67,16 @@ You can think of this project as:
 React UI (port 8080) → Rust API (port 9000) → libzdbdecode.so → ZFS Libraries
 ```
 
-## What's Implemented (Milestone 0)
+## What's Implemented (Milestones 0-6)
 
-- ✅ Native C library (`libzdbdecode`) with `zdx_list_pools()`
-- ✅ Rust backend with axum serving `GET /api/pools`
-- ✅ React UI displaying pool list
-- ✅ Global mutex for thread-safe ZFS calls
-- ✅ FFI with proper memory management (zdx_free_result)
-
-## What's Implemented (Milestone 1)
-
-- ✅ Pool open/close via libzpool (single active pool)
-- ✅ MOS object listing with pagination and type filtering
-- ✅ MOS object inspector (dnode fields + blkptrs)
-- ✅ Basic UI for browsing MOS objects and inspecting metadata
+- ✅ Pool discovery/open for imported pools with read-only safety model
+- ✅ MOS browser with pagination, filtering, semantic + physical graph views
+- ✅ Rich inspector for dnode fields, ZAP, blkptrs, and raw hex block reads
+- ✅ Pool summary view with feature list, collapsible vdev tree, and copyable zdb-like output
+- ✅ DSL-aware traversal and dataset tree navigation
+- ✅ Filesystem navigation (list + graph modes) with dataset/mount handoff
+- ✅ SPA history-friendly UI navigation, breadcrumbs, and object pinning
+- ✅ Packaging/build scripts and offline fixture + parity validation tooling
 
 ## Running on a Host with ZFS Access
 
@@ -137,6 +135,9 @@ ssh -L 8080:127.0.0.1:8080 -L 9000:127.0.0.1:9000 USER@HOST
 Backend startup now supports an explicit offline pool-open mode for exported
 pools. This mode is opt-in and remains read-only.
 
+Runtime switching is also available from the UI header (`Mode: Live | Offline`)
+or directly via `GET/PUT /api/mode`.
+
 ```bash
 export ZFS_EXPLORER_POOL_MODE=offline
 export ZFS_EXPLORER_OFFLINE_POOLS="poolA,poolB"
@@ -149,6 +150,8 @@ Environment variables:
 - `ZFS_EXPLORER_POOL_MODE`: `live` (default) or `offline`
 - `ZFS_EXPLORER_OFFLINE_POOLS`: comma-separated pool names exposed by `/api/pools` in offline mode
 - `ZFS_EXPLORER_OFFLINE_PATHS`: colon-separated search paths used by offline open logic
+- `ZFS_EXPLORER_ZPOOL_CACHEFILE`: optional override for pool cachefile path in live mode
+  (useful on hosts that do not use `/etc/zfs/zpool.cache`, e.g. `/data/zfs/zpool.cache`)
 
 Optional parity check workflow (live vs offline responses):
 
@@ -181,7 +184,15 @@ zfs-explorer/
 │   ├── include/
 │   │   └── zdbdecode.h    # Public API
 │   ├── src/
-│   │   ├── zdbdecode.c    # Implementation
+│   │   ├── zdbdecode_internal.h
+│   │   ├── zdx_core.c
+│   │   ├── zdx_pool.c
+│   │   ├── zdx_mos.c
+│   │   ├── zdx_dsl.c
+│   │   ├── zdx_objset.c
+│   │   ├── zdx_catalog.c
+│   │   ├── zdx_zap.c
+│   │   ├── zdx_block.c
 │   │   ├── json.c         # JSON helpers
 │   │   └── json.h
 │   ├── libzdbdecode.so    # Built library
@@ -203,7 +214,11 @@ zfs-explorer/
 ## API Endpoints (Selected)
 
 - `GET /api/version` - Build/runtime/debug metadata (includes active pool-open mode)
+- `GET /api/mode` - Current runtime pool-open mode (`live`/`offline`)
+- `PUT /api/mode` - Switch runtime pool-open mode (`{ "mode": "live" | "offline" }`)
 - `GET /api/pools` - List all imported pools (returns JSON array of strings)
+- `GET /api/pools/:pool/summary` - Structured pool config summary (`pool`, `features_for_read`, `vdev_tree`, `uberblock`)
+- `GET /api/pools/:pool/errors?cursor=&limit=&resolve_paths=` - Persistent pool error log entries
 - `GET /api/pools/:pool/mos/objects?type=&start=&limit=` - List MOS objects
 - `GET /api/pools/:pool/obj/:objid` - MOS dnode metadata
 - `GET /api/pools/:pool/obj/:objid/blkptrs` - MOS block pointers

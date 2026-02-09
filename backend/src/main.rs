@@ -1,7 +1,10 @@
 mod api;
 mod ffi;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::get,
+    Router,
+};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
@@ -23,7 +26,7 @@ pub struct PoolOpenConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Arc<Mutex<Option<ffi::PoolHandle>>>,
-    pub pool_open: PoolOpenConfig,
+    pub pool_open: Arc<Mutex<PoolOpenConfig>>,
 }
 
 fn parse_pool_open_mode() -> Result<PoolOpenMode, String> {
@@ -101,17 +104,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         pool: Arc::new(Mutex::new(None)),
-        pool_open: PoolOpenConfig {
+        pool_open: Arc::new(Mutex::new(PoolOpenConfig {
             mode,
             offline_search_paths,
             offline_pool_names,
-        },
+        })),
     };
 
     // Build the router
     let app = Router::new()
         .route("/api/version", get(api::api_version))
+        .route("/api/mode", get(api::get_mode).put(api::set_mode))
         .route("/api/pools", get(api::list_pools))
+        .route("/api/pools/{pool}/summary", get(api::pool_summary))
+        .route("/api/pools/{pool}/errors", get(api::pool_errors))
         .route("/api/pools/{pool}/datasets", get(api::list_pool_datasets))
         .route("/api/pools/{pool}/mos/objects", get(api::mos_list_objects))
         .route("/api/pools/{pool}/obj/{objid}", get(api::mos_get_object))

@@ -2,6 +2,46 @@
 
 /* Global libzfs handle */
 libzfs_handle_t *g_zfs = NULL;
+static char *g_spa_config_path_override = NULL;
+
+static boolean_t
+zdx_file_readable(const char *path)
+{
+    struct stat st;
+    if (path == NULL || path[0] == '\0')
+        return B_FALSE;
+    return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/*
+ * Allow cachefile override for hosts where zpool.cache is not under /etc/zfs.
+ *
+ * Priority:
+ *   1) ZFS_EXPLORER_ZPOOL_CACHEFILE
+ *   2) ZPOOL_CACHE
+ *   3) Auto-detect /data/zfs/zpool.cache when /etc/zfs/zpool.cache is missing
+ */
+static void
+zdx_apply_cachefile_override(void)
+{
+    const char *cachefile = getenv("ZFS_EXPLORER_ZPOOL_CACHEFILE");
+    if (cachefile == NULL || cachefile[0] == '\0')
+        cachefile = getenv("ZPOOL_CACHE");
+
+    if ((cachefile == NULL || cachefile[0] == '\0') &&
+        !zdx_file_readable("/etc/zfs/zpool.cache") &&
+        zdx_file_readable("/data/zfs/zpool.cache")) {
+        cachefile = "/data/zfs/zpool.cache";
+    }
+
+    if (cachefile == NULL || cachefile[0] == '\0')
+        return;
+
+    free(g_spa_config_path_override);
+    g_spa_config_path_override = strdup(cachefile);
+    if (g_spa_config_path_override != NULL)
+        spa_config_path = g_spa_config_path_override;
+}
 
 /*
  * Free a result structure
@@ -287,6 +327,8 @@ zdx_sa_setup(objset_t *os, sa_attr_type_t **tablep)
 int
 zdx_init(void)
 {
+    zdx_apply_cachefile_override();
+
     /* Initialize ZFS kernel context (SPA_MODE_READ is defined in sys/spa.h) */
     kernel_init(SPA_MODE_READ);
 
@@ -312,6 +354,9 @@ zdx_fini(void)
     }
 
     kernel_fini();
+
+    free(g_spa_config_path_override);
+    g_spa_config_path_override = NULL;
 }
 
 static void
@@ -398,6 +443,16 @@ build_search_paths(const char *search_paths, char ***out_paths, int *out_count)
     return 0;
 }
 
+static boolean_t
+zdx_import_collision(int rc)
+{
+    return (rc == EEXIST
+#ifdef EALREADY
+        || rc == EALREADY
+#endif
+    );
+}
+
 /*
  * Open a pool via libzpool
  */
@@ -414,8 +469,47 @@ zdx_pool_open(const char *name, int *err)
     }
 
     spa_t *spa = NULL;
+    boolean_t imported_live = B_FALSE;
     int rc = spa_open(name, &spa, FTAG);
+    if (rc == ENOENT && g_zfs != NULL) {
+        /*
+         * Some hosts list pools via libzfs but don't have the pool loaded in
+         * the in-process libzpool SPA namespace yet. Seed it from live config.
+         */
+        zpool_handle_t *zhp = zpool_open_canfail(g_zfs, name);
+        if (zhp != NULL) {
+            nvlist_t *cfg = zpool_get_config(zhp, NULL);
+            nvlist_t *cfg_dup = NULL;
+            int dup_err = (cfg != NULL) ? nvlist_dup(cfg, &cfg_dup, 0) : EINVAL;
+            if (dup_err == 0 && cfg_dup != NULL) {
+                char *import_name = strdup(name);
+                if (import_name != NULL) {
+                    int import_rc = spa_import(import_name, cfg_dup, NULL,
+                        ZFS_IMPORT_SKIP_MMP);
+                    free(import_name);
+                    if (import_rc == 0) {
+                        imported_live = B_TRUE;
+                    } else if (!zdx_import_collision(import_rc)) {
+                        rc = import_rc;
+                    }
+                } else {
+                    rc = ENOMEM;
+                }
+                nvlist_free(cfg_dup);
+            } else if (dup_err != 0) {
+                rc = dup_err;
+            }
+            zpool_close(zhp);
+        }
+
+        if (rc == ENOENT || imported_live) {
+            rc = spa_open(name, &spa, FTAG);
+        }
+    }
+
     if (rc != 0) {
+        if (imported_live)
+            (void) spa_export(name, NULL, B_TRUE, B_FALSE);
         if (err)
             *err = rc;
         return NULL;
@@ -430,7 +524,18 @@ zdx_pool_open(const char *name, int *err)
     }
 
     pool->name = strdup(name);
+    if (!pool->name) {
+        free(pool);
+        spa_close(spa, FTAG);
+        if (imported_live)
+            (void) spa_export(name, NULL, B_TRUE, B_FALSE);
+        if (err)
+            *err = ENOMEM;
+        return NULL;
+    }
     pool->spa = spa;
+    pool->offline_mode = B_FALSE;
+    pool->imported_transient = imported_live;
     return pool;
 }
 
@@ -492,11 +597,7 @@ zdx_pool_open_offline(const char *name, const char *search_paths, int *err)
     nvlist_free(cfg);
     if (rc == 0) {
         imported_offline = B_TRUE;
-    } else if (rc != EEXIST
-#ifdef EALREADY
-        && rc != EALREADY
-#endif
-    ) {
+    } else if (!zdx_import_collision(rc)) {
         if (err)
             *err = rc;
         return NULL;
@@ -534,7 +635,8 @@ zdx_pool_open_offline(const char *name, const char *search_paths, int *err)
     }
 
     pool->spa = spa;
-    pool->imported_offline = imported_offline;
+    pool->offline_mode = B_TRUE;
+    pool->imported_transient = imported_offline;
     return pool;
 }
 
@@ -550,7 +652,7 @@ zdx_pool_close(zdx_pool_t *pool)
     if (pool->spa)
         spa_close(pool->spa, FTAG);
 
-    if (pool->imported_offline && pool->name)
+    if (pool->imported_transient && pool->name)
         (void) spa_export(pool->name, NULL, B_TRUE, B_FALSE);
 
     free(pool->name);

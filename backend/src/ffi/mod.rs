@@ -107,6 +107,25 @@ pub fn pool_datasets(pool: *mut zdx_pool_t) -> ZdxResult {
     ZdxResult::from_raw(raw)
 }
 
+/// Fetch structured pool summary (zdb-like config view)
+pub fn pool_summary(pool: *mut zdx_pool_t) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_pool_summary(pool) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Fetch paginated persistent pool error-log entries.
+pub fn pool_errors(
+    pool: *mut zdx_pool_t,
+    cursor: u64,
+    limit: u64,
+    resolve_paths: bool,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_pool_errors(pool, cursor, limit, if resolve_paths { 1 } else { 0 }) };
+    ZdxResult::from_raw(raw)
+}
+
 /// Open a pool (behind mutex)
 pub fn pool_open(name: &str) -> Result<PoolHandle, (i32, String)> {
     let _lock = FFI_MUTEX.lock().unwrap();

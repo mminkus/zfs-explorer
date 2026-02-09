@@ -31,6 +31,18 @@ fn pool_open_mode_name(mode: crate::PoolOpenMode) -> &'static str {
     }
 }
 
+fn parse_pool_open_mode(raw: &str) -> Option<crate::PoolOpenMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "live" => Some(crate::PoolOpenMode::Live),
+        "offline" => Some(crate::PoolOpenMode::Offline),
+        _ => None,
+    }
+}
+
+fn pool_open_config(state: &AppState) -> crate::PoolOpenConfig {
+    state.pool_open.lock().unwrap().clone()
+}
+
 fn build_version_payload(pool_open: &crate::PoolOpenConfig) -> Value {
     json!({
         "project": "zfs-explorer",
@@ -54,18 +66,71 @@ fn build_version_payload(pool_open: &crate::PoolOpenConfig) -> Value {
     })
 }
 
+fn build_mode_payload(pool_open: &crate::PoolOpenConfig) -> Value {
+    json!({
+        "mode": pool_open_mode_name(pool_open.mode),
+        "offline_search_paths": pool_open.offline_search_paths.clone(),
+        "offline_pools": pool_open.offline_pool_names.clone(),
+    })
+}
+
 /// GET /api/version - Build/runtime info for support bundles
 pub async fn api_version(State(state): State<AppState>) -> ApiResult {
-    Ok(Json(build_version_payload(&state.pool_open)))
+    let config = pool_open_config(&state);
+    Ok(Json(build_version_payload(&config)))
+}
+
+/// GET /api/mode - current pool open mode
+pub async fn get_mode(State(state): State<AppState>) -> ApiResult {
+    let config = pool_open_config(&state);
+    Ok(Json(build_mode_payload(&config)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetModeRequest {
+    pub mode: String,
+}
+
+/// PUT /api/mode - switch pool open mode at runtime
+pub async fn set_mode(
+    State(state): State<AppState>,
+    Json(request): Json<SetModeRequest>,
+) -> ApiResult {
+    let Some(next_mode) = parse_pool_open_mode(&request.mode) else {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "mode must be 'live' or 'offline'",
+        ));
+    };
+
+    let mut changed = false;
+    {
+        let mut config = state.pool_open.lock().unwrap();
+        if config.mode != next_mode {
+            config.mode = next_mode;
+            changed = true;
+        }
+    }
+
+    if changed {
+        let mut pool_guard = state.pool.lock().unwrap();
+        if let Some(old) = pool_guard.take() {
+            crate::ffi::pool_close(old.ptr);
+        }
+    }
+
+    let config = pool_open_config(&state);
+    Ok(Json(build_mode_payload(&config)))
 }
 
 /// GET /api/pools - List all imported pools
 pub async fn list_pools(State(state): State<AppState>) -> ApiResult {
-    if matches!(state.pool_open.mode, crate::PoolOpenMode::Offline)
-        && !state.pool_open.offline_pool_names.is_empty()
+    let pool_open = pool_open_config(&state);
+
+    if matches!(pool_open.mode, crate::PoolOpenMode::Offline)
+        && !pool_open.offline_pool_names.is_empty()
     {
-        let pools = state
-            .pool_open
+        let pools = pool_open
             .offline_pool_names
             .iter()
             .cloned()
@@ -100,6 +165,33 @@ pub async fn list_pool_datasets(
 ) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::pool_datasets(pool_ptr);
+    json_from_result(result)
+}
+
+/// GET /api/pools/:pool/summary
+pub async fn pool_summary(State(state): State<AppState>, Path(pool): Path<String>) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::pool_summary(pool_ptr);
+    json_from_result(result)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PoolErrorsQuery {
+    pub cursor: Option<u64>,
+    pub limit: Option<u64>,
+    pub resolve_paths: Option<bool>,
+}
+
+/// GET /api/pools/:pool/errors?cursor=&limit=&resolve_paths=
+pub async fn pool_errors(
+    State(state): State<AppState>,
+    Path(pool): Path<String>,
+    Query(params): Query<PoolErrorsQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
+    let resolve_paths = params.resolve_paths.unwrap_or(true);
+    let result = crate::ffi::pool_errors(pool_ptr, cursor, limit, resolve_paths);
     json_from_result(result)
 }
 
@@ -185,6 +277,7 @@ fn json_from_result(result: crate::ffi::ZdxResult) -> ApiResult {
 }
 
 fn ensure_pool(state: &AppState, pool: &str) -> Result<*mut crate::ffi::zdx_pool_t, ApiError> {
+    let pool_open = pool_open_config(state);
     let mut guard = state.pool.lock().unwrap();
 
     if let Some(existing) = guard.as_ref() {
@@ -197,12 +290,12 @@ fn ensure_pool(state: &AppState, pool: &str) -> Result<*mut crate::ffi::zdx_pool
         crate::ffi::pool_close(old.ptr);
     }
 
-    let mode = state.pool_open.mode;
+    let mode = pool_open.mode;
     let mode_name = pool_open_mode_name(mode);
     let handle = match mode {
         crate::PoolOpenMode::Live => crate::ffi::pool_open(pool),
         crate::PoolOpenMode::Offline => {
-            crate::ffi::pool_open_offline(pool, state.pool_open.offline_search_paths.as_deref())
+            crate::ffi::pool_open_offline(pool, pool_open.offline_search_paths.as_deref())
         }
     }
     .map_err(|(_code, msg)| {
@@ -876,6 +969,33 @@ mod tests {
         assert_eq!(payload["runtime"]["os"], std::env::consts::OS);
         assert_eq!(payload["runtime"]["arch"], std::env::consts::ARCH);
         assert_eq!(payload["pool_open"]["mode"], "live");
+    }
+
+    #[test]
+    fn parse_pool_open_mode_accepts_expected_values() {
+        assert!(matches!(
+            parse_pool_open_mode("live"),
+            Some(crate::PoolOpenMode::Live)
+        ));
+        assert!(matches!(
+            parse_pool_open_mode("OFFLINE"),
+            Some(crate::PoolOpenMode::Offline)
+        ));
+        assert!(parse_pool_open_mode("invalid").is_none());
+    }
+
+    #[test]
+    fn mode_payload_shape_is_stable() {
+        let payload = build_mode_payload(&crate::PoolOpenConfig {
+            mode: crate::PoolOpenMode::Offline,
+            offline_search_paths: Some("/tmp/fixtures".to_string()),
+            offline_pool_names: vec!["tank".to_string(), "backup".to_string()],
+        });
+
+        assert_eq!(payload["mode"], "offline");
+        assert_eq!(payload["offline_search_paths"], "/tmp/fixtures");
+        assert_eq!(payload["offline_pools"][0], "tank");
+        assert_eq!(payload["offline_pools"][1], "backup");
     }
 
     #[test]

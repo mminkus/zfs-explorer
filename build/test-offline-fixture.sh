@@ -116,20 +116,31 @@ fi
 
 echo "==> Running offline smoke checks"
 
-curl -sS "$BASE_URL/api/version" | jq -e '.pool_open.mode == "offline"' >/dev/null
-curl -sS "$BASE_URL/api/pools" | jq -e --arg pool "$POOL" 'index($pool) != null' >/dev/null
-curl -sS "$BASE_URL/api/pools/$POOL/dsl/root" | jq -e '.root_dir_obj | type == "number"' >/dev/null
-curl -sS "$BASE_URL/api/pools/$POOL/mos/objects?start=0&limit=32" \
-  | jq -e '.objects | type == "array"' >/dev/null
+VERSION_JSON="$(curl -fsS "$BASE_URL/api/version")"
+echo "$VERSION_JSON" | jq -e '.pool_open.mode == "offline"' >/dev/null \
+  || { echo "error: /api/version does not report offline mode" >&2; exit 1; }
+
+POOLS_JSON="$(curl -fsS "$BASE_URL/api/pools")"
+echo "$POOLS_JSON" | jq -e --arg pool "$POOL" 'index($pool) != null' >/dev/null \
+  || { echo "error: pool '$POOL' missing from /api/pools in offline mode" >&2; exit 1; }
+
+DSL_ROOT_JSON="$(curl -fsS "$BASE_URL/api/pools/$POOL/dsl/root")"
+echo "$DSL_ROOT_JSON" | jq -e '.root_dir_obj | type == "number"' >/dev/null \
+  || { echo "error: /api/pools/$POOL/dsl/root missing numeric root_dir_obj" >&2; exit 1; }
+
+MOS_LIST_JSON="$(curl -fsS "$BASE_URL/api/pools/$POOL/mos/objects?start=0&limit=32")"
+echo "$MOS_LIST_JSON" | jq -e '.objects | type == "array"' >/dev/null \
+  || { echo "error: /api/pools/$POOL/mos/objects did not return an objects array" >&2; exit 1; }
 
 FIRST_OBJ="$(
-  curl -sS "$BASE_URL/api/pools/$POOL/mos/objects?start=0&limit=1" \
+  curl -fsS "$BASE_URL/api/pools/$POOL/mos/objects?start=0&limit=1" \
     | jq -r '.objects[0].id // empty'
 )"
 if [[ -n "$FIRST_OBJ" ]]; then
-  curl -sS "$BASE_URL/api/pools/$POOL/obj/$FIRST_OBJ" \
-    | jq -e --argjson id "$FIRST_OBJ" '.object.id == $id' >/dev/null
+  OBJ_JSON="$(curl -fsS "$BASE_URL/api/pools/$POOL/obj/$FIRST_OBJ")"
+  echo "$OBJ_JSON" \
+    | jq -e --argjson id "$FIRST_OBJ" '((.id? // .object.id?) == $id)' >/dev/null \
+    || { echo "error: /api/pools/$POOL/obj/$FIRST_OBJ id mismatch" >&2; exit 1; }
 fi
-
 echo
 echo "Offline fixture smoke checks passed."

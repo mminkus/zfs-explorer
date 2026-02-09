@@ -45,7 +45,8 @@
 struct zdx_pool {
     char *name;
     spa_t *spa;
-    boolean_t imported_offline;
+    boolean_t offline_mode;
+    boolean_t imported_transient;
 };
 
 extern libzfs_handle_t *g_zfs;

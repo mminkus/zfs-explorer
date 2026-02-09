@@ -35,6 +35,9 @@ void zdx_pool_close(zdx_pool_t *pool);
 zdx_result_t zdx_pool_info(zdx_pool_t *pool);
 zdx_result_t zdx_pool_vdevs(zdx_pool_t *pool);
 zdx_result_t zdx_pool_datasets(zdx_pool_t *pool);
+zdx_result_t zdx_pool_summary(zdx_pool_t *pool);
+zdx_result_t zdx_pool_errors(zdx_pool_t *pool, uint64_t cursor,
+                             uint64_t limit, int resolve_paths);
 
 /* === MOS object operations === */
 zdx_result_t zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,

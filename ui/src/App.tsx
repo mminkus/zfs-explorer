@@ -39,8 +39,8 @@ const parseApiErrorMessage = async (response: Response): Promise<string | null> 
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url)
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init)
   if (!response.ok) {
     const message = await parseApiErrorMessage(response)
     throw new Error(`HTTP ${response.status}: ${message ?? response.statusText}`)
@@ -163,6 +163,76 @@ type ApiVersionResponse = {
     offline_search_paths?: string | null
     offline_pools?: string[]
   }
+}
+
+type PoolModeResponse = {
+  mode: 'live' | 'offline'
+  offline_search_paths?: string | null
+  offline_pools?: string[]
+}
+
+type PoolSummaryPool = {
+  name: string
+  guid: number
+  state: number
+  txg: number
+  version: number
+  hostid: number
+  hostname: string | null
+  errata: number
+}
+
+type PoolSummaryRootBpDva = {
+  vdev: number
+  offset: number
+  asize: number
+  is_gang: boolean
+}
+
+type PoolSummaryRootBp = {
+  is_hole: boolean
+  level: number
+  type: number
+  lsize: number
+  psize: number
+  asize: number
+  birth_txg: number
+  dvas: PoolSummaryRootBpDva[]
+}
+
+type PoolSummaryResponse = {
+  pool: PoolSummaryPool
+  features_for_read: string[]
+  vdev_tree: Record<string, unknown> | null
+  uberblock: {
+    txg: number
+    timestamp: number
+    rootbp: PoolSummaryRootBp | null
+  }
+}
+
+type PoolErrorEntry = {
+  source: string
+  dataset_obj: number
+  object: number
+  level: number
+  blkid: number
+  birth: number | null
+  path: string | null
+}
+
+type PoolErrorsResponse = {
+  pool: string
+  error_count: number
+  approx_entries: number
+  head_errlog: boolean
+  errlog_last_obj: number
+  errlog_scrub_obj: number
+  cursor: number
+  limit: number
+  count: number
+  next: number | null
+  entries: PoolErrorEntry[]
 }
 
 type DatasetTreeNode = {
@@ -331,6 +401,124 @@ const isSameFsLocation = (a: FsLocation, b: FsLocation) => {
   })
 }
 
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
+
+const extractVdevChildren = (node: Record<string, unknown>): Record<string, unknown>[] => {
+  const direct = node.children
+  if (Array.isArray(direct)) {
+    return direct.filter(item => asRecord(item) !== null) as Record<string, unknown>[]
+  }
+
+  return Object.entries(node)
+    .filter(([key, value]) => /^children\[\d+\]$/.test(key) && asRecord(value) !== null)
+    .sort((a, b) => {
+      const idxA = Number.parseInt(a[0].slice(9, -1), 10)
+      const idxB = Number.parseInt(b[0].slice(9, -1), 10)
+      return idxA - idxB
+    })
+    .map(([, value]) => value as Record<string, unknown>)
+}
+
+const scalarToZdb = (value: unknown): string => {
+  if (typeof value === 'string') return `'${value}'`
+  if (typeof value === 'boolean') return value ? '1' : '0'
+  if (value === null) return '(none)'
+  if (Array.isArray(value)) return `[${value.map(scalarToZdb).join(', ')}]`
+  if (typeof value === 'object') return '{...}'
+  return String(value)
+}
+
+const vdevTreeToZdb = (node: Record<string, unknown>, indent = 1): string[] => {
+  const pad = '    '.repeat(indent)
+  const lines: string[] = []
+
+  const preferredKeys = [
+    'type',
+    'id',
+    'guid',
+    'metaslab_array',
+    'metaslab_shift',
+    'ashift',
+    'asize',
+    'is_log',
+    'create_txg',
+    'path',
+    'devid',
+    'phys_path',
+    'whole_disk',
+    'vdev_enc_sysfs_path',
+  ]
+
+  preferredKeys.forEach(key => {
+    if (key in node && key !== 'children') {
+      lines.push(`${pad}${key}: ${scalarToZdb(node[key])}`)
+    }
+  })
+
+  Object.entries(node).forEach(([key, value]) => {
+    if (preferredKeys.includes(key) || key === 'children') return
+    if (/^children\[\d+\]$/.test(key)) return
+    lines.push(`${pad}${key}: ${scalarToZdb(value)}`)
+  })
+
+  const children = extractVdevChildren(node)
+  children.forEach((child, idx) => {
+    lines.push(`${pad}children[${idx}]:`)
+    lines.push(...vdevTreeToZdb(child, indent + 1))
+  })
+
+  return lines
+}
+
+const rootbpToZdb = (rootbp: PoolSummaryRootBp | null): string => {
+  if (!rootbp) return '(none)'
+  if (rootbp.is_hole) return 'hole'
+  if (!rootbp.dvas || rootbp.dvas.length === 0) {
+    return `level=${rootbp.level} type=${rootbp.type} asize=${rootbp.asize}`
+  }
+  const dvas = rootbp.dvas
+    .map(
+      (dva, idx) => `DVA[${idx}]=<${dva.vdev}:${dva.offset.toString(16)}:${dva.asize.toString(16)}>`
+    )
+    .join(' ')
+  return `${dvas} level=${rootbp.level} type=${rootbp.type} birth=${rootbp.birth_txg}`
+}
+
+const poolSummaryToZdb = (summary: PoolSummaryResponse): string => {
+  const lines: string[] = []
+  lines.push(`${summary.pool.name}:`)
+  lines.push(`    version: ${summary.pool.version}`)
+  lines.push(`    name: '${summary.pool.name}'`)
+  lines.push(`    state: ${summary.pool.state}`)
+  lines.push(`    txg: ${summary.pool.txg}`)
+  lines.push(`    pool_guid: ${summary.pool.guid}`)
+  lines.push(`    errata: ${summary.pool.errata}`)
+  lines.push(`    hostid: ${summary.pool.hostid}`)
+  lines.push(`    hostname: '${summary.pool.hostname ?? '(none)'}'`)
+  lines.push(`    vdev_tree:`)
+  if (summary.vdev_tree) {
+    lines.push(...vdevTreeToZdb(summary.vdev_tree, 2))
+  } else {
+    lines.push(`        (none)`)
+  }
+  lines.push(`    features_for_read:`)
+  if (summary.features_for_read.length === 0) {
+    lines.push(`        (none)`)
+  } else {
+    summary.features_for_read.forEach(feature => {
+      lines.push(`        ${feature}`)
+    })
+  }
+  lines.push(`Uberblock:`)
+  lines.push(`    txg: ${summary.uberblock.txg}`)
+  lines.push(`    timestamp: ${summary.uberblock.timestamp}`)
+  lines.push(`    rootbp: ${rootbpToZdb(summary.uberblock.rootbp)}`)
+  return lines.join('\n')
+}
+
 function App() {
   const [pools, setPools] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -398,6 +586,20 @@ function App() {
   const [debugCopied, setDebugCopied] = useState(false)
   const [debugCopyError, setDebugCopyError] = useState<string | null>(null)
   const [apiVersionInfo, setApiVersionInfo] = useState<ApiVersionResponse | null>(null)
+  const [modeSwitching, setModeSwitching] = useState(false)
+  const [modeError, setModeError] = useState<string | null>(null)
+  const [poolSummary, setPoolSummary] = useState<PoolSummaryResponse | null>(null)
+  const [poolSummaryLoading, setPoolSummaryLoading] = useState(false)
+  const [poolSummaryError, setPoolSummaryError] = useState<string | null>(null)
+  const [poolSummaryCopied, setPoolSummaryCopied] = useState(false)
+  const [poolErrors, setPoolErrors] = useState<PoolErrorsResponse | null>(null)
+  const [poolErrorsLoading, setPoolErrorsLoading] = useState(false)
+  const [poolErrorsError, setPoolErrorsError] = useState<string | null>(null)
+  const [poolErrorsResolvePaths, setPoolErrorsResolvePaths] = useState(true)
+  const [poolDetailsOpen, setPoolDetailsOpen] = useState(false)
+  const [poolTreeExpanded, setPoolTreeExpanded] = useState<Record<string, boolean>>({
+    root: true,
+  })
   const [leftPaneTab, setLeftPaneTab] = useState<NavigatorMode>('datasets')
   const [pinnedByPool, setPinnedByPool] = useState<Record<string, PinnedObject[]>>({})
   const [graphSearch, setGraphSearch] = useState('')
@@ -700,6 +902,11 @@ function App() {
         return
       }
 
+      if (state.mode === 'pool') {
+        setLeftPaneTab('pool')
+        return
+      }
+
       if (state.mode === 'datasets') {
         setLeftPaneTab('datasets')
         return
@@ -813,18 +1020,36 @@ function App() {
     [navIndex, selectedPool, commitBrowserState]
   )
 
+  const isPoolTab = leftPaneTab === 'pool'
   const isMosMode = leftPaneTab === 'mos'
   const isFsTab = leftPaneTab === 'fs'
   const isDatasetsTab = leftPaneTab === 'datasets'
-  const isFsMode = leftPaneTab !== 'mos'
+  const isFsMode = leftPaneTab === 'datasets' || leftPaneTab === 'fs'
   const poolMode = apiVersionInfo?.pool_open?.mode === 'offline' ? 'offline' : 'live'
   const poolModeLabel = poolMode === 'offline' ? 'Offline' : 'Live'
   const offlinePoolNames = apiVersionInfo?.pool_open?.offline_pools ?? []
+  const modeToggleDisabled = modeSwitching || !apiVersionInfo
   const canGoBack =
     (isMosMode && navIndex > 0) || (isFsTab && fsHistoryIndex > 0)
   const canGoForward =
     (isMosMode && navIndex < navStack.length - 1) ||
     (isFsTab && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1)
+
+  const applyModePayload = useCallback((modeData: PoolModeResponse) => {
+    setApiVersionInfo(prev => {
+      if (!prev) {
+        return prev
+      }
+      return {
+        ...prev,
+        pool_open: {
+          mode: modeData.mode,
+          offline_search_paths: modeData.offline_search_paths ?? null,
+          offline_pools: modeData.offline_pools ?? [],
+        },
+      }
+    })
+  }, [])
 
   useEffect(() => {
     fetchJson<string[]>(`${API_BASE}/api/pools`)
@@ -959,6 +1184,68 @@ function App() {
     }
   }
 
+  const fetchPoolSummary = async (pool: string) => {
+    setPoolSummaryLoading(true)
+    setPoolSummaryError(null)
+    try {
+      const data = await fetchJson<PoolSummaryResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/summary`
+      )
+      setPoolSummary(data)
+      setPoolTreeExpanded({ root: true })
+    } catch (err) {
+      setPoolSummary(null)
+      setPoolSummaryError((err as Error).message)
+    } finally {
+      setPoolSummaryLoading(false)
+    }
+  }
+
+  const fetchPoolErrors = async (
+    pool: string,
+    cursor = 0,
+    append = false,
+    resolvePaths = poolErrorsResolvePaths
+  ) => {
+    setPoolErrorsLoading(true)
+    if (!append) {
+      setPoolErrorsError(null)
+    }
+
+    try {
+      const params = new URLSearchParams()
+      params.set('cursor', String(cursor))
+      params.set('limit', '200')
+      params.set('resolve_paths', resolvePaths ? 'true' : 'false')
+
+      const data = await fetchJson<PoolErrorsResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/errors?${params.toString()}`
+      )
+
+      if (append) {
+        setPoolErrors(prev => {
+          if (!prev) return data
+          const entries = [...prev.entries, ...data.entries]
+          return {
+            ...data,
+            cursor: prev.cursor,
+            count: entries.length,
+            entries,
+          }
+        })
+      } else {
+        setPoolErrors(data)
+      }
+    } catch (err) {
+      setPoolErrorsError((err as Error).message)
+      if (!append) {
+        setPoolErrors(null)
+      }
+    } finally {
+      setPoolErrorsLoading(false)
+    }
+  }
+
   const toggleDatasetNode = (dirObj: number) => {
     setDatasetExpanded(prev => ({ ...prev, [dirObj]: !prev[dirObj] }))
   }
@@ -966,16 +1253,25 @@ function App() {
   const handlePoolSelect = (pool: string) => {
     if (!pool) return
     setSelectedPool(pool)
-    setLeftPaneTab('datasets')
     setNavStack([])
     setNavIndex(-1)
     setFsHistory([])
     setFsHistoryIndex(-1)
-    commitBrowserState({ mode: 'datasets', pool })
+    if (leftPaneTab === 'pool') {
+      commitBrowserState({ mode: 'pool', pool })
+    } else if (leftPaneTab === 'mos') {
+      commitBrowserState({ mode: 'mos', pool, objid: null }, 'replace')
+    } else {
+      commitBrowserState({ mode: 'datasets', pool })
+    }
   }
 
   const setLeftPaneTabWithHistory = (mode: NavigatorMode) => {
     setLeftPaneTab(mode)
+    if (mode === 'pool') {
+      commitBrowserState({ mode: 'pool', pool: selectedPool ?? null })
+      return
+    }
     if (mode === 'mos') {
       commitBrowserState({ mode: 'mos', pool: selectedPool ?? null, objid: selectedObject })
       return
@@ -997,12 +1293,24 @@ function App() {
     const mountHint = catalog?.mountpoint ? ` · ${catalog.mountpoint}` : ''
 
     return (
-      <div key={`${node.dsl_dir_obj}-${node.name}`} style={{ marginLeft: depth * 12 }}>
-        <div className="dsl-node">
+      <div
+        key={`${node.dsl_dir_obj}-${node.name}`}
+        className={`dsl-item ${depth === 0 ? 'dsl-root' : ''}`}
+        style={{ marginLeft: depth * 14 }}
+      >
+        <div className={`dsl-node ${depth > 0 ? 'dsl-node-child' : ''}`}>
           <button
-            className="dsl-toggle"
+            className={`dsl-toggle ${hasChildren ? '' : 'leaf'}`}
             onClick={() => toggleDatasetNode(node.dsl_dir_obj)}
             disabled={!hasChildren}
+            aria-label={
+              hasChildren
+                ? expanded
+                  ? `Collapse ${node.name}`
+                  : `Expand ${node.name}`
+                : `${node.name} has no children`
+            }
+            title={hasChildren ? (expanded ? 'Collapse' : 'Expand') : 'Leaf'}
           >
             {hasChildren ? (expanded ? '▾' : '▸') : '•'}
           </button>
@@ -1484,8 +1792,120 @@ function App() {
     }
   }
 
+  const switchPoolMode = async (nextMode: 'live' | 'offline') => {
+    if (modeSwitching || nextMode === poolMode) return
+
+    setModeError(null)
+    setModeSwitching(true)
+
+    try {
+      const modeData = await fetchJson<PoolModeResponse>(`${API_BASE}/api/mode`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ mode: nextMode }),
+      })
+
+      applyModePayload(modeData)
+
+      const nextPools = await fetchJson<string[]>(`${API_BASE}/api/pools`)
+      setPools(nextPools)
+      setError(null)
+
+      const activePool =
+        selectedPool && nextPools.includes(selectedPool)
+          ? selectedPool
+          : nextPools.length > 0
+          ? nextPools[0]
+          : null
+
+      if (!activePool) {
+        setSelectedPool(null)
+        setPoolSummary(null)
+        setPoolSummaryError(null)
+        setPoolErrors(null)
+        setPoolErrorsError(null)
+        setDatasetTree(null)
+        setDatasetError(null)
+        setDatasetCatalog({})
+        setDatasetExpanded({})
+        setMosObjects([])
+        setMosNext(null)
+        setFsHistory([])
+        setFsHistoryIndex(-1)
+        setFsState(null)
+        setFsEntries([])
+        setFsError(null)
+        setFsSelected(null)
+        setFsStat(null)
+        setLeftPaneTab('pool')
+        commitBrowserState({ mode: 'pool', pool: null }, 'replace')
+        return
+      }
+
+      const shouldReplacePool = activePool !== selectedPool
+      if (shouldReplacePool) {
+        setSelectedPool(activePool)
+        if (leftPaneTab === 'pool') {
+          commitBrowserState({ mode: 'pool', pool: activePool }, 'replace')
+        } else if (leftPaneTab === 'mos') {
+          commitBrowserState({ mode: 'mos', pool: activePool, objid: null }, 'replace')
+        } else {
+          commitBrowserState({ mode: 'datasets', pool: activePool }, 'replace')
+        }
+      } else {
+        resetInspector()
+        setNavStack([])
+        setNavIndex(-1)
+        setFsHistory([])
+        setFsHistoryIndex(-1)
+        setFsState(null)
+        setFsEntries([])
+        setFsError(null)
+        setFsSelected(null)
+        setFsStat(null)
+        setPoolDetailsOpen(false)
+
+        await Promise.all([
+          fetchPoolSummary(activePool),
+          fetchPoolErrors(activePool, 0, false, poolErrorsResolvePaths),
+          fetchDatasetTree(activePool),
+          fetchDatasetCatalog(activePool),
+        ])
+        await fetchMosObjects(0, false)
+
+        if (leftPaneTab === 'pool') {
+          commitBrowserState({ mode: 'pool', pool: activePool }, 'replace')
+        } else if (leftPaneTab === 'mos') {
+          commitBrowserState({ mode: 'mos', pool: activePool, objid: null }, 'replace')
+        } else {
+          commitBrowserState({ mode: 'datasets', pool: activePool }, 'replace')
+        }
+      }
+
+      try {
+        const versionData = await fetchJson<ApiVersionResponse>(`${API_BASE}/api/version`)
+        setApiVersionInfo(versionData)
+      } catch {
+        applyModePayload(modeData)
+      }
+    } catch (err) {
+      setModeError((err as Error).message)
+    } finally {
+      setModeSwitching(false)
+    }
+  }
+
   useEffect(() => {
     if (!selectedPool) {
+      setPoolSummary(null)
+      setPoolSummaryLoading(false)
+      setPoolSummaryError(null)
+      setPoolErrors(null)
+      setPoolErrorsLoading(false)
+      setPoolErrorsError(null)
+      setPoolDetailsOpen(false)
       setMosObjects([])
       setMosNext(null)
       setDatasetTree(null)
@@ -1529,9 +1949,17 @@ function App() {
     if (!selectedPool) {
       return
     }
+    fetchPoolSummary(selectedPool)
     fetchDatasetTree(selectedPool)
     fetchDatasetCatalog(selectedPool)
   }, [selectedPool])
+
+  useEffect(() => {
+    if (!selectedPool) {
+      return
+    }
+    fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths)
+  }, [selectedPool, poolErrorsResolvePaths])
 
   const fetchZapInfo = async (objid: number) => {
     if (!selectedPool) return
@@ -1828,6 +2256,21 @@ function App() {
     setGraphExpandError(null)
   }
 
+  const togglePoolTreeNode = (path: string) => {
+    setPoolTreeExpanded(prev => ({ ...prev, [path]: !prev[path] }))
+  }
+
+  const handleCopyPoolSummary = async () => {
+    if (!poolSummary) return
+    try {
+      await navigator.clipboard.writeText(poolSummaryToZdb(poolSummary))
+      setPoolSummaryCopied(true)
+      setTimeout(() => setPoolSummaryCopied(false), 2000)
+    } catch (err) {
+      setPoolSummaryError((err as Error).message)
+    }
+  }
+
   const handleCopyZdbCommand = () => {
     if (selectedPool && selectedObject !== null) {
       const cmd = `sudo zdb -dddd ${selectedPool} ${selectedObject}`
@@ -1853,7 +2296,7 @@ function App() {
           selected_pool: selectedPool,
           selected_object: selectedObject,
           selected_object_type: objectInfo?.type?.name ?? null,
-          inspector_tab: isFsMode ? 'filesystem' : inspectorTab,
+          inspector_tab: isPoolTab ? 'pool' : isFsMode ? 'filesystem' : inspectorTab,
           raw_view: rawView,
           fs_state: fsState
             ? {
@@ -1908,6 +2351,81 @@ function App() {
       isRef: false,
     }))
   }, [objectInfo?.bonus_decoded])
+
+  const renderPoolVdevNode = (
+    node: Record<string, unknown>,
+    path: string,
+    depth: number
+  ) => {
+    const children = extractVdevChildren(node)
+    const hasChildren = children.length > 0
+    const expanded = poolTreeExpanded[path] ?? depth === 0
+    const typeName = typeof node.type === 'string' ? node.type : 'vdev'
+    const idText =
+      typeof node.id === 'number' || typeof node.id === 'string' ? ` #${node.id}` : ''
+    const detailKeys = [
+      'guid',
+      'ashift',
+      'asize',
+      'metaslab_shift',
+      'metaslab_array',
+      'path',
+      'devid',
+      'phys_path',
+      'vdev_enc_sysfs_path',
+      'create_txg',
+      'whole_disk',
+      'is_log',
+      'com.klarasystems:vdev_zap_root',
+      'com.delphix:vdev_zap_top',
+      'com.delphix:vdev_zap_leaf',
+    ]
+
+    return (
+      <div
+        key={path}
+        className={`pool-vdev-node ${depth === 0 ? 'root' : 'child'}`}
+        style={{ marginLeft: depth * 14 }}
+      >
+        <div className={`pool-vdev-head ${depth > 0 ? 'pool-vdev-head-child' : ''}`}>
+          <button
+            type="button"
+            className={`pool-vdev-toggle ${hasChildren ? '' : 'leaf'}`}
+            onClick={() => togglePoolTreeNode(path)}
+            disabled={!hasChildren}
+            title={hasChildren ? (expanded ? 'Collapse children' : 'Expand children') : 'Leaf'}
+            aria-label={
+              hasChildren
+                ? expanded
+                  ? `Collapse ${typeName}${idText}`
+                  : `Expand ${typeName}${idText}`
+                : `${typeName}${idText} is a leaf`
+            }
+          >
+            {hasChildren ? (expanded ? '▾' : '▸') : '•'}
+          </button>
+          <span className="pool-vdev-title">
+            {typeName}
+            {idText}
+          </span>
+        </div>
+
+        <div className="pool-vdev-meta">
+          {detailKeys
+            .filter(key => key in node)
+            .map(key => (
+              <span key={`${path}:${key}`} className="pool-vdev-pill">
+                {key}: {scalarToZdb(node[key])}
+              </span>
+            ))}
+        </div>
+
+        {expanded &&
+          hasChildren &&
+          children.map((child, idx) => renderPoolVdevNode(child, `${path}.${idx}`, depth + 1))}
+      </div>
+    )
+  }
 
   const renderPinnedSection = () => {
     if (!selectedPool) return null
@@ -1969,11 +2487,41 @@ function App() {
           </div>
           <div className="status-item">
             <span>Mode</span>
-            <span className={`mode-badge ${poolMode}`}>{poolModeLabel}</span>
+            <div className="format-toggle">
+              <button
+                type="button"
+                className={poolMode === 'live' ? 'toggle active' : 'toggle'}
+                onClick={() => switchPoolMode('live')}
+                disabled={modeToggleDisabled}
+                title="Use imported pools via libzfs"
+              >
+                Live
+              </button>
+              <button
+                type="button"
+                className={poolMode === 'offline' ? 'toggle active' : 'toggle'}
+                onClick={() => switchPoolMode('offline')}
+                disabled={modeToggleDisabled}
+                title="Use exported pool files/devices (experimental)"
+              >
+                Offline
+              </button>
+            </div>
           </div>
           <div className="status-item">
             <span>Pool</span>
-            <strong>{selectedPool ?? 'none'}</strong>
+            {selectedPool ? (
+              <button
+                type="button"
+                className="status-link"
+                onClick={() => setPoolDetailsOpen(true)}
+                title="Open pool details"
+              >
+                {selectedPool}
+              </button>
+            ) : (
+              <strong>none</strong>
+            )}
           </div>
         </div>
       </header>
@@ -1987,6 +2535,12 @@ function App() {
           <> Configured pools: {offlinePoolNames.join(', ')}.</>
         )}
       </div>
+
+      {modeError && (
+        <div className="safety-banner error-banner" role="alert">
+          <strong>Mode switch failed:</strong> {modeError}
+        </div>
+      )}
 
       <div className="breadcrumb">
         <div className="nav-buttons">
@@ -2016,11 +2570,9 @@ function App() {
               resetInspector()
               setNavStack([])
               setNavIndex(-1)
-              if (selectedPool) {
-                handlePoolSelect(selectedPool)
-              } else {
-                setLeftPaneTabWithHistory('datasets')
-              }
+              setFsHistory([])
+              setFsHistoryIndex(-1)
+              setLeftPaneTabWithHistory('pool')
             }}
             title={`Pool ${selectedPool}`}
           >
@@ -2030,6 +2582,7 @@ function App() {
           <span className="crumb muted">No pool selected</span>
         )}
         <span className="crumb-sep">→</span>
+        {isPoolTab && <span className="crumb active">Pool</span>}
         {isDatasetsTab && (
           <span className="crumb active">Datasets</span>
         )}
@@ -2115,7 +2668,13 @@ function App() {
 
           <div className="left-pane-tabs">
             <button
-              className={`tab ${leftPaneTab !== 'mos' ? 'active' : ''}`}
+              className={`tab ${isPoolTab ? 'active' : ''}`}
+              onClick={() => setLeftPaneTabWithHistory('pool')}
+            >
+              Pool
+            </button>
+            <button
+              className={`tab ${isDatasetsTab || isFsTab ? 'active' : ''}`}
               onClick={() => setLeftPaneTabWithHistory('datasets')}
             >
               Datasets
@@ -2130,7 +2689,7 @@ function App() {
 
           {leftPaneTab !== 'mos' && (
             <div className="left-pane-content">
-              {renderPinnedSection()}
+              {!isPoolTab && renderPinnedSection()}
               <div className="pool-selector">
                 <label>Pool</label>
                 {loading && <p className="muted">Loading pools...</p>}
@@ -2160,7 +2719,69 @@ function App() {
                 )}
               </div>
 
-              {selectedPool && (
+              {isPoolTab && selectedPool && (
+                <div className="pool-overview">
+                  <h3>Pool Summary</h3>
+                  {poolSummaryLoading && <p className="muted">Loading pool summary...</p>}
+                  {poolSummaryError && <p className="muted">Error: {poolSummaryError}</p>}
+                  {poolSummary && (
+                    <>
+                      <dl className="pool-overview-grid">
+                        <div>
+                          <dt>State</dt>
+                          <dd>{poolSummary.pool.state}</dd>
+                        </div>
+                        <div>
+                          <dt>TXG</dt>
+                          <dd>{poolSummary.pool.txg}</dd>
+                        </div>
+                        <div>
+                          <dt>Version</dt>
+                          <dd>{poolSummary.pool.version}</dd>
+                        </div>
+                        <div>
+                          <dt>GUID</dt>
+                          <dd>{poolSummary.pool.guid}</dd>
+                        </div>
+                        <div>
+                          <dt>Errata</dt>
+                          <dd>{poolSummary.pool.errata}</dd>
+                        </div>
+                        <div>
+                          <dt>Features</dt>
+                          <dd>{poolSummary.features_for_read.length}</dd>
+                        </div>
+                      </dl>
+                      <div className="pool-overview-errors">
+                        <span>Persistent errors</span>
+                        <strong>{poolErrors ? poolErrors.error_count.toLocaleString() : '—'}</strong>
+                        {poolErrorsLoading && <span className="muted">loading…</span>}
+                      </div>
+                      {poolErrorsError && (
+                        <p className="muted">Error log: {poolErrorsError}</p>
+                      )}
+                      <div className="pool-overview-actions">
+                        <button
+                          type="button"
+                          className={`fs-action-btn ${poolSummaryCopied ? 'active' : ''}`}
+                          onClick={handleCopyPoolSummary}
+                        >
+                          {poolSummaryCopied ? 'Copied' : 'Copy zdb-like'}
+                        </button>
+                        <button
+                          type="button"
+                          className="fs-action-btn"
+                          onClick={() => setPoolDetailsOpen(true)}
+                        >
+                          Pool details
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {!isPoolTab && selectedPool && (
                 <div className="dataset-tree">
                   <h3>Dataset Tree</h3>
                   {datasetLoading && <p className="muted">Loading dataset tree...</p>}
@@ -2282,7 +2903,199 @@ function App() {
 
         <Panel defaultSize={isNarrow ? 40 : 56} minSize={isNarrow ? 26 : 32}>
           <section className="panel pane-center">
-          {leftPaneTab !== 'mos' ? (
+          {isPoolTab ? (
+            <>
+              <div className="panel-header graph-header">
+                <div>
+                  <h2>Pool Summary</h2>
+                  <span className="muted">
+                    {selectedPool ? `${selectedPool} · zdb-style config overview` : 'No pool selected'}
+                  </span>
+                </div>
+                <div className="graph-controls">
+                  <button
+                    className="graph-btn"
+                    type="button"
+                    onClick={() => selectedPool && fetchPoolSummary(selectedPool)}
+                    disabled={!selectedPool || poolSummaryLoading}
+                  >
+                    {poolSummaryLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                  <button
+                    className={`graph-btn ${poolSummaryCopied ? 'active' : ''}`}
+                    type="button"
+                    onClick={handleCopyPoolSummary}
+                    disabled={!poolSummary}
+                  >
+                    {poolSummaryCopied ? 'Copied' : 'Copy zdb-like'}
+                  </button>
+                  <button
+                    className="graph-btn"
+                    type="button"
+                    onClick={() => setPoolDetailsOpen(true)}
+                    disabled={!poolSummary}
+                  >
+                    Details
+                  </button>
+                </div>
+              </div>
+
+              {poolSummaryError && (
+                <div className="error">
+                  <strong>Error:</strong> {poolSummaryError}
+                </div>
+              )}
+
+              {poolSummaryLoading && <p className="muted">Loading pool summary...</p>}
+
+              {!poolSummaryLoading && !poolSummary && !poolSummaryError && (
+                <p className="muted">Select a pool to inspect its configuration.</p>
+              )}
+
+              {poolSummary && (
+                <div className="pool-summary-center">
+                  <div className="pool-summary-cards">
+                    <div className="pool-summary-card">
+                      <span>State</span>
+                      <strong>{poolSummary.pool.state}</strong>
+                    </div>
+                    <div className="pool-summary-card">
+                      <span>TXG</span>
+                      <strong>{poolSummary.pool.txg}</strong>
+                    </div>
+                    <div className="pool-summary-card">
+                      <span>Version</span>
+                      <strong>{poolSummary.pool.version}</strong>
+                    </div>
+                    <div className="pool-summary-card">
+                      <span>Features</span>
+                      <strong>{poolSummary.features_for_read.length}</strong>
+                    </div>
+                    <div className="pool-summary-card">
+                      <span>Host</span>
+                      <strong>{poolSummary.pool.hostname ?? '(none)'}</strong>
+                    </div>
+                    <div className="pool-summary-card">
+                      <span>GUID</span>
+                      <strong>{poolSummary.pool.guid}</strong>
+                    </div>
+                  </div>
+
+                  <div className="pool-vdev-tree">
+                    <h3>Vdev Tree</h3>
+                    {poolSummary.vdev_tree ? (
+                      renderPoolVdevNode(poolSummary.vdev_tree, 'root', 0)
+                    ) : (
+                      <p className="muted">No vdev tree available.</p>
+                    )}
+                  </div>
+
+                  {selectedPool && (
+                    <div className="pool-errors">
+                      <div className="pool-errors-header">
+                        <h3>Persistent Errors</h3>
+                        <div className="pool-errors-actions">
+                          <label className="pool-errors-resolve">
+                            <input
+                              type="checkbox"
+                              checked={poolErrorsResolvePaths}
+                              onChange={e => setPoolErrorsResolvePaths(e.target.checked)}
+                            />
+                            Resolve paths
+                          </label>
+                          <button
+                            className="graph-btn"
+                            type="button"
+                            onClick={() =>
+                              fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths)
+                            }
+                            disabled={poolErrorsLoading}
+                          >
+                            {poolErrorsLoading ? 'Refreshing…' : 'Refresh errors'}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="pool-errors-meta">
+                        <span>
+                          Error count: <strong>{poolErrors?.error_count.toLocaleString() ?? '—'}</strong>
+                        </span>
+                        <span>
+                          Approx entries: <strong>{poolErrors?.approx_entries.toLocaleString() ?? '—'}</strong>
+                        </span>
+                        <span>
+                          Next cursor: <strong>{poolErrors?.next ?? 'none'}</strong>
+                        </span>
+                      </div>
+
+                      {poolErrorsError && (
+                        <div className="error">
+                          <strong>Error:</strong> {poolErrorsError}
+                        </div>
+                      )}
+
+                      {poolErrors && poolErrors.entries.length > 0 ? (
+                        <div className="pool-errors-table">
+                          <div className="pool-errors-row pool-errors-head">
+                            <span>Source</span>
+                            <span>Dataset</span>
+                            <span>Object</span>
+                            <span>Level</span>
+                            <span>Blkid</span>
+                            <span>Path</span>
+                          </div>
+                          {poolErrors.entries.map((entry, idx) => (
+                            <div
+                              key={`${entry.source}-${entry.dataset_obj}-${entry.object}-${entry.level}-${entry.blkid}-${idx}`}
+                              className="pool-errors-row"
+                            >
+                              <span>{entry.source}</span>
+                              <span>#{entry.dataset_obj}</span>
+                              <span>#{entry.object}</span>
+                              <span>{entry.level}</span>
+                              <span>{entry.blkid}</span>
+                              <span className="pool-errors-path">{entry.path ?? '(unresolved)'}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        !poolErrorsLoading && (
+                          <p className="muted">No persistent error entries returned.</p>
+                        )
+                      )}
+
+                      {poolErrors?.next !== null && (
+                        <button
+                          className="load-more"
+                          onClick={() =>
+                            fetchPoolErrors(
+                              selectedPool,
+                              poolErrors?.next ?? 0,
+                              true,
+                              poolErrorsResolvePaths
+                            )
+                          }
+                          disabled={poolErrorsLoading}
+                        >
+                          {poolErrorsLoading ? 'Loading…' : 'Load more errors'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="pool-summary-foot">
+                    <span>Uberblock TXG {poolSummary.uberblock.txg}</span>
+                    <span>
+                      Timestamp{' '}
+                      {poolSummary.uberblock.timestamp
+                        ? new Date(poolSummary.uberblock.timestamp * 1000).toLocaleString()
+                        : '(unknown)'}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : !isMosMode ? (
             <>
               <div className="panel-header graph-header">
                 <div>
@@ -2671,7 +3484,7 @@ function App() {
             <h2>Inspector</h2>
             <div className="panel-actions">
               {isFsMode && fsStatLoading && <span className="muted">Loading…</span>}
-              {!isFsMode && inspectorLoading && <span className="muted">Loading…</span>}
+              {isMosMode && inspectorLoading && <span className="muted">Loading…</span>}
               <button
                 type="button"
                 className={`pin-btn ${debugCopied ? 'active' : ''}`}
@@ -2680,7 +3493,7 @@ function App() {
               >
                 {debugCopied ? 'Debug copied' : 'Copy debug'}
               </button>
-              {!isFsMode && selectedObject !== null && (
+              {isMosMode && selectedObject !== null && (
                 <button
                   type="button"
                   className={`pin-btn ${isPinned ? 'active' : ''}`}
@@ -2702,6 +3515,7 @@ function App() {
           <div className="runtime-mode">
             <span className="runtime-mode-label">Pool mode</span>
             <span className={`mode-badge ${poolMode}`}>{poolModeLabel}</span>
+            {modeSwitching && <span className="muted">switching…</span>}
           </div>
 
           {isFsMode && fsState && (
@@ -2855,7 +3669,81 @@ function App() {
             <p className="muted">Select a dataset to view filesystem metadata.</p>
           )}
 
-          {!isFsMode && selectedPool && selectedObject !== null && (
+          {isPoolTab && poolSummary && (
+            <div className="inspector-content">
+              <div className="inspector-section">
+                <h3>Pool</h3>
+                <dl className="info-grid">
+                  <div>
+                    <dt>Name</dt>
+                    <dd>{poolSummary.pool.name}</dd>
+                  </div>
+                  <div>
+                    <dt>GUID</dt>
+                    <dd>{poolSummary.pool.guid}</dd>
+                  </div>
+                  <div>
+                    <dt>State</dt>
+                    <dd>{poolSummary.pool.state}</dd>
+                  </div>
+                  <div>
+                    <dt>TXG</dt>
+                    <dd>{poolSummary.pool.txg}</dd>
+                  </div>
+                  <div>
+                    <dt>Version</dt>
+                    <dd>{poolSummary.pool.version}</dd>
+                  </div>
+                  <div>
+                    <dt>Host</dt>
+                    <dd>{poolSummary.pool.hostname ?? '(none)'}</dd>
+                  </div>
+                </dl>
+              </div>
+
+              <div className="inspector-section">
+                <h3>Features For Read</h3>
+                {poolSummary.features_for_read.length === 0 ? (
+                  <p className="muted">No readonly features reported.</p>
+                ) : (
+                  <ul className="feature-list">
+                    {poolSummary.features_for_read.map(feature => (
+                      <li key={feature}>{feature}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              <div className="inspector-section">
+                <h3>Persistent Errors</h3>
+                {poolErrorsError && <p className="muted">Error: {poolErrorsError}</p>}
+                <dl className="info-grid">
+                  <div>
+                    <dt>Error Count</dt>
+                    <dd>{poolErrors ? poolErrors.error_count.toLocaleString() : '—'}</dd>
+                  </div>
+                  <div>
+                    <dt>Approx Entries</dt>
+                    <dd>{poolErrors ? poolErrors.approx_entries.toLocaleString() : '—'}</dd>
+                  </div>
+                  <div>
+                    <dt>Last Obj</dt>
+                    <dd>{poolErrors?.errlog_last_obj ?? '—'}</dd>
+                  </div>
+                  <div>
+                    <dt>Scrub Obj</dt>
+                    <dd>{poolErrors?.errlog_scrub_obj ?? '—'}</dd>
+                  </div>
+                </dl>
+              </div>
+            </div>
+          )}
+
+          {isPoolTab && !poolSummary && !poolSummaryLoading && !poolSummaryError && (
+            <p className="muted">Select a pool to view summary metadata.</p>
+          )}
+
+          {isMosMode && selectedPool && selectedObject !== null && (
             <div className="zdb-hint">
               <code>sudo zdb -dddd {selectedPool} {selectedObject}</code>
               <button
@@ -2869,17 +3757,17 @@ function App() {
             </div>
           )}
 
-          {!isFsMode && inspectorError && (
+          {isMosMode && inspectorError && (
             <div className="error">
               <strong>Error:</strong> {inspectorError}
             </div>
           )}
 
-          {!isFsMode && !selectedObject && !inspectorLoading && (
+          {isMosMode && !selectedObject && !inspectorLoading && (
             <p className="muted">Select a MOS object to inspect its dnode.</p>
           )}
 
-          {!isFsMode && selectedObject !== null && objectInfo && (
+          {isMosMode && selectedObject !== null && objectInfo && (
             <>
               <div className="inspector-tabs">
                 <button
@@ -3378,6 +4266,55 @@ function App() {
           </section>
         </Panel>
       </PanelGroup>
+
+      {poolDetailsOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true">
+          <div className="modal-card">
+            <div className="modal-header">
+              <h3>Pool details</h3>
+              <button
+                type="button"
+                className="pin-btn"
+                onClick={() => setPoolDetailsOpen(false)}
+              >
+                Close
+              </button>
+            </div>
+            {poolSummary ? (
+              <div className="modal-body">
+                <div className="pool-summary-cards">
+                  <div className="pool-summary-card">
+                    <span>Name</span>
+                    <strong>{poolSummary.pool.name}</strong>
+                  </div>
+                  <div className="pool-summary-card">
+                    <span>GUID</span>
+                    <strong>{poolSummary.pool.guid}</strong>
+                  </div>
+                  <div className="pool-summary-card">
+                    <span>State</span>
+                    <strong>{poolSummary.pool.state}</strong>
+                  </div>
+                  <div className="pool-summary-card">
+                    <span>TXG</span>
+                    <strong>{poolSummary.pool.txg}</strong>
+                  </div>
+                </div>
+                <div className="pool-vdev-tree modal-vdev-tree">
+                  <h3>Vdev Tree</h3>
+                  {poolSummary.vdev_tree ? (
+                    renderPoolVdevNode(poolSummary.vdev_tree, 'modal.root', 0)
+                  ) : (
+                    <p className="muted">No vdev tree available.</p>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <p className="muted">No pool summary loaded.</p>
+            )}
+          </div>
+        </div>
+      )}
 
       <footer>
         <p>v0.01, OpenZFS commit: 21bbe7cb6</p>
