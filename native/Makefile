@@ -34,7 +34,15 @@ LDLIBS = -L$(ZFS_PREFIX)/lib -lzfs -lzpool -lnvpair
 TARGET = libzdbdecode.so
 STATIC_TARGET = libzdbdecode.a
 
-SRCS = src/zdbdecode.c src/json.c
+SRCS = src/zdx_core.c \
+       src/zdx_pool.c \
+       src/zdx_mos.c \
+       src/zdx_dsl.c \
+       src/zdx_objset.c \
+       src/zdx_catalog.c \
+       src/zdx_zap.c \
+       src/zdx_block.c \
+       src/json.c
 OBJS = $(SRCS:.c=.o)
 
 .PHONY: all clean
@@ -47,7 +55,7 @@ $(TARGET): $(OBJS)
 $(STATIC_TARGET): $(OBJS)
 	$(AR) rcs $@ $(OBJS)
 
-src/%.o: src/%.c include/zdbdecode.h src/json.h
+src/%.o: src/%.c include/zdbdecode.h src/json.h src/zdbdecode_internal.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -o $@ -c $<
 
 clean:
