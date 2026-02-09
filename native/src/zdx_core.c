@@ -43,7 +43,15 @@ make_error(int err, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    result.errmsg = strdup(buf);
+    if (err > 0) {
+        char with_errno[512];
+        const char *errtxt = strerror(err);
+        (void)snprintf(with_errno, sizeof (with_errno), "%s: %s", buf,
+            errtxt ? errtxt : "unknown error");
+        result.errmsg = strdup(with_errno);
+    } else {
+        result.errmsg = strdup(buf);
+    }
     return result;
 }
 
@@ -306,6 +314,90 @@ zdx_fini(void)
     kernel_fini();
 }
 
+static void
+free_search_paths(char **paths, int count)
+{
+    if (!paths)
+        return;
+    for (int i = 0; i < count; i++)
+        free(paths[i]);
+    free(paths);
+}
+
+static int
+build_search_paths(const char *search_paths, char ***out_paths, int *out_count)
+{
+    if (!out_paths || !out_count)
+        return EINVAL;
+
+    *out_paths = NULL;
+    *out_count = 0;
+
+    if (search_paths != NULL && search_paths[0] != '\0') {
+        char *copy = strdup(search_paths);
+        if (!copy)
+            return ENOMEM;
+
+        int count = 1;
+        for (const char *p = search_paths; *p != '\0'; p++) {
+            if (*p == ':')
+                count++;
+        }
+
+        char **paths = calloc((size_t)count, sizeof (char *));
+        if (!paths) {
+            free(copy);
+            return ENOMEM;
+        }
+
+        int idx = 0;
+        char *iter = copy;
+        char *token = NULL;
+        while ((token = strsep(&iter, ":")) != NULL) {
+            if (token[0] == '\0')
+                continue;
+            paths[idx] = strdup(token);
+            if (!paths[idx]) {
+                free(copy);
+                free_search_paths(paths, idx);
+                return ENOMEM;
+            }
+            idx++;
+        }
+        free(copy);
+
+        if (idx == 0) {
+            free(paths);
+            return EINVAL;
+        }
+
+        *out_paths = paths;
+        *out_count = idx;
+        return 0;
+    }
+
+    size_t default_count = 0;
+    const char * const *defaults = zpool_default_search_paths(&default_count);
+    if (!defaults || default_count == 0)
+        return ENOENT;
+
+    char **paths = calloc(default_count, sizeof (char *));
+    if (!paths)
+        return ENOMEM;
+
+    for (size_t i = 0; i < default_count; i++) {
+        paths[i] = strdup(defaults[i]);
+        if (!paths[i]) {
+            free_search_paths(paths, (int)i);
+            return ENOMEM;
+        }
+    }
+
+    *out_paths = paths;
+    *out_count = (int)default_count;
+    return 0;
+}
+
 /*
  * Open a pool via libzpool
  */
@@ -343,6 +435,110 @@ zdx_pool_open(const char *name, int *err)
 }
 
 /*
+ * Open a pool by scanning offline vdevs/paths and importing read-only in-process.
+ */
+zdx_pool_t *
+zdx_pool_open_offline(const char *name, const char *search_paths, int *err)
+{
+    if (err)
+        *err = 0;
+
+    if (name == NULL) {
+        if (err)
+            *err = EINVAL;
+        return NULL;
+    }
+
+    char **paths = NULL;
+    int path_count = 0;
+    int rc = build_search_paths(search_paths, &paths, &path_count);
+    if (rc != 0) {
+        if (err)
+            *err = rc;
+        return NULL;
+    }
+
+    importargs_t args = { 0 };
+    args.paths = path_count;
+    args.path = paths;
+    args.can_be_active = B_TRUE;
+    args.scan = B_TRUE;
+
+    libpc_handle_t lpch = { 0 };
+    lpch.lpc_lib_handle = NULL;
+    lpch.lpc_ops = &libzpool_config_ops;
+    lpch.lpc_printerr = B_TRUE;
+
+    nvlist_t *cfg = NULL;
+    rc = zpool_find_config(&lpch, name, &cfg, &args);
+    free_search_paths(paths, path_count);
+    if (rc != 0 || cfg == NULL) {
+        if (err)
+            *err = (rc != 0) ? rc : ENOENT;
+        return NULL;
+    }
+
+    boolean_t imported_offline = B_FALSE;
+    char *import_name = strdup(name);
+    if (!import_name) {
+        nvlist_free(cfg);
+        if (err)
+            *err = ENOMEM;
+        return NULL;
+    }
+
+    rc = spa_import(import_name, cfg, NULL, ZFS_IMPORT_SKIP_MMP);
+    free(import_name);
+    nvlist_free(cfg);
+    if (rc == 0) {
+        imported_offline = B_TRUE;
+    } else if (rc != EEXIST
+#ifdef EALREADY
+        && rc != EALREADY
+#endif
+    ) {
+        if (err)
+            *err = rc;
+        return NULL;
+    }
+
+    spa_t *spa = NULL;
+    rc = spa_open(name, &spa, FTAG);
+    if (rc != 0) {
+        if (imported_offline)
+            (void) spa_export(name, NULL, B_TRUE, B_FALSE);
+        if (err)
+            *err = rc;
+        return NULL;
+    }
+
+    zdx_pool_t *pool = calloc(1, sizeof (zdx_pool_t));
+    if (!pool) {
+        spa_close(spa, FTAG);
+        if (imported_offline)
+            (void) spa_export(name, NULL, B_TRUE, B_FALSE);
+        if (err)
+            *err = ENOMEM;
+        return NULL;
+    }
+
+    pool->name = strdup(name);
+    if (!pool->name) {
+        free(pool);
+        spa_close(spa, FTAG);
+        if (imported_offline)
+            (void) spa_export(name, NULL, B_TRUE, B_FALSE);
+        if (err)
+            *err = ENOMEM;
+        return NULL;
+    }
+
+    pool->spa = spa;
+    pool->imported_offline = imported_offline;
+    return pool;
+}
+
+/*
  * Close a pool handle
  */
 void
@@ -354,10 +550,9 @@ zdx_pool_close(zdx_pool_t *pool)
     if (pool->spa)
         spa_close(pool->spa, FTAG);
 
+    if (pool->imported_offline && pool->name)
+        (void) spa_export(pool->name, NULL, B_TRUE, B_FALSE);
+
     free(pool->name);
     free(pool);
 }
-
-/*
- * Pool info (stub for now)
- */

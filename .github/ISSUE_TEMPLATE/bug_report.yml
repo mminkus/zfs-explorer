@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible issue in ZFS Explorer
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Please include concrete reproduction data so we can diagnose quickly.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened vs what you expected.
+      placeholder: Briefly describe the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Exact steps and selected pool/object/path.
+      placeholder: |
+        1. Open pool ...
+        2. Navigate to object/dataset ...
+        3. Click ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: debug_info
+    attributes:
+      label: Debug info JSON
+      description: Paste Inspector `Copy debug` output.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: endpoint
+    attributes:
+      label: Endpoint / object context
+      description: Endpoint URL, object id, dataset path, and response/error payload if available.
+      placeholder: GET /api/pools/<pool>/obj/<objid> ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Backend logs
+      description: Include relevant `RUST_LOG` output (debug level preferred).
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Host OS, architecture, pool features/layout, and whether data is encrypted.
+      placeholder: Debian 13, x86_64, RAIDZ2, encryption on/off...
+    validations:
+      required: true

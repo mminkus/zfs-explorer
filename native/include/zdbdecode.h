@@ -29,6 +29,8 @@ void zdx_fini(void);  /* kernel_fini() */
 /* === Pool operations === */
 zdx_result_t zdx_list_pools(void);
 zdx_pool_t *zdx_pool_open(const char *name, int *err);
+zdx_pool_t *zdx_pool_open_offline(const char *name, const char *search_paths,
+                                  int *err);
 void zdx_pool_close(zdx_pool_t *pool);
 zdx_result_t zdx_pool_info(zdx_pool_t *pool);
 zdx_result_t zdx_pool_vdevs(zdx_pool_t *pool);

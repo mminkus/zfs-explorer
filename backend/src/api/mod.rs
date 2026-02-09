@@ -11,6 +11,12 @@ use crate::AppState;
 
 const DEFAULT_PAGE_LIMIT: u64 = 200;
 const MAX_PAGE_LIMIT: u64 = 10_000;
+const BACKEND_NAME: &str = env!("CARGO_PKG_NAME");
+const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_GIT_SHA: &str = match option_env!("ZFS_EXPLORER_GIT_SHA") {
+    Some(v) => v,
+    None => "unknown",
+};
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
 
@@ -18,14 +24,65 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     (status, Json(json!({ "error": message.into() })))
 }
 
+fn pool_open_mode_name(mode: crate::PoolOpenMode) -> &'static str {
+    match mode {
+        crate::PoolOpenMode::Live => "live",
+        crate::PoolOpenMode::Offline => "offline",
+    }
+}
+
+fn build_version_payload(pool_open: &crate::PoolOpenConfig) -> Value {
+    json!({
+        "project": "zfs-explorer",
+        "backend": {
+            "name": BACKEND_NAME,
+            "version": BACKEND_VERSION,
+            "git_sha": BUILD_GIT_SHA,
+        },
+        "openzfs": {
+            "commit": crate::ffi::version(),
+        },
+        "runtime": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "pool_open": {
+            "mode": pool_open_mode_name(pool_open.mode),
+            "offline_search_paths": pool_open.offline_search_paths.clone(),
+            "offline_pools": pool_open.offline_pool_names.clone(),
+        },
+    })
+}
+
+/// GET /api/version - Build/runtime info for support bundles
+pub async fn api_version(State(state): State<AppState>) -> ApiResult {
+    Ok(Json(build_version_payload(&state.pool_open)))
+}
+
 /// GET /api/pools - List all imported pools
-pub async fn list_pools() -> ApiResult {
+pub async fn list_pools(State(state): State<AppState>) -> ApiResult {
+    if matches!(state.pool_open.mode, crate::PoolOpenMode::Offline)
+        && !state.pool_open.offline_pool_names.is_empty()
+    {
+        let pools = state
+            .pool_open
+            .offline_pool_names
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+        return Ok(Json(Value::Array(pools)));
+    }
+
     let result = crate::ffi::list_pools();
 
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("Failed to list pools: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
     let json_str = result
@@ -112,7 +169,10 @@ fn json_from_result(result: crate::ffi::ZdxResult) -> ApiResult {
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
     let json_str = result
@@ -124,10 +184,7 @@ fn json_from_result(result: crate::ffi::ZdxResult) -> ApiResult {
     Ok(Json(value))
 }
 
-fn ensure_pool(
-    state: &AppState,
-    pool: &str,
-) -> Result<*mut crate::ffi::zdx_pool_t, ApiError> {
+fn ensure_pool(state: &AppState, pool: &str) -> Result<*mut crate::ffi::zdx_pool_t, ApiError> {
     let mut guard = state.pool.lock().unwrap();
 
     if let Some(existing) = guard.as_ref() {
@@ -140,9 +197,20 @@ fn ensure_pool(
         crate::ffi::pool_close(old.ptr);
     }
 
-    let handle = crate::ffi::pool_open(pool).map_err(|(_code, msg)| {
-        tracing::error!("Failed to open pool {}: {}", pool, msg);
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    let mode = state.pool_open.mode;
+    let mode_name = pool_open_mode_name(mode);
+    let handle = match mode {
+        crate::PoolOpenMode::Live => crate::ffi::pool_open(pool),
+        crate::PoolOpenMode::Offline => {
+            crate::ffi::pool_open_offline(pool, state.pool_open.offline_search_paths.as_deref())
+        }
+    }
+    .map_err(|(_code, msg)| {
+        tracing::error!("Failed to open pool {} (mode={}): {}", pool, mode_name, msg);
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("pool open failed ({mode_name}): {msg}"),
+        )
     })?;
 
     let ptr = handle.ptr;
@@ -251,10 +319,7 @@ pub async fn dsl_dir_head(
 }
 
 /// GET /api/pools/:pool/dsl/root
-pub async fn dsl_root_dir(
-    State(state): State<AppState>,
-    Path(pool): Path<String>,
-) -> ApiResult {
+pub async fn dsl_root_dir(State(state): State<AppState>, Path(pool): Path<String>) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::dsl_root_dir(pool_ptr);
     json_from_result(result)
@@ -292,7 +357,10 @@ pub async fn read_block(
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
     let json_str = result
@@ -328,7 +396,10 @@ pub async fn dataset_tree(
     if !root_result.is_ok() {
         let err_msg = root_result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
     let root_json = root_result
@@ -367,11 +438,17 @@ pub async fn dataset_tree(
         if !head_result.is_ok() {
             let err_msg = head_result.error_msg().unwrap_or("Unknown error");
             tracing::error!("FFI error: {}", err_msg);
-            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err_msg.to_string(),
+            ));
         }
-        let head_json = head_result
-            .json()
-            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in head result"))?;
+        let head_json = head_result.json().ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Missing JSON in head result",
+            )
+        })?;
         let head_value = parse_json_value(head_json)?;
         let head_dataset_obj = head_value["head_dataset_obj"].as_u64();
 
@@ -379,11 +456,17 @@ pub async fn dataset_tree(
         if !children_result.is_ok() {
             let err_msg = children_result.error_msg().unwrap_or("Unknown error");
             tracing::error!("FFI error: {}", err_msg);
-            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err_msg.to_string(),
+            ));
         }
-        let children_json = children_result
-            .json()
-            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in children result"))?;
+        let children_json = children_result.json().ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Missing JSON in children result",
+            )
+        })?;
         let children_value = parse_json_value(children_json)?;
         let child_dir_zapobj = children_value["child_dir_zapobj"].as_u64();
 
@@ -464,12 +547,18 @@ fn resolve_dataset_objset(
     if !head_result.is_ok() {
         let err_msg = head_result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
-    let head_json = head_result
-        .json()
-        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in head result"))?;
+    let head_json = head_result.json().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Missing JSON in head result",
+        )
+    })?;
     let head_value = parse_json_value(head_json)?;
 
     let head_obj = head_value["head_dataset_obj"].as_u64().unwrap_or(0);
@@ -484,12 +573,18 @@ fn resolve_dataset_objset(
     if !objset_result.is_ok() {
         let err_msg = objset_result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
-    let objset_json = objset_result
-        .json()
-        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in objset result"))?;
+    let objset_json = objset_result.json().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Missing JSON in objset result",
+        )
+    })?;
     let objset_value = parse_json_value(objset_json)?;
 
     let response = build_dataset_objset_response(dir_obj, head_obj, &objset_value);
@@ -508,7 +603,10 @@ pub async fn objset_root(
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
     let json_str = result
@@ -578,7 +676,9 @@ pub async fn graph_from(
     Query(params): Query<GraphQuery>,
 ) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
-    let include = params.include.unwrap_or_else(|| "semantic,physical".to_string());
+    let include = params
+        .include
+        .unwrap_or_else(|| "semantic,physical".to_string());
     let _depth = params.depth.unwrap_or(1);
     let (include_semantic, include_physical, include_zap) = parse_graph_include(Some(&include));
 
@@ -586,7 +686,10 @@ pub async fn graph_from(
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err_msg.to_string(),
+        ));
     }
 
     let json_str = result
@@ -687,17 +790,17 @@ mod tests {
 
     #[test]
     fn normalize_cursor_limit_defaults_cursor_and_limit() {
-        assert_eq!(
-            normalize_cursor_limit(None, None),
-            (0, DEFAULT_PAGE_LIMIT)
-        );
+        assert_eq!(normalize_cursor_limit(None, None), (0, DEFAULT_PAGE_LIMIT));
         assert_eq!(normalize_cursor_limit(Some(42), Some(64)), (42, 64));
     }
 
     #[test]
     fn parse_graph_include_handles_defaults_and_flags() {
         assert_eq!(parse_graph_include(None), (true, true, false));
-        assert_eq!(parse_graph_include(Some("semantic,zap")), (true, false, true));
+        assert_eq!(
+            parse_graph_include(Some("semantic,zap")),
+            (true, false, true)
+        );
         assert_eq!(parse_graph_include(Some("physical")), (false, true, false));
     }
 
@@ -707,7 +810,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         let msg = err
             .1
-            .0
+             .0
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or_default();
@@ -718,7 +821,7 @@ mod tests {
     fn api_error_returns_json_envelope() {
         let err = api_error(StatusCode::BAD_REQUEST, "boom");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1.0["error"], "boom");
+        assert_eq!(err.1 .0["error"], "boom");
     }
 
     #[test]
@@ -756,6 +859,23 @@ mod tests {
             parsed,
             vec![("local".to_string(), 3), ("dataset".to_string(), 7)]
         );
+    }
+
+    #[test]
+    fn version_payload_includes_required_fields() {
+        let payload = build_version_payload(&crate::PoolOpenConfig {
+            mode: crate::PoolOpenMode::Live,
+            offline_search_paths: None,
+            offline_pool_names: Vec::new(),
+        });
+        assert_eq!(payload["project"], "zfs-explorer");
+        assert_eq!(payload["backend"]["name"], BACKEND_NAME);
+        assert_eq!(payload["backend"]["version"], BACKEND_VERSION);
+        assert!(payload["backend"]["git_sha"].as_str().is_some());
+        assert!(payload["openzfs"]["commit"].as_str().is_some());
+        assert_eq!(payload["runtime"]["os"], std::env::consts::OS);
+        assert_eq!(payload["runtime"]["arch"], std::env::consts::ARCH);
+        assert_eq!(payload["pool_open"]["mode"], "live");
     }
 
     #[test]

@@ -1,15 +1,35 @@
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+
+fn git_short_sha() -> String {
+    let output = Command::new("git")
+        .args(["-C", "..", "rev-parse", "--short", "HEAD"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sha.is_empty() {
+                "unknown".to_string()
+            } else {
+                sha
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
 
 fn main() {
     // Get paths from environment or use defaults
-    let libzdbdecode_path = env::var("LIBZDBDECODE_PATH")
-        .unwrap_or_else(|_| "../native".to_string());
-    let zfs_prefix = env::var("ZFS_PREFIX")
-        .unwrap_or_else(|_| "../_deps/openzfs".to_string());
+    let libzdbdecode_path =
+        env::var("LIBZDBDECODE_PATH").unwrap_or_else(|_| "../native".to_string());
+    let zfs_prefix = env::var("ZFS_PREFIX").unwrap_or_else(|_| "../_deps/openzfs".to_string());
 
     println!("cargo:rerun-if-changed=../native/include/zdbdecode.h");
     println!("cargo:rerun-if-changed=../native/libzdbdecode.so");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rustc-env=ZFS_EXPLORER_GIT_SHA={}", git_short_sha());
 
     // Link to native library
     println!("cargo:rustc-link-search=native={}", libzdbdecode_path);

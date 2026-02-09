@@ -16,6 +16,14 @@ static FFI_MUTEX: Mutex<()> = Mutex::new(());
 /// Ensure zdx_init() is called exactly once
 static INIT: Once = Once::new();
 
+fn errno_hint(code: i32) -> String {
+    if code > 0 {
+        format!(" ({})", std::io::Error::from_raw_os_error(code))
+    } else {
+        String::new()
+    }
+}
+
 /// Initialize ZFS library (called once via std::sync::Once)
 pub fn init() -> Result<(), String> {
     let mut result = Ok(());
@@ -106,7 +114,42 @@ pub fn pool_open(name: &str) -> Result<PoolHandle, (i32, String)> {
     let mut err: i32 = 0;
     let ptr = unsafe { zdx_pool_open(c_name.as_ptr(), &mut err) };
     if ptr.is_null() {
-        let msg = format!("zdx_pool_open failed with code {}", err);
+        let msg = format!("zdx_pool_open failed with code {}{}", err, errno_hint(err));
+        return Err((err, msg));
+    }
+
+    Ok(PoolHandle {
+        name: name.to_string(),
+        ptr,
+    })
+}
+
+/// Open a pool from offline/exported media by scanning provided paths.
+/// `search_paths` is a colon-separated list of directories/devices, or `None`
+/// to use OpenZFS default import search paths.
+pub fn pool_open_offline(
+    name: &str,
+    search_paths: Option<&str>,
+) -> Result<PoolHandle, (i32, String)> {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let c_name = CString::new(name).map_err(|e| (-1, e.to_string()))?;
+    let c_paths = match search_paths {
+        Some(v) => Some(CString::new(v).map_err(|e| (-1, e.to_string()))?),
+        None => None,
+    };
+
+    let path_ptr = c_paths
+        .as_ref()
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let mut err: i32 = 0;
+    let ptr = unsafe { zdx_pool_open_offline(c_name.as_ptr(), path_ptr, &mut err) };
+    if ptr.is_null() {
+        let msg = format!(
+            "zdx_pool_open_offline failed with code {}{}",
+            err,
+            errno_hint(err)
+        );
         return Err((err, msg));
     }
 

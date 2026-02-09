@@ -144,6 +144,27 @@ type RawBlockResponse = {
   data_hex: string
 }
 
+type ApiVersionResponse = {
+  project: string
+  backend: {
+    name: string
+    version: string
+    git_sha: string
+  }
+  openzfs: {
+    commit: string
+  }
+  runtime: {
+    os: string
+    arch: string
+  }
+  pool_open?: {
+    mode?: string
+    offline_search_paths?: string | null
+    offline_pools?: string[]
+  }
+}
+
 type DatasetTreeNode = {
   name: string
   dsl_dir_obj: number
@@ -374,6 +395,9 @@ function App() {
   const [hexLoading, setHexLoading] = useState(false)
   const [hexError, setHexError] = useState<string | null>(null)
   const [zdbCopied, setZdbCopied] = useState(false)
+  const [debugCopied, setDebugCopied] = useState(false)
+  const [debugCopyError, setDebugCopyError] = useState<string | null>(null)
+  const [apiVersionInfo, setApiVersionInfo] = useState<ApiVersionResponse | null>(null)
   const [leftPaneTab, setLeftPaneTab] = useState<NavigatorMode>('datasets')
   const [pinnedByPool, setPinnedByPool] = useState<Record<string, PinnedObject[]>>({})
   const [graphSearch, setGraphSearch] = useState('')
@@ -793,6 +817,9 @@ function App() {
   const isFsTab = leftPaneTab === 'fs'
   const isDatasetsTab = leftPaneTab === 'datasets'
   const isFsMode = leftPaneTab !== 'mos'
+  const poolMode = apiVersionInfo?.pool_open?.mode === 'offline' ? 'offline' : 'live'
+  const poolModeLabel = poolMode === 'offline' ? 'Offline' : 'Live'
+  const offlinePoolNames = apiVersionInfo?.pool_open?.offline_pools ?? []
   const canGoBack =
     (isMosMode && navIndex > 0) || (isFsTab && fsHistoryIndex > 0)
   const canGoForward =
@@ -808,6 +835,14 @@ function App() {
       .catch(err => {
         setError((err as Error).message)
         setLoading(false)
+      })
+  }, [])
+
+  useEffect(() => {
+    fetchJson<ApiVersionResponse>(`${API_BASE}/api/version`)
+      .then(data => setApiVersionInfo(data))
+      .catch(() => {
+        setApiVersionInfo(null)
       })
   }, [])
 
@@ -1803,6 +1838,48 @@ function App() {
     }
   }
 
+  const handleCopyDebugInfo = async () => {
+    setDebugCopyError(null)
+    try {
+      const versionInfo = await fetchJson<ApiVersionResponse>(`${API_BASE}/api/version`)
+      const payload = {
+        captured_at_utc: new Date().toISOString(),
+        backend: versionInfo,
+        frontend: {
+          api_base: API_BASE,
+          user_agent: navigator.userAgent,
+          left_pane_tab: leftPaneTab,
+          format_mode: formatMode,
+          selected_pool: selectedPool,
+          selected_object: selectedObject,
+          selected_object_type: objectInfo?.type?.name ?? null,
+          inspector_tab: isFsMode ? 'filesystem' : inspectorTab,
+          raw_view: rawView,
+          fs_state: fsState
+            ? {
+                dataset_name: fsState.datasetName,
+                mountpoint: fsState.mountpoint,
+                mounted: fsState.mounted,
+                dsl_dir_obj: fsState.dslDirObj,
+                objset_id: fsState.objsetId,
+                current_dir_obj: fsState.currentDir,
+                path: fsState.path.map(seg => ({
+                  name: seg.name,
+                  objid: seg.objid,
+                  kind: seg.kind ?? null,
+                })),
+              }
+            : null,
+        },
+      }
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2))
+      setDebugCopied(true)
+      setTimeout(() => setDebugCopied(false), 2000)
+    } catch (err) {
+      setDebugCopyError((err as Error).message)
+    }
+  }
+
   const isZapObjectKey = (entry: ZapEntry) =>
     zapObjectKeys.has(entry.name) && entry.maybe_object_ref && entry.target_obj !== null
 
@@ -1891,11 +1968,25 @@ function App() {
             <code>localhost:9000</code>
           </div>
           <div className="status-item">
+            <span>Mode</span>
+            <span className={`mode-badge ${poolMode}`}>{poolModeLabel}</span>
+          </div>
+          <div className="status-item">
             <span>Pool</span>
             <strong>{selectedPool ?? 'none'}</strong>
           </div>
         </div>
       </header>
+
+      <div className="safety-banner" role="status" aria-live="polite">
+        <strong>Read-only mode:</strong>{' '}
+        {poolMode === 'offline'
+          ? 'offline/exported pool analysis (experimental).'
+          : 'live imported pools only.'}
+        {poolMode === 'offline' && offlinePoolNames.length > 0 && (
+          <> Configured pools: {offlinePoolNames.join(', ')}.</>
+        )}
+      </div>
 
       <div className="breadcrumb">
         <div className="nav-buttons">
@@ -2581,6 +2672,14 @@ function App() {
             <div className="panel-actions">
               {isFsMode && fsStatLoading && <span className="muted">Loading…</span>}
               {!isFsMode && inspectorLoading && <span className="muted">Loading…</span>}
+              <button
+                type="button"
+                className={`pin-btn ${debugCopied ? 'active' : ''}`}
+                onClick={handleCopyDebugInfo}
+                title="Copy backend and frontend debug context"
+              >
+                {debugCopied ? 'Debug copied' : 'Copy debug'}
+              </button>
               {!isFsMode && selectedObject !== null && (
                 <button
                   type="button"
@@ -2592,6 +2691,17 @@ function App() {
                 </button>
               )}
             </div>
+          </div>
+
+          {debugCopyError && (
+            <div className="error">
+              <strong>Debug copy failed:</strong> {debugCopyError}
+            </div>
+          )}
+
+          <div className="runtime-mode">
+            <span className="runtime-mode-label">Pool mode</span>
+            <span className={`mode-badge ${poolMode}`}>{poolModeLabel}</span>
           </div>
 
           {isFsMode && fsState && (

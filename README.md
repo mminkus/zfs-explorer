@@ -20,6 +20,10 @@ The design is intentionally **read-only**. Long-term goals include supporting
 analysis of **unimported or damaged pools**, enabling forensic inspection and
 file recovery without ever importing the pool.
 
+Current mode disclaimer: default operation is **live imported pools only**.
+Experimental offline/exported pool analysis can be enabled explicitly via env
+configuration (see **Offline Mode (Experimental)** below).
+
 You can think of this project as:
 
 - **`zdb`, visualized**
@@ -28,6 +32,32 @@ You can think of this project as:
 - **A foundation for ZFS recovery and forensic workflows**
 
 **Current Status:** Active development (MOS browser, ZAP decoding, DSL edges, hex dump, dataset tree, FS navigation in progress)
+
+## Guided Tour
+
+1. Start backend on the ZFS host (`sudo ./run-backend.sh` or `sudo ./target/debug/zfs-explorer`).
+2. Open the UI and pick a pool from the left pane.
+3. Use `Datasets` to choose a dataset, then browse its filesystem view.
+4. Click `Open as object` (or object links in Inspector) to jump into MOS/object inspection.
+5. Use `Explore`, `Graph`, and `Physical` center views to inspect semantic and blkptr relationships.
+6. Use Inspector tabs (`Summary`, `ZAP`, `Blkptr`, `Raw`) for detailed decoding and hex reads.
+7. Use `Copy debug` in Inspector when reporting bugs.
+
+## Common Workflows
+
+### Dataset -> Filesystem -> Object Inspection
+
+1. Select dataset in `Datasets` tree.
+2. Browse paths in FS view (`List` or `Graph`).
+3. Select an entry and click `Open as object`.
+4. Inspect bonus fields, ZAP links, blkptrs, and raw block hex.
+
+### DSL Traversal Path
+
+1. In MOS mode, open object `1` (object directory) and inspect ZAP entries.
+2. Follow `root_dataset` to DSL dir objects.
+3. Traverse `child_dir_zapobj` / `head_dataset_obj` edges.
+4. Handoff into FS view from dataset-linked inspector actions.
 
 ## Architecture
 
@@ -102,6 +132,45 @@ ssh -L 8080:127.0.0.1:8080 -L 9000:127.0.0.1:9000 USER@HOST
 # Open http://localhost:8080 in your browser
 ```
 
+## Offline Mode (Experimental)
+
+Backend startup now supports an explicit offline pool-open mode for exported
+pools. This mode is opt-in and remains read-only.
+
+```bash
+export ZFS_EXPLORER_POOL_MODE=offline
+export ZFS_EXPLORER_OFFLINE_POOLS="poolA,poolB"
+export ZFS_EXPLORER_OFFLINE_PATHS="/dev/disk/by-id:/srv/offline-images"
+sudo ./run-backend.sh
+```
+
+Environment variables:
+
+- `ZFS_EXPLORER_POOL_MODE`: `live` (default) or `offline`
+- `ZFS_EXPLORER_OFFLINE_POOLS`: comma-separated pool names exposed by `/api/pools` in offline mode
+- `ZFS_EXPLORER_OFFLINE_PATHS`: colon-separated search paths used by offline open logic
+
+Optional parity check workflow (live vs offline responses):
+
+```bash
+# live backend on :9000, offline backend on :9001
+LIVE_BASE_URL=http://127.0.0.1:9000 \
+OFFLINE_BASE_URL=http://127.0.0.1:9001 \
+build/check-offline-parity.sh <pool> 1 32 34
+```
+
+Create a local offline fixture pool and run offline smoke checks:
+
+```bash
+# create/export a small file-backed fixture pool
+build/create-offline-fixture.sh --pool zdx_fixture --force
+
+# run backend smoke checks against that fixture (root required)
+sudo build/test-offline-fixture.sh \
+  --pool zdx_fixture \
+  --search-paths "$(pwd)/fixtures/offline/zdx_fixture"
+```
+
 ## Project Structure
 
 ```
@@ -133,6 +202,7 @@ zfs-explorer/
 
 ## API Endpoints (Selected)
 
+- `GET /api/version` - Build/runtime/debug metadata (includes active pool-open mode)
 - `GET /api/pools` - List all imported pools (returns JSON array of strings)
 - `GET /api/pools/:pool/mos/objects?type=&start=&limit=` - List MOS objects
 - `GET /api/pools/:pool/obj/:objid` - MOS dnode metadata
@@ -252,6 +322,48 @@ See `docs/PACKAGING_STATIC_FEASIBILITY.md` for the current packaging decision.
 - Backend binds to **127.0.0.1:9000** only (localhost)
 - Access via SSH tunnel for remote use
 - Requires root privileges (or ZFS capabilities) to access pools
+
+## Read-Only Safety Model
+
+- Native initialization uses `kernel_init(SPA_MODE_READ)`.
+- Live mode opens already-imported pools and does not issue write paths.
+- Offline mode is explicit and uses read-only import plumbing for analysis.
+- Native runtime guardrails reject pool access if read-only mode is not active.
+- API bind address is localhost-only by default (`127.0.0.1:9000`).
+- Offline/exported mode is experimental and opt-in via env vars.
+
+This project is intended for inspection and debugging, not mutation.
+
+## Known Limitations
+
+Known caveats and expected failure modes are tracked in:
+
+- `docs/KNOWN_LIMITATIONS.md`
+
+## Logging and Debug Info
+
+Backend logging uses `tracing` with `INFO` as default if `RUST_LOG` is unset.
+
+Common `RUST_LOG` presets:
+
+```bash
+# Default behavior (same as unset)
+RUST_LOG=info sudo ./target/debug/zfs-explorer
+
+# Quieter operation
+RUST_LOG=warn sudo ./target/debug/zfs-explorer
+
+# Debug ZFS Explorer backend routes and FFI flow
+RUST_LOG=zfs_explorer=debug,axum=info,tower_http=info sudo ./target/debug/zfs-explorer
+```
+
+Debug metadata endpoint:
+
+```bash
+curl http://127.0.0.1:9000/api/version
+```
+
+The Inspector also provides a `Copy debug` action that copies backend version/runtime info plus current UI navigation context as JSON.
 
 ## Validation Checklist
 

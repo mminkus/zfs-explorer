@@ -34,6 +34,7 @@
 #include <sys/abd.h>
 #include <libzpool.h>
 #include <libzfs.h>
+#include <libzutil.h>
 
 /* Build-time version info */
 #ifndef ZDX_GIT_SHA
@@ -44,6 +45,7 @@
 struct zdx_pool {
     char *name;
     spa_t *spa;
+    boolean_t imported_offline;
 };
 
 extern libzfs_handle_t *g_zfs;

@@ -27,6 +27,21 @@ h1 {
   font-size: 0.95rem;
 }
 
+.safety-banner {
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 140, 66, 0.38);
+  background: rgba(255, 140, 66, 0.12);
+  color: #ffccad;
+  border-radius: 10px;
+  padding: 0.55rem 0.85rem;
+  font-size: 0.82rem;
+}
+
+.safety-banner strong {
+  color: #ffd9c4;
+  margin-right: 0.3rem;
+}
+
 .status {
   display: flex;
   gap: 1.5rem;
@@ -75,6 +90,31 @@ footer code {
 .status-item strong {
   color: var(--text);
   font-size: 1rem;
+}
+
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid var(--panel-border);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+}
+
+.mode-badge.live {
+  color: #8ad4ff;
+  border-color: rgba(77, 208, 225, 0.45);
+  background: rgba(77, 208, 225, 0.12);
+}
+
+.mode-badge.offline {
+  color: #ffcf9a;
+  border-color: rgba(255, 166, 93, 0.45);
+  background: rgba(255, 166, 93, 0.14);
 }
 
 .breadcrumb {
@@ -259,6 +299,20 @@ footer code {
   border-color: rgba(255, 140, 66, 0.45);
   color: #ffb37a;
   cursor: default;
+}
+
+.runtime-mode {
+  margin: -0.1rem 0 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.runtime-mode-label {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
 .graph-header {
