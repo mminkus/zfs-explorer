@@ -4,36 +4,34 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::AppState;
 
 const DEFAULT_PAGE_LIMIT: u64 = 200;
 const MAX_PAGE_LIMIT: u64 = 10_000;
+type ApiError = (StatusCode, Json<Value>);
+type ApiResult = Result<Json<Value>, ApiError>;
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    (status, Json(json!({ "error": message.into() })))
+}
 
 /// GET /api/pools - List all imported pools
-pub async fn list_pools() -> Result<Json<Value>, (StatusCode, String)> {
+pub async fn list_pools() -> ApiResult {
     let result = crate::ffi::list_pools();
 
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("Failed to list pools: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let json_str = result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in result".to_string(),
-    ))?;
-
-    let value: Value = serde_json::from_str(json_str).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
 
     Ok(Json(value))
 }
@@ -42,7 +40,7 @@ pub async fn list_pools() -> Result<Json<Value>, (StatusCode, String)> {
 pub async fn list_pool_datasets(
     State(state): State<AppState>,
     Path(pool): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::pool_datasets(pool_ptr);
     json_from_result(result)
@@ -56,10 +54,10 @@ pub struct MosListQuery {
     pub limit: Option<u64>,
 }
 
-fn parse_json_value(json_str: &str) -> Result<Value, (StatusCode, String)> {
+fn parse_json_value(json_str: &str) -> Result<Value, ApiError> {
     serde_json::from_str(json_str).map_err(|e| {
         tracing::error!("Failed to parse JSON: {}", e);
-        (
+        api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("JSON parse error: {}", e),
         )
@@ -83,6 +81,24 @@ fn parse_graph_include(include: Option<&str>) -> (bool, bool, bool) {
     )
 }
 
+fn parse_dsl_children(value: &Value) -> Vec<(String, u64)> {
+    let Some(children) = value["children"].as_array() else {
+        return Vec::new();
+    };
+
+    children
+        .iter()
+        .filter_map(|child| {
+            let child_objid = child["dir_objid"].as_u64()?;
+            if child_objid == 0 {
+                return None;
+            }
+            let child_name = child["name"].as_str().unwrap_or("dataset").to_string();
+            Some((child_name, child_objid))
+        })
+        .collect()
+}
+
 fn build_dataset_objset_response(dir_obj: u64, head_obj: u64, objset_value: &Value) -> Value {
     serde_json::json!({
         "dsl_dir_obj": dir_obj,
@@ -92,17 +108,16 @@ fn build_dataset_objset_response(dir_obj: u64, head_obj: u64, objset_value: &Val
     })
 }
 
-fn json_from_result(result: crate::ffi::ZdxResult) -> Result<Json<Value>, (StatusCode, String)> {
+fn json_from_result(result: crate::ffi::ZdxResult) -> ApiResult {
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let json_str = result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in result".to_string(),
-    ))?;
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
 
     let value = parse_json_value(json_str)?;
 
@@ -112,7 +127,7 @@ fn json_from_result(result: crate::ffi::ZdxResult) -> Result<Json<Value>, (Statu
 fn ensure_pool(
     state: &AppState,
     pool: &str,
-) -> Result<*mut crate::ffi::zdx_pool_t, (StatusCode, String)> {
+) -> Result<*mut crate::ffi::zdx_pool_t, ApiError> {
     let mut guard = state.pool.lock().unwrap();
 
     if let Some(existing) = guard.as_ref() {
@@ -127,7 +142,7 @@ fn ensure_pool(
 
     let handle = crate::ffi::pool_open(pool).map_err(|(_code, msg)| {
         tracing::error!("Failed to open pool {}: {}", pool, msg);
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
 
     let ptr = handle.ptr;
@@ -140,7 +155,7 @@ pub async fn mos_list_objects(
     State(state): State<AppState>,
     Path(pool): Path<String>,
     Query(params): Query<MosListQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
 
     let type_filter = params.type_filter.unwrap_or(-1);
@@ -155,7 +170,7 @@ pub async fn mos_list_objects(
 pub async fn mos_get_object(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::mos_get_object(pool_ptr, objid);
     json_from_result(result)
@@ -165,7 +180,7 @@ pub async fn mos_get_object(
 pub async fn mos_get_blkptrs(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::mos_get_blkptrs(pool_ptr, objid);
     json_from_result(result)
@@ -175,14 +190,14 @@ pub async fn mos_get_blkptrs(
 pub async fn obj_get_full(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::obj_get(pool_ptr, objid);
     json_from_result(result)
 }
 
 /// GET /api/mos/types
-pub async fn list_dmu_types() -> Result<Json<Value>, (StatusCode, String)> {
+pub async fn list_dmu_types() -> ApiResult {
     let result = crate::ffi::list_dmu_types();
     json_from_result(result)
 }
@@ -197,7 +212,7 @@ pub struct ZapEntriesQuery {
 pub async fn zap_info(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::zap_info(pool_ptr, objid);
     json_from_result(result)
@@ -208,7 +223,7 @@ pub async fn zap_entries(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
     Query(params): Query<ZapEntriesQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
     let result = crate::ffi::zap_entries(pool_ptr, objid, cursor, limit);
@@ -219,7 +234,7 @@ pub async fn zap_entries(
 pub async fn dsl_dir_children(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::dsl_dir_children(pool_ptr, objid);
     json_from_result(result)
@@ -229,7 +244,7 @@ pub async fn dsl_dir_children(
 pub async fn dsl_dir_head(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::dsl_dir_head(pool_ptr, objid);
     json_from_result(result)
@@ -239,7 +254,7 @@ pub async fn dsl_dir_head(
 pub async fn dsl_root_dir(
     State(state): State<AppState>,
     Path(pool): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::dsl_root_dir(pool_ptr);
     json_from_result(result)
@@ -258,11 +273,11 @@ pub async fn read_block(
     State(state): State<AppState>,
     Path(pool): Path<String>,
     Query(params): Query<BlockQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
 
     if params.asize == 0 {
-        return Err((StatusCode::BAD_REQUEST, "asize must be > 0".to_string()));
+        return Err(api_error(StatusCode::BAD_REQUEST, "asize must be > 0"));
     }
 
     let max_read: u64 = 1 << 20;
@@ -277,21 +292,14 @@ pub async fn read_block(
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let json_str = result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in result".to_string(),
-    ))?;
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
 
-    let mut value: Value = serde_json::from_str(json_str).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let mut value = parse_json_value(json_str)?;
 
     value["asize"] = Value::from(params.asize);
     value["truncated"] = Value::from(size < params.asize);
@@ -311,7 +319,7 @@ pub async fn dataset_tree(
     State(state): State<AppState>,
     Path(pool): Path<String>,
     Query(params): Query<DatasetTreeQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let max_depth = params.depth.unwrap_or(4);
     let limit = params.limit.unwrap_or(500);
@@ -320,26 +328,16 @@ pub async fn dataset_tree(
     if !root_result.is_ok() {
         let err_msg = root_result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let root_json = root_result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in result".to_string(),
-    ))?;
-
-    let root_value: Value = serde_json::from_str(root_json).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
-
-    let root_dir = root_value["root_dir_obj"].as_u64().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "root_dir_obj missing".to_string(),
-    ))?;
+    let root_json = root_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let root_value = parse_json_value(root_json)?;
+    let root_dir = root_value["root_dir_obj"]
+        .as_u64()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "root_dir_obj missing"))?;
 
     let mut seen = 0usize;
     let mut truncated = false;
@@ -352,7 +350,7 @@ pub async fn dataset_tree(
         seen: &mut usize,
         limit: usize,
         truncated: &mut bool,
-    ) -> Result<Value, (StatusCode, String)> {
+    ) -> Result<Value, ApiError> {
         if *seen >= limit {
             *truncated = true;
             return Ok(serde_json::json!({
@@ -369,62 +367,41 @@ pub async fn dataset_tree(
         if !head_result.is_ok() {
             let err_msg = head_result.error_msg().unwrap_or("Unknown error");
             tracing::error!("FFI error: {}", err_msg);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
         }
-        let head_json = head_result.json().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Missing JSON in head result".to_string(),
-        ))?;
-        let head_value: Value = serde_json::from_str(head_json).map_err(|e| {
-            tracing::error!("Failed to parse JSON: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("JSON parse error: {}", e),
-            )
-        })?;
+        let head_json = head_result
+            .json()
+            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in head result"))?;
+        let head_value = parse_json_value(head_json)?;
         let head_dataset_obj = head_value["head_dataset_obj"].as_u64();
 
         let children_result = crate::ffi::dsl_dir_children(pool_ptr, objid);
         if !children_result.is_ok() {
             let err_msg = children_result.error_msg().unwrap_or("Unknown error");
             tracing::error!("FFI error: {}", err_msg);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
         }
-        let children_json = children_result.json().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Missing JSON in children result".to_string(),
-        ))?;
-        let children_value: Value = serde_json::from_str(children_json).map_err(|e| {
-            tracing::error!("Failed to parse JSON: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("JSON parse error: {}", e),
-            )
-        })?;
+        let children_json = children_result
+            .json()
+            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in children result"))?;
+        let children_value = parse_json_value(children_json)?;
         let child_dir_zapobj = children_value["child_dir_zapobj"].as_u64();
 
         let mut children_nodes: Vec<Value> = Vec::new();
         if depth > 0 {
-            if let Some(children) = children_value["children"].as_array() {
-                for child in children {
-                    let child_name = child["name"].as_str().unwrap_or("dataset").to_string();
-                    let child_objid = child["dir_objid"].as_u64().unwrap_or(0);
-                    if child_objid == 0 {
-                        continue;
-                    }
-                    let node = build_node(
-                        pool_ptr,
-                        child_name,
-                        child_objid,
-                        depth - 1,
-                        seen,
-                        limit,
-                        truncated,
-                    )?;
-                    children_nodes.push(node);
-                    if *truncated {
-                        break;
-                    }
+            for (child_name, child_objid) in parse_dsl_children(&children_value) {
+                let node = build_node(
+                    pool_ptr,
+                    child_name,
+                    child_objid,
+                    depth - 1,
+                    seen,
+                    limit,
+                    truncated,
+                )?;
+                children_nodes.push(node);
+                if *truncated {
+                    break;
                 }
             }
         }
@@ -463,7 +440,7 @@ pub async fn dataset_tree(
 pub async fn dataset_head(
     State(state): State<AppState>,
     Path((pool, dir_obj)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let response = resolve_dataset_objset(pool_ptr, dir_obj)?;
     Ok(Json(response))
@@ -473,7 +450,7 @@ pub async fn dataset_head(
 pub async fn dataset_objset(
     State(state): State<AppState>,
     Path((pool, dir_obj)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let response = resolve_dataset_objset(pool_ptr, dir_obj)?;
     Ok(Json(response))
@@ -482,31 +459,24 @@ pub async fn dataset_objset(
 fn resolve_dataset_objset(
     pool_ptr: *mut crate::ffi::zdx_pool_t,
     dir_obj: u64,
-) -> Result<Value, (StatusCode, String)> {
+) -> Result<Value, ApiError> {
     let head_result = crate::ffi::dsl_dir_head(pool_ptr, dir_obj);
     if !head_result.is_ok() {
         let err_msg = head_result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let head_json = head_result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in head result".to_string(),
-    ))?;
-    let head_value: Value = serde_json::from_str(head_json).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let head_json = head_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in head result"))?;
+    let head_value = parse_json_value(head_json)?;
 
     let head_obj = head_value["head_dataset_obj"].as_u64().unwrap_or(0);
     if head_obj == 0 {
-        return Err((
+        return Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "head_dataset_obj missing".to_string(),
+            "head_dataset_obj missing",
         ));
     }
 
@@ -514,20 +484,13 @@ fn resolve_dataset_objset(
     if !objset_result.is_ok() {
         let err_msg = objset_result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let objset_json = objset_result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in objset result".to_string(),
-    ))?;
-    let objset_value: Value = serde_json::from_str(objset_json).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let objset_json = objset_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in objset result"))?;
+    let objset_value = parse_json_value(objset_json)?;
 
     let response = build_dataset_objset_response(dir_obj, head_obj, &objset_value);
 
@@ -538,28 +501,20 @@ fn resolve_dataset_objset(
 pub async fn objset_root(
     State(state): State<AppState>,
     Path((pool, objset_id)): Path<(String, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
 
     let result = crate::ffi::objset_root(pool_ptr, objset_id);
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let json_str = result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in result".to_string(),
-    ))?;
-
-    let value: Value = serde_json::from_str(json_str).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
 
     Ok(Json(value))
 }
@@ -580,7 +535,7 @@ pub async fn objset_dir_entries(
     State(state): State<AppState>,
     Path((pool, objset_id, dir_obj)): Path<(String, u64, u64)>,
     Query(params): Query<DirEntriesQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
     let result = crate::ffi::objset_dir_entries(pool_ptr, objset_id, dir_obj, cursor, limit);
@@ -592,11 +547,11 @@ pub async fn objset_walk(
     State(state): State<AppState>,
     Path((pool, objset_id)): Path<(String, u64)>,
     Query(params): Query<WalkQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let path = params.path.unwrap_or_else(|| "/".to_string());
     let result = crate::ffi::objset_walk(pool_ptr, objset_id, &path)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     json_from_result(result)
 }
 
@@ -604,7 +559,7 @@ pub async fn objset_walk(
 pub async fn objset_stat(
     State(state): State<AppState>,
     Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::objset_stat(pool_ptr, objset_id, objid);
     json_from_result(result)
@@ -621,7 +576,7 @@ pub async fn graph_from(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
     Query(params): Query<GraphQuery>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
     let include = params.include.unwrap_or_else(|| "semantic,physical".to_string());
     let _depth = params.depth.unwrap_or(1);
@@ -631,21 +586,13 @@ pub async fn graph_from(
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         tracing::error!("FFI error: {}", err_msg);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
+        return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, err_msg.to_string()));
     }
 
-    let json_str = result.json().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Missing JSON in result".to_string(),
-    ))?;
-
-    let value: Value = serde_json::from_str(json_str).map_err(|e| {
-        tracing::error!("Failed to parse JSON: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("JSON parse error: {}", e),
-        )
-    })?;
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
 
     let object = &value["object"];
     let source_obj = object["id"].as_u64().unwrap_or(objid);
@@ -758,7 +705,20 @@ mod tests {
     fn parse_json_value_maps_errors_to_http_500() {
         let err = parse_json_value("{bad json").unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.1.starts_with("JSON parse error:"));
+        let msg = err
+            .1
+            .0
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(msg.starts_with("JSON parse error:"));
+    }
+
+    #[test]
+    fn api_error_returns_json_envelope() {
+        let err = api_error(StatusCode::BAD_REQUEST, "boom");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.0["error"], "boom");
     }
 
     #[test]
@@ -778,5 +738,30 @@ mod tests {
         assert_eq!(payload["head_dataset_obj"], 54);
         assert_eq!(payload["objset_id"], 54);
         assert_eq!(payload["rootbp"]["ndvas"], 2);
+    }
+
+    #[test]
+    fn parse_dsl_children_handles_missing_and_invalid_entries() {
+        let payload = json!({
+            "children": [
+                { "name": "local", "dir_objid": 3 },
+                { "name": "bad-zero", "dir_objid": 0 },
+                { "name": "bad-type", "dir_objid": "oops" },
+                { "dir_objid": 7 }
+            ]
+        });
+
+        let parsed = parse_dsl_children(&payload);
+        assert_eq!(
+            parsed,
+            vec![("local".to_string(), 3), ("dataset".to_string(), 7)]
+        );
+    }
+
+    #[test]
+    fn parse_dsl_children_returns_empty_for_missing_children() {
+        let payload = json!({ "not_children": [] });
+        let parsed = parse_dsl_children(&payload);
+        assert!(parsed.is_empty());
     }
 }

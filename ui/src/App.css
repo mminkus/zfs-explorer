@@ -689,7 +689,16 @@ footer code {
 .fs-actions {
   margin-top: 0.6rem;
   display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.fs-actions .muted {
+  min-width: 0;
+  flex: 1 1 140px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .fs-action-btn {
@@ -1711,6 +1720,10 @@ footer code {
   padding: 0.3rem 0.6rem;
   border-radius: 999px;
   font-size: 0.75rem;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
   cursor: pointer;
 }
 
@@ -1732,6 +1745,7 @@ footer code {
 }
 
 .info-grid div {
+  min-width: 0;
   background: rgba(0, 0, 0, 0.25);
   border-radius: 10px;
   padding: 0.5rem 0.6rem;
@@ -1747,6 +1761,7 @@ footer code {
 }
 
 .info-grid dd {
+  min-width: 0;
   margin: 0;
   font-family: var(--mono);
   font-size: 0.85rem;

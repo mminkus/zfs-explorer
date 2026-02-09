@@ -14,6 +14,40 @@ import type {
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
 
+type ApiErrorPayload = {
+  error?: string
+}
+
+const parseApiErrorMessage = async (response: Response): Promise<string | null> => {
+  const fallback = response.statusText || 'Request failed'
+  try {
+    const text = await response.text()
+    if (!text.trim()) {
+      return fallback
+    }
+    try {
+      const parsed = JSON.parse(text) as ApiErrorPayload
+      if (typeof parsed?.error === 'string' && parsed.error.trim()) {
+        return parsed.error
+      }
+    } catch {
+      // Not JSON; fall through to raw text.
+    }
+    return text.trim()
+  } catch {
+    return fallback
+  }
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const response = await fetch(url)
+  if (!response.ok) {
+    const message = await parseApiErrorMessage(response)
+    throw new Error(`HTTP ${response.status}: ${message ?? response.statusText}`)
+  }
+  return (await response.json()) as T
+}
+
 type DmuType = {
   id: number
   name: string
@@ -243,6 +277,20 @@ type BonusDecodedDslDataset = {
   prev_snap_obj: number
   next_snap_obj: number
   snapnames_zapobj: number
+  deadlist_obj: number
+  next_clones_obj: number
+  props_obj: number
+  userrefs_obj: number
+  num_children: number
+  creation_time: number
+  creation_txg: number
+  referenced_bytes: number
+  compressed_bytes: number
+  uncompressed_bytes: number
+  unique_bytes: number
+  fsid_guid: number
+  guid: number
+  flags: number
 }
 
 type BonusDecoded = BonusDecodedDslDir | BonusDecodedDslDataset | { kind: string }
@@ -404,6 +452,19 @@ function App() {
       null
     )
   }, [datasetIndex, selectedObject])
+
+  const dslDatasetBonus = useMemo(() => {
+    const bonus = objectInfo?.bonus_decoded
+    if (!bonus || !('kind' in bonus) || bonus.kind !== 'dsl_dataset') {
+      return null
+    }
+    return bonus as BonusDecodedDslDataset
+  }, [objectInfo?.bonus_decoded])
+
+  const dslDatasetNode = useMemo(() => {
+    if (!dslDatasetBonus) return null
+    return datasetIndex.nodeById.get(dslDatasetBonus.dir_obj) ?? null
+  }, [datasetIndex.nodeById, dslDatasetBonus])
 
   const filteredFsEntries = useMemo(() => {
     const term = fsSearch.trim().toLowerCase()
@@ -739,19 +800,13 @@ function App() {
     (isFsTab && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1)
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/pools`)
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}: ${res.statusText}`)
-        }
-        return res.json()
-      })
+    fetchJson<string[]>(`${API_BASE}/api/pools`)
       .then(data => {
         setPools(data)
         setLoading(false)
       })
       .catch(err => {
-        setError(err.message)
+        setError((err as Error).message)
         setLoading(false)
       })
   }, [])
@@ -819,18 +874,12 @@ function App() {
   }
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/mos/types`)
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}: ${res.statusText}`)
-        }
-        return res.json()
-      })
-      .then((data: DmuType[]) => {
+    fetchJson<DmuType[]>(`${API_BASE}/api/mos/types`)
+      .then(data => {
         setDmuTypes(data)
       })
       .catch(err => {
-        setTypesError(err.message)
+        setTypesError((err as Error).message)
       })
   }, [])
 
@@ -847,13 +896,9 @@ function App() {
       const params = new URLSearchParams()
       params.set('depth', '4')
       params.set('limit', '500')
-      const res = await fetch(
+      const data = await fetchJson<DatasetTreeResponse>(
         `${API_BASE}/api/pools/${encodeURIComponent(pool)}/datasets/tree?${params.toString()}`
       )
-      if (!res.ok) {
-        throw new Error(`Dataset tree HTTP ${res.status}`)
-      }
-      const data: DatasetTreeResponse = await res.json()
       setDatasetTree(data)
       setDatasetExpanded({ [data.root.dsl_dir_obj]: true })
     } catch (err) {
@@ -865,11 +910,9 @@ function App() {
 
   const fetchDatasetCatalog = async (pool: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/pools/${encodeURIComponent(pool)}/datasets`)
-      if (!res.ok) {
-        throw new Error(`Dataset list HTTP ${res.status}`)
-      }
-      const data = (await res.json()) as DatasetCatalogEntry[]
+      const data = await fetchJson<DatasetCatalogEntry[]>(
+        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/datasets`
+      )
       const next: Record<string, DatasetCatalogEntry> = {}
       data.forEach(entry => {
         next[entry.name] = entry
@@ -986,16 +1029,15 @@ function App() {
     for (const part of parts) {
       currentPath += `/${part}`
       try {
-        const res = await fetch(
+        const data = await fetchJson<{
+          found?: boolean
+          objid?: number
+          type_name?: string
+        }>(
           `${API_BASE}/api/pools/${encodeURIComponent(
             selectedPool
           )}/objset/${objsetId}/walk?path=${encodeURIComponent(currentPath)}`
         )
-        if (!res.ok) {
-          segments.push({ name: part, objid: 0, kind: 'dir' })
-          continue
-        }
-        const data = await res.json()
         if (!data.found) {
           segments.push({ name: part, objid: 0, kind: 'dir' })
           continue
@@ -1020,15 +1062,11 @@ function App() {
     setFsStatLoading(true)
     setFsStatError(null)
     try {
-      const res = await fetch(
+      const data = await fetchJson<FsStat>(
         `${API_BASE}/api/pools/${encodeURIComponent(
           selectedPool
         )}/objset/${objsetId}/stat/${objid}`
       )
-      if (!res.ok) {
-        throw new Error(`FS stat HTTP ${res.status}`)
-      }
-      const data: FsStat = await res.json()
       if (fsStatKey.current !== key) return
       setFsStat(data)
     } catch (err) {
@@ -1057,15 +1095,11 @@ function App() {
         const entry = queue.shift()
         if (!entry) break
         try {
-          const res = await fetch(
+          const data = await fetchJson<FsStat>(
             `${API_BASE}/api/pools/${encodeURIComponent(
               pool
             )}/objset/${objsetId}/stat/${entry.objid}`
           )
-          if (!res.ok) {
-            continue
-          }
-          const data: FsStat = await res.json()
           stats[entry.objid] = data
         } catch {
           // ignore per-entry errors
@@ -1103,15 +1137,18 @@ function App() {
     setFsPathLoading(true)
     setFsPathError(null)
     try {
-      const res = await fetch(
+      const data = await fetchJson<{
+        found?: boolean
+        error?: string
+        remaining?: string
+        resolved?: string
+        objid?: number
+        type_name?: string
+      }>(
         `${API_BASE}/api/pools/${encodeURIComponent(
           selectedPool
         )}/objset/${fsState.objsetId}/walk?path=${encodeURIComponent(normalized)}`
       )
-      if (!res.ok) {
-        throw new Error(`FS walk HTTP ${res.status}`)
-      }
-      const data = await res.json()
       if (!data.found) {
         const remaining = data.remaining ?? ''
         const message =
@@ -1194,15 +1231,11 @@ function App() {
       const params = new URLSearchParams()
       params.set('cursor', '0')
       params.set('limit', '500')
-      const res = await fetch(
+      const data = await fetchJson<FsDirResponse>(
         `${API_BASE}/api/pools/${encodeURIComponent(
           selectedPool
         )}/objset/${objsetId}/dir/${dirObj}/entries?${params.toString()}`
       )
-      if (!res.ok) {
-        throw new Error(`FS entries HTTP ${res.status}`)
-      }
-      const data: FsDirResponse = await res.json()
       setFsEntries(data.entries ?? [])
       setFsEntryStats({})
       setFsEntryStatsError(null)
@@ -1330,30 +1363,25 @@ function App() {
     setFsHistory([])
     setFsHistoryIndex(-1)
     try {
-      const headRes = await fetch(
+      const headData = await fetchJson<{
+        objset_id?: number
+        head_dataset_obj?: number
+      }>(
         `${API_BASE}/api/pools/${encodeURIComponent(
           selectedPool
         )}/dataset/${node.dsl_dir_obj}/head`
       )
-      if (!headRes.ok) {
-        throw new Error(`Dataset head HTTP ${headRes.status}`)
-      }
-      const headData = await headRes.json()
       const objsetId = Number(headData.objset_id)
       const headDatasetObj = Number(headData.head_dataset_obj)
       if (!objsetId) {
         throw new Error('Missing objset_id from dataset head')
       }
 
-      const rootRes = await fetch(
+      const rootData = await fetchJson<{ root_obj?: number }>(
         `${API_BASE}/api/pools/${encodeURIComponent(
           selectedPool
         )}/objset/${objsetId}/root`
       )
-      if (!rootRes.ok) {
-        throw new Error(`Objset root HTTP ${rootRes.status}`)
-      }
-      const rootData = await rootRes.json()
       const rootObj = Number(rootData.root_obj)
       if (!rootObj) {
         throw new Error('Missing root_obj from objset root')
@@ -1409,13 +1437,9 @@ function App() {
     }
 
     try {
-      const res = await fetch(
+      const data = await fetchJson<MosListResponse>(
         `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/mos/objects?${params.toString()}`
       )
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`)
-      }
-      const data: MosListResponse = await res.json()
       setMosObjects(prev => (append ? [...prev, ...data.objects] : data.objects))
       setMosNext(data.next)
     } catch (err) {
@@ -1476,13 +1500,9 @@ function App() {
 
   const fetchZapInfo = async (objid: number) => {
     if (!selectedPool) return
-    const res = await fetch(
+    const data = await fetchJson<ZapInfo>(
       `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/zap/info`
     )
-    if (!res.ok) {
-      throw new Error(`ZAP info HTTP ${res.status}`)
-    }
-    const data: ZapInfo = await res.json()
     setZapInfo(data)
   }
 
@@ -1494,13 +1514,9 @@ function App() {
       const params = new URLSearchParams()
       params.set('cursor', String(cursor))
       params.set('limit', '200')
-      const res = await fetch(
+      const data = await fetchJson<ZapResponse>(
         `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/zap?${params.toString()}`
       )
-      if (!res.ok) {
-        throw new Error(`ZAP entries HTTP ${res.status}`)
-      }
-      const data: ZapResponse = await res.json()
       setZapEntries(prev => (append ? [...prev, ...data.entries] : data.entries))
       setZapNext(data.next)
     } catch (err) {
@@ -1529,22 +1545,14 @@ function App() {
     setZapNext(null)
     setZapError(null)
     try {
-      const infoRes = await fetch(
-        `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}`
-      )
-      const blkptrRes = await fetch(
-        `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/blkptrs`
-      )
-
-      if (!infoRes.ok) {
-        throw new Error(`Object info HTTP ${infoRes.status}`)
-      }
-      if (!blkptrRes.ok) {
-        throw new Error(`Blkptrs HTTP ${blkptrRes.status}`)
-      }
-
-      const infoData: DnodeInfo = await infoRes.json()
-      const blkData: BlkptrResponse = await blkptrRes.json()
+      const [infoData, blkData] = await Promise.all([
+        fetchJson<DnodeInfo>(
+          `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}`
+        ),
+        fetchJson<BlkptrResponse>(
+          `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/blkptrs`
+        ),
+      ])
       setObjectInfo(infoData)
       setBlkptrs(blkData)
 
@@ -1697,13 +1705,9 @@ function App() {
     params.set('asize', String(dva.asize))
     params.set('limit', String(limit))
 
-    fetch(`${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/block?${params}`)
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`Raw block HTTP ${res.status}`)
-        }
-        return res.json()
-      })
+    fetchJson<RawBlockResponse>(
+      `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/block?${params}`
+    )
       .then((data: RawBlockResponse) => {
         setHexDump(data)
       })
@@ -1746,13 +1750,9 @@ function App() {
     try {
       const results = await Promise.all(
         frontier.map(async objid => {
-          const res = await fetch(
+          return fetchJson<GraphResponse>(
             `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/graph/from/${objid}?include=semantic,zap`
           )
-          if (!res.ok) {
-            throw new Error(`Graph expand HTTP ${res.status}`)
-          }
-          return (await res.json()) as GraphResponse
         })
       )
 
@@ -1822,13 +1822,7 @@ function App() {
       ]
     }
     if (bonus.kind === 'dsl_dataset') {
-      const b = bonus as BonusDecodedDslDataset
-      return [
-        { key: 'dir_obj', value: b.dir_obj, isRef: true },
-        { key: 'prev_snap_obj', value: b.prev_snap_obj, isRef: true },
-        { key: 'next_snap_obj', value: b.next_snap_obj, isRef: true },
-        { key: 'snapnames_zapobj', value: b.snapnames_zapobj, isRef: true },
-      ]
+      return []
     }
 
     return Object.entries(bonus).map(([key, value]) => ({
@@ -2880,6 +2874,190 @@ function App() {
                             Open in FS
                           </button>
                         </div>
+                      </div>
+                    )}
+
+                    {dslDatasetBonus && (
+                      <div className="inspector-section">
+                        <h3>DSL Dataset</h3>
+                        <dl className="info-grid">
+                          <div>
+                            <dt>Dir Obj</dt>
+                            <dd>
+                              {dslDatasetBonus.dir_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.dir_obj)}
+                                >
+                                  Object {dslDatasetBonus.dir_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Prev Snap</dt>
+                            <dd>
+                              {dslDatasetBonus.prev_snap_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.prev_snap_obj)}
+                                >
+                                  Object {dslDatasetBonus.prev_snap_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Next Snap</dt>
+                            <dd>
+                              {dslDatasetBonus.next_snap_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.next_snap_obj)}
+                                >
+                                  Object {dslDatasetBonus.next_snap_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Snapnames ZAP</dt>
+                            <dd>
+                              {dslDatasetBonus.snapnames_zapobj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.snapnames_zapobj)}
+                                >
+                                  Object {dslDatasetBonus.snapnames_zapobj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Deadlist Obj</dt>
+                            <dd>
+                              {dslDatasetBonus.deadlist_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.deadlist_obj)}
+                                >
+                                  Object {dslDatasetBonus.deadlist_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Props Obj</dt>
+                            <dd>
+                              {dslDatasetBonus.props_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.props_obj)}
+                                >
+                                  Object {dslDatasetBonus.props_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Userrefs Obj</dt>
+                            <dd>
+                              {dslDatasetBonus.userrefs_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.userrefs_obj)}
+                                >
+                                  Object {dslDatasetBonus.userrefs_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Next Clones Obj</dt>
+                            <dd>
+                              {dslDatasetBonus.next_clones_obj !== 0 ? (
+                                <button
+                                  className="zap-entry-link"
+                                  onClick={() => navigateTo(dslDatasetBonus.next_clones_obj)}
+                                >
+                                  Object {dslDatasetBonus.next_clones_obj}
+                                </button>
+                              ) : (
+                                <code>0</code>
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Children</dt>
+                            <dd>{dslDatasetBonus.num_children}</dd>
+                          </div>
+                          <div>
+                            <dt>Creation TXG</dt>
+                            <dd>{dslDatasetBonus.creation_txg}</dd>
+                          </div>
+                          <div>
+                            <dt>Creation Time</dt>
+                            <dd>{new Date(dslDatasetBonus.creation_time * 1000).toLocaleString()}</dd>
+                          </div>
+                          <div>
+                            <dt>Referenced</dt>
+                            <dd>{dslDatasetBonus.referenced_bytes} B</dd>
+                          </div>
+                          <div>
+                            <dt>Compressed</dt>
+                            <dd>{dslDatasetBonus.compressed_bytes} B</dd>
+                          </div>
+                          <div>
+                            <dt>Uncompressed</dt>
+                            <dd>{dslDatasetBonus.uncompressed_bytes} B</dd>
+                          </div>
+                          <div>
+                            <dt>Unique</dt>
+                            <dd>{dslDatasetBonus.unique_bytes} B</dd>
+                          </div>
+                          <div>
+                            <dt>FSID GUID</dt>
+                            <dd>{dslDatasetBonus.fsid_guid}</dd>
+                          </div>
+                          <div>
+                            <dt>GUID</dt>
+                            <dd>{dslDatasetBonus.guid}</dd>
+                          </div>
+                          <div>
+                            <dt>Flags</dt>
+                            <dd>{dslDatasetBonus.flags}</dd>
+                          </div>
+                        </dl>
+
+                        {dslDatasetNode && (
+                          <div className="fs-actions">
+                            <span className="muted">
+                              {datasetIndex.fullNameById.get(dslDatasetNode.dsl_dir_obj) ??
+                                dslDatasetNode.name}
+                            </span>
+                            <button
+                              type="button"
+                              className="fs-action-btn"
+                              onClick={() => enterFsFromDataset(dslDatasetNode)}
+                            >
+                              Open Dataset in FS
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )}
 

@@ -184,6 +184,12 @@ npm install
 - Access via SSH tunnel for remote use
 - Requires root privileges (or ZFS capabilities) to access pools
 
+## Validation Checklist
+
+For repeatable milestone/release verification, use:
+
+- `docs/VALIDATION_CHECKLIST.md`
+
 ## Next Steps
 
 - Finish FS navigation + graph integration
