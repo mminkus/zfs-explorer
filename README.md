@@ -300,8 +300,8 @@ Build a portable backend bundle (binary + required shared libraries):
 
 Output:
 
-- Bundle directory: `dist/zfs-explorer-<profile>-linux-<arch>/`
-- Tarball: `dist/zfs-explorer-<profile>-linux-<arch>.tar.gz`
+- Bundle directory: `dist/zfs-explorer-<profile>-<os>-<arch>/`
+- Tarball: `dist/zfs-explorer-<profile>-<os>-<arch>.tar.gz`
 
 Run backend from the bundle with:
 
@@ -320,12 +320,14 @@ Typical remote-host flow:
 ```bash
 # on build machine
 ./build/package.sh --profile release
-rsync -av dist/zfs-explorer-release-linux-$(uname -m).tar.gz USER@HOST:/tmp/
+OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+rsync -av dist/zfs-explorer-release-${OS_NAME}-$(uname -m).tar.gz USER@HOST:/tmp/
 
 # on target host
 cd /opt
-sudo tar -xzf /tmp/zfs-explorer-release-linux-$(uname -m).tar.gz
-cd zfs-explorer-release-linux-$(uname -m)
+OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+sudo tar -xzf /tmp/zfs-explorer-release-${OS_NAME}-$(uname -m).tar.gz
+cd zfs-explorer-release-${OS_NAME}-$(uname -m)
 sudo ./run-backend.sh
 ```
 
@@ -354,6 +356,13 @@ This project is intended for inspection and debugging, not mutation.
 Known caveats and expected failure modes are tracked in:
 
 - `docs/KNOWN_LIMITATIONS.md`
+
+## Portability Roadmap
+
+FreeBSD portability is tracked as an explicit milestone. Current audit and
+abstraction plan:
+
+- `docs/PORTABILITY_FREEBSD.md`
 
 ## Logging and Debug Info
 
@@ -385,6 +394,7 @@ The Inspector also provides a `Copy debug` action that copies backend version/ru
 For repeatable milestone/release verification, use:
 
 - `docs/VALIDATION_CHECKLIST.md`
+- `docs/SCREENSHOTS.md`
 
 ## Next Steps
 

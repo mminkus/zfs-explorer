@@ -596,6 +596,8 @@ function App() {
   const [poolErrorsLoading, setPoolErrorsLoading] = useState(false)
   const [poolErrorsError, setPoolErrorsError] = useState<string | null>(null)
   const [poolErrorsResolvePaths, setPoolErrorsResolvePaths] = useState(true)
+  const [poolErrorsCursorInput, setPoolErrorsCursorInput] = useState('0')
+  const [poolErrorsLimit, setPoolErrorsLimit] = useState(200)
   const [poolDetailsOpen, setPoolDetailsOpen] = useState(false)
   const [poolTreeExpanded, setPoolTreeExpanded] = useState<Record<string, boolean>>({
     root: true,
@@ -652,8 +654,9 @@ function App() {
     const nodeById = new Map<number, DatasetTreeNode>()
     const fullNameById = new Map<number, string>()
     const childZapToNode = new Map<number, DatasetTreeNode>()
+    const nodeByHeadDatasetObj = new Map<number, DatasetTreeNode>()
     if (!datasetTree) {
-      return { nodeById, fullNameById, childZapToNode }
+      return { nodeById, fullNameById, childZapToNode, nodeByHeadDatasetObj }
     }
 
     const walk = (node: DatasetTreeNode, prefix: string) => {
@@ -663,11 +666,14 @@ function App() {
       if (node.child_dir_zapobj) {
         childZapToNode.set(node.child_dir_zapobj, node)
       }
+      if (node.head_dataset_obj) {
+        nodeByHeadDatasetObj.set(node.head_dataset_obj, node)
+      }
       node.children?.forEach(child => walk(child, fullName))
     }
 
     walk(datasetTree.root, '')
-    return { nodeById, fullNameById, childZapToNode }
+    return { nodeById, fullNameById, childZapToNode, nodeByHeadDatasetObj }
   }, [datasetTree])
 
   const datasetForMos = useMemo(() => {
@@ -1205,7 +1211,8 @@ function App() {
     pool: string,
     cursor = 0,
     append = false,
-    resolvePaths = poolErrorsResolvePaths
+    resolvePaths = poolErrorsResolvePaths,
+    limit = poolErrorsLimit
   ) => {
     setPoolErrorsLoading(true)
     if (!append) {
@@ -1213,9 +1220,12 @@ function App() {
     }
 
     try {
+      const normalizedLimit = Number.isFinite(limit)
+        ? Math.max(1, Math.floor(limit))
+        : 200
       const params = new URLSearchParams()
       params.set('cursor', String(cursor))
-      params.set('limit', '200')
+      params.set('limit', String(normalizedLimit))
       params.set('resolve_paths', resolvePaths ? 'true' : 'false')
 
       const data = await fetchJson<PoolErrorsResponse>(
@@ -1235,6 +1245,7 @@ function App() {
         })
       } else {
         setPoolErrors(data)
+        setPoolErrorsCursorInput(String(data.cursor))
       }
     } catch (err) {
       setPoolErrorsError((err as Error).message)
@@ -1248,6 +1259,16 @@ function App() {
 
   const toggleDatasetNode = (dirObj: number) => {
     setDatasetExpanded(prev => ({ ...prev, [dirObj]: !prev[dirObj] }))
+  }
+
+  const handlePoolErrorsJump = () => {
+    if (!selectedPool) return
+    const parsed = Number.parseInt(poolErrorsCursorInput.trim(), 10)
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      setPoolErrorsError('Cursor must be a non-negative integer.')
+      return
+    }
+    fetchPoolErrors(selectedPool, parsed, false, poolErrorsResolvePaths, poolErrorsLimit)
   }
 
   const handlePoolSelect = (pool: string) => {
@@ -1300,7 +1321,7 @@ function App() {
       >
         <div className={`dsl-node ${depth > 0 ? 'dsl-node-child' : ''}`}>
           <button
-            className={`dsl-toggle ${hasChildren ? '' : 'leaf'}`}
+            className={`dsl-toggle ${hasChildren ? (expanded ? 'expanded' : 'collapsed') : 'leaf'}`}
             onClick={() => toggleDatasetNode(node.dsl_dir_obj)}
             disabled={!hasChildren}
             aria-label={
@@ -1312,7 +1333,15 @@ function App() {
             }
             title={hasChildren ? (expanded ? 'Collapse' : 'Expand') : 'Leaf'}
           >
-            {hasChildren ? (expanded ? '▾' : '▸') : '•'}
+            {hasChildren ? (
+              <span className="tree-toggle-glyph" aria-hidden>
+                ▸
+              </span>
+            ) : (
+              <span className="tree-toggle-leaf" aria-hidden>
+                •
+              </span>
+            )}
           </button>
           <button
             className="dsl-name"
@@ -1763,6 +1792,62 @@ function App() {
     enterFsFromDataset(datasetForMos)
   }
 
+  const resolveErrorDatasetNode = useCallback(
+    (entry: PoolErrorEntry) =>
+      datasetIndex.nodeByHeadDatasetObj.get(entry.dataset_obj) ??
+      datasetIndex.nodeById.get(entry.dataset_obj) ??
+      null,
+    [datasetIndex]
+  )
+
+  const openPoolErrorAsObject = useCallback(
+    (entry: PoolErrorEntry) => {
+      setLeftPaneTab('mos')
+      setInspectorTab('summary')
+      navigateTo(entry.object, { reset: true })
+    },
+    [navigateTo]
+  )
+
+  const openPoolErrorInFs = useCallback(
+    async (entry: PoolErrorEntry) => {
+      const node = resolveErrorDatasetNode(entry)
+      if (!node) return
+
+      await enterFsFromDataset(node)
+
+      if (!selectedPool) return
+      try {
+        const headData = await fetchJson<{ objset_id?: number }>(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/dataset/${node.dsl_dir_obj}/head`
+        )
+        const objsetId = Number(headData.objset_id)
+        if (!objsetId) return
+
+        const looksResolvedPath =
+          typeof entry.path === 'string' && entry.path.trim().startsWith('/')
+        const selectedName = looksResolvedPath
+          ? entry.path!.trim()
+          : `object #${entry.object}`
+
+        setFsSelected({
+          name: selectedName,
+          objid: entry.object,
+          type_name: 'unknown',
+        })
+        if (looksResolvedPath) {
+          setFsPathInput(entry.path!.trim())
+        }
+        fetchFsStat(objsetId, entry.object)
+      } catch (err) {
+        console.warn('Failed to preload filesystem stat from error entry:', err)
+      }
+    },
+    [enterFsFromDataset, fetchFsStat, resolveErrorDatasetNode, selectedPool]
+  )
+
   const typeOptions = useMemo(() => {
     return [...dmuTypes].sort((a, b) => a.name.localeCompare(b.name))
   }, [dmuTypes])
@@ -1826,6 +1911,7 @@ function App() {
         setPoolSummaryError(null)
         setPoolErrors(null)
         setPoolErrorsError(null)
+        setPoolErrorsCursorInput('0')
         setDatasetTree(null)
         setDatasetError(null)
         setDatasetCatalog({})
@@ -1869,7 +1955,7 @@ function App() {
 
         await Promise.all([
           fetchPoolSummary(activePool),
-          fetchPoolErrors(activePool, 0, false, poolErrorsResolvePaths),
+          fetchPoolErrors(activePool, 0, false, poolErrorsResolvePaths, poolErrorsLimit),
           fetchDatasetTree(activePool),
           fetchDatasetCatalog(activePool),
         ])
@@ -1905,6 +1991,7 @@ function App() {
       setPoolErrors(null)
       setPoolErrorsLoading(false)
       setPoolErrorsError(null)
+      setPoolErrorsCursorInput('0')
       setPoolDetailsOpen(false)
       setMosObjects([])
       setMosNext(null)
@@ -1958,8 +2045,8 @@ function App() {
     if (!selectedPool) {
       return
     }
-    fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths)
-  }, [selectedPool, poolErrorsResolvePaths])
+    fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths, poolErrorsLimit)
+  }, [selectedPool, poolErrorsResolvePaths, poolErrorsLimit])
 
   const fetchZapInfo = async (objid: number) => {
     if (!selectedPool) return
@@ -2390,7 +2477,7 @@ function App() {
         <div className={`pool-vdev-head ${depth > 0 ? 'pool-vdev-head-child' : ''}`}>
           <button
             type="button"
-            className={`pool-vdev-toggle ${hasChildren ? '' : 'leaf'}`}
+            className={`pool-vdev-toggle ${hasChildren ? (expanded ? 'expanded' : 'collapsed') : 'leaf'}`}
             onClick={() => togglePoolTreeNode(path)}
             disabled={!hasChildren}
             title={hasChildren ? (expanded ? 'Collapse children' : 'Expand children') : 'Leaf'}
@@ -2402,7 +2489,15 @@ function App() {
                 : `${typeName}${idText} is a leaf`
             }
           >
-            {hasChildren ? (expanded ? '▾' : '▸') : '•'}
+            {hasChildren ? (
+              <span className="tree-toggle-glyph" aria-hidden>
+                ▸
+              </span>
+            ) : (
+              <span className="tree-toggle-leaf" aria-hidden>
+                •
+              </span>
+            )}
           </button>
           <span className="pool-vdev-title">
             {typeName}
@@ -3003,11 +3098,67 @@ function App() {
                             />
                             Resolve paths
                           </label>
+                          <label className="pool-errors-limit">
+                            Limit
+                            <select
+                              value={poolErrorsLimit}
+                              onChange={e => setPoolErrorsLimit(Number(e.target.value))}
+                            >
+                              {[50, 100, 200, 500, 1000].map(size => (
+                                <option key={size} value={size}>
+                                  {size}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="pool-errors-cursor">
+                            Cursor
+                            <input
+                              type="number"
+                              min={0}
+                              step={1}
+                              value={poolErrorsCursorInput}
+                              onChange={e => setPoolErrorsCursorInput(e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault()
+                                  handlePoolErrorsJump()
+                                }
+                              }}
+                            />
+                          </label>
+                          <button
+                            className="graph-btn"
+                            type="button"
+                            onClick={handlePoolErrorsJump}
+                            disabled={poolErrorsLoading || !selectedPool}
+                          >
+                            Go
+                          </button>
+                          <button
+                            className="graph-btn"
+                            type="button"
+                            onClick={() => {
+                              setPoolErrorsCursorInput('0')
+                              if (selectedPool) {
+                                fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths, poolErrorsLimit)
+                              }
+                            }}
+                            disabled={poolErrorsLoading || !selectedPool}
+                          >
+                            First
+                          </button>
                           <button
                             className="graph-btn"
                             type="button"
                             onClick={() =>
-                              fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths)
+                              fetchPoolErrors(
+                                selectedPool,
+                                Number.parseInt(poolErrorsCursorInput, 10) || 0,
+                                false,
+                                poolErrorsResolvePaths,
+                                poolErrorsLimit
+                              )
                             }
                             disabled={poolErrorsLoading}
                           >
@@ -3022,6 +3173,17 @@ function App() {
                         </span>
                         <span>
                           Approx entries: <strong>{poolErrors?.approx_entries.toLocaleString() ?? '—'}</strong>
+                        </span>
+                        <span>
+                          Range:{' '}
+                          <strong>
+                            {poolErrors
+                              ? `${poolErrors.cursor.toLocaleString()}-${Math.max(
+                                  poolErrors.cursor,
+                                  poolErrors.cursor + Math.max(poolErrors.count - 1, 0)
+                                ).toLocaleString()}`
+                              : '—'}
+                          </strong>
                         </span>
                         <span>
                           Next cursor: <strong>{poolErrors?.next ?? 'none'}</strong>
@@ -3043,20 +3205,65 @@ function App() {
                             <span>Level</span>
                             <span>Blkid</span>
                             <span>Path</span>
+                            <span>Actions</span>
                           </div>
-                          {poolErrors.entries.map((entry, idx) => (
-                            <div
-                              key={`${entry.source}-${entry.dataset_obj}-${entry.object}-${entry.level}-${entry.blkid}-${idx}`}
-                              className="pool-errors-row"
-                            >
-                              <span>{entry.source}</span>
-                              <span>#{entry.dataset_obj}</span>
-                              <span>#{entry.object}</span>
-                              <span>{entry.level}</span>
-                              <span>{entry.blkid}</span>
-                              <span className="pool-errors-path">{entry.path ?? '(unresolved)'}</span>
-                            </div>
-                          ))}
+                          {poolErrors.entries.map((entry, idx) => {
+                            const datasetNode = resolveErrorDatasetNode(entry)
+                            const datasetName =
+                              datasetNode &&
+                              (datasetIndex.fullNameById.get(datasetNode.dsl_dir_obj) ??
+                                datasetNode.name)
+                            return (
+                              <div
+                                key={`${entry.source}-${entry.dataset_obj}-${entry.object}-${entry.level}-${entry.blkid}-${idx}`}
+                                className="pool-errors-row"
+                              >
+                                <span>{entry.source}</span>
+                                <span
+                                  title={
+                                    datasetName
+                                      ? `${datasetName} (objset ${entry.dataset_obj})`
+                                      : `objset ${entry.dataset_obj}`
+                                  }
+                                >
+                                  {datasetName
+                                    ? `${datasetName} #${entry.dataset_obj}`
+                                    : `#${entry.dataset_obj}`}
+                                </span>
+                                <span>#{entry.object}</span>
+                                <span>{entry.level}</span>
+                                <span>{entry.blkid}</span>
+                                <span className="pool-errors-path">
+                                  {entry.path ?? '(unresolved)'}
+                                </span>
+                                <span className="pool-errors-row-actions">
+                                  <button
+                                    className="pool-errors-action-btn"
+                                    type="button"
+                                    onClick={() => openPoolErrorAsObject(entry)}
+                                    title="Open object in MOS view"
+                                  >
+                                    MOS
+                                  </button>
+                                  <button
+                                    className="pool-errors-action-btn"
+                                    type="button"
+                                    onClick={() => {
+                                      void openPoolErrorInFs(entry)
+                                    }}
+                                    disabled={!datasetNode}
+                                    title={
+                                      datasetNode
+                                        ? 'Open dataset in filesystem view and inspect object'
+                                        : 'Dataset not available in dataset tree'
+                                    }
+                                  >
+                                    FS
+                                  </button>
+                                </span>
+                              </div>
+                            )
+                          })}
                         </div>
                       ) : (
                         !poolErrorsLoading && (
@@ -3072,7 +3279,8 @@ function App() {
                               selectedPool,
                               poolErrors?.next ?? 0,
                               true,
-                              poolErrorsResolvePaths
+                              poolErrorsResolvePaths,
+                              poolErrorsLimit
                             )
                           }
                           disabled={poolErrorsLoading}

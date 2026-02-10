@@ -21,13 +21,18 @@ fn git_short_sha() -> String {
 }
 
 fn main() {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "linux".to_string());
+
     // Get paths from environment or use defaults
     let libzdbdecode_path =
         env::var("LIBZDBDECODE_PATH").unwrap_or_else(|_| "../native".to_string());
     let zfs_prefix = env::var("ZFS_PREFIX").unwrap_or_else(|_| "../_deps/openzfs".to_string());
 
     println!("cargo:rerun-if-changed=../native/include/zdbdecode.h");
-    println!("cargo:rerun-if-changed=../native/libzdbdecode.so");
+    match target_os.as_str() {
+        "macos" => println!("cargo:rerun-if-changed=../native/libzdbdecode.dylib"),
+        _ => println!("cargo:rerun-if-changed=../native/libzdbdecode.so"),
+    }
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rustc-env=ZFS_EXPLORER_GIT_SHA={}", git_short_sha());
 
@@ -40,6 +45,14 @@ fn main() {
     println!("cargo:rustc-link-lib=zfs");
     println!("cargo:rustc-link-lib=zpool");
     println!("cargo:rustc-link-lib=nvpair");
+
+    // Dev/runtime convenience: resolve libs relative to backend/target/debug.
+    // This keeps `sudo ./backend/target/debug/zfs-explorer` working without
+    // manually exporting LD_LIBRARY_PATH.
+    if matches!(target_os.as_str(), "linux" | "freebsd") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../../native");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../../_deps/openzfs/lib");
+    }
 
     // Generate bindings
     let bindings = bindgen::Builder::default()

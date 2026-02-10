@@ -8,13 +8,21 @@ ZFS_PREFIX ?= ../_deps/openzfs
 # ZFS source - for headers
 ZFS_SRC ?= ../zfs
 
+# Select SPL OS include subtree (Linux default, FreeBSD override/auto-detect)
+UNAME_S := $(shell uname -s 2>/dev/null || echo Linux)
+ifeq ($(UNAME_S),FreeBSD)
+ZFS_OS ?= freebsd
+else
+ZFS_OS ?= linux
+endif
+
 # Get git SHA from ZFS repo
 ZDX_GIT_SHA := $(shell git -C $(ZFS_SRC) rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
 # Include paths - use source tree for headers, prefix for libs
 CPPFLAGS += -I$(ZFS_SRC)/include
 CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include
-CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include/os/linux
+CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include/os/$(ZFS_OS)
 CPPFLAGS += -I$(ZFS_SRC)/lib/libzpool/include
 CPPFLAGS += -Iinclude
 CPPFLAGS += -D_GNU_SOURCE

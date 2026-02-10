@@ -6,3 +6,10 @@ rustflags = [
   "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../native",
   "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../_deps/openzfs/lib",
 ]
+
+[target.x86_64-unknown-freebsd]
+rustflags = [
+  # Same relative layout as Linux dev builds.
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../native",
+  "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../_deps/openzfs/lib",
+]

@@ -142,7 +142,8 @@ if [[ ! -f "$BINARY_PATH" ]]; then
 fi
 
 ARCH="$(uname -m)"
-BUNDLE_NAME="zfs-explorer-${PROFILE}-linux-${ARCH}"
+OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+BUNDLE_NAME="zfs-explorer-${PROFILE}-${OS_NAME}-${ARCH}"
 BUNDLE_DIR="$OUTPUT_DIR/$BUNDLE_NAME"
 LIB_DIR="$BUNDLE_DIR/lib"
 BIN_DIR="$BUNDLE_DIR/bin"

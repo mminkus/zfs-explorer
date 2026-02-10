@@ -19,7 +19,9 @@ zdx_file_readable(const char *path)
  * Priority:
  *   1) ZFS_EXPLORER_ZPOOL_CACHEFILE
  *   2) ZPOOL_CACHE
- *   3) Auto-detect /data/zfs/zpool.cache when /etc/zfs/zpool.cache is missing
+ *   3) Auto-detect common alternate locations when /etc/zfs/zpool.cache is missing:
+ *      - /data/zfs/zpool.cache (e.g. some appliance distributions)
+ *      - /boot/zfs/zpool.cache (e.g. FreeBSD defaults)
  */
 static void
 zdx_apply_cachefile_override(void)
@@ -29,9 +31,12 @@ zdx_apply_cachefile_override(void)
         cachefile = getenv("ZPOOL_CACHE");
 
     if ((cachefile == NULL || cachefile[0] == '\0') &&
-        !zdx_file_readable("/etc/zfs/zpool.cache") &&
-        zdx_file_readable("/data/zfs/zpool.cache")) {
-        cachefile = "/data/zfs/zpool.cache";
+        !zdx_file_readable("/etc/zfs/zpool.cache")) {
+        if (zdx_file_readable("/data/zfs/zpool.cache")) {
+            cachefile = "/data/zfs/zpool.cache";
+        } else if (zdx_file_readable("/boot/zfs/zpool.cache")) {
+            cachefile = "/boot/zfs/zpool.cache";
+        }
     }
 
     if (cachefile == NULL || cachefile[0] == '\0')
