@@ -13,6 +13,7 @@ import type {
 
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
+const SPACEMAP_PAGE_LIMIT = 200
 
 type ApiErrorPayload = {
   error?: string
@@ -233,6 +234,72 @@ type PoolErrorsResponse = {
   count: number
   next: number | null
   entries: PoolErrorEntry[]
+}
+
+type SpacemapHistogramBucket = {
+  bucket: number
+  min_length: number
+  max_length: number | null
+  alloc_count: number
+  free_count: number
+}
+
+type SpacemapSummaryResponse = {
+  object: number
+  start: number
+  size: number
+  shift: number
+  length: number
+  allocated: number
+  smp_length: number
+  smp_alloc: number
+  range_entries: number
+  alloc_entries: number
+  free_entries: number
+  alloc_bytes: number
+  free_bytes: number
+  net_bytes: number
+  txg_min: number | null
+  txg_max: number | null
+  histogram: SpacemapHistogramBucket[]
+}
+
+type SpacemapRange = {
+  index: number
+  op: 'alloc' | 'free' | string
+  offset: number
+  length: number
+  txg: number | null
+  sync_pass: number | null
+  vdev: number | null
+}
+
+type SpacemapRangesFilters = {
+  op: 'all' | 'alloc' | 'free'
+  min_length: number
+  txg_min: number | null
+  txg_max: number | null
+}
+
+type SpacemapRangesResponse = {
+  object: number
+  start: number
+  size: number
+  shift: number
+  cursor: number
+  limit: number
+  count: number
+  next: number | null
+  filters?: SpacemapRangesFilters
+  ranges: SpacemapRange[]
+}
+
+type SpacemapTopWindow = {
+  window_start: number
+  window_end: number
+  ops: number
+  alloc_bytes: number
+  free_bytes: number
 }
 
 type DatasetTreeNode = {
@@ -456,6 +523,9 @@ type PinnedObject = {
   typeName?: string
 }
 
+const isSpacemapDnode = (dnode: DnodeInfo | null | undefined): boolean =>
+  !!dnode && dnode.type.name.toLowerCase().includes('space map')
+
 const isSameFsLocation = (a: FsLocation, b: FsLocation) => {
   if (a.objsetId !== b.objsetId) return false
   if (a.currentDir !== b.currentDir) return false
@@ -667,7 +737,9 @@ function App() {
   )
   const [navStack, setNavStack] = useState<number[]>([])
   const [navIndex, setNavIndex] = useState(-1)
-  const [inspectorTab, setInspectorTab] = useState<'summary' | 'zap' | 'blkptr' | 'raw'>('summary')
+  const [inspectorTab, setInspectorTab] = useState<
+    'summary' | 'zap' | 'blkptr' | 'spacemap' | 'raw'
+  >('summary')
   const [rawView, setRawView] = useState<'json' | 'hex'>('json')
   const [hexDump, setHexDump] = useState<RawBlockResponse | null>(null)
   const [hexLoading, setHexLoading] = useState(false)
@@ -688,6 +760,17 @@ function App() {
   const [poolErrorsResolvePaths, setPoolErrorsResolvePaths] = useState(true)
   const [poolErrorsCursorInput, setPoolErrorsCursorInput] = useState('0')
   const [poolErrorsLimit, setPoolErrorsLimit] = useState(200)
+  const [spacemapSummary, setSpacemapSummary] = useState<SpacemapSummaryResponse | null>(null)
+  const [spacemapSummaryLoading, setSpacemapSummaryLoading] = useState(false)
+  const [spacemapSummaryError, setSpacemapSummaryError] = useState<string | null>(null)
+  const [spacemapRanges, setSpacemapRanges] = useState<SpacemapRange[]>([])
+  const [spacemapRangesNext, setSpacemapRangesNext] = useState<number | null>(null)
+  const [spacemapRangesLoading, setSpacemapRangesLoading] = useState(false)
+  const [spacemapRangesError, setSpacemapRangesError] = useState<string | null>(null)
+  const [spacemapOpFilter, setSpacemapOpFilter] = useState<'all' | 'alloc' | 'free'>('all')
+  const [spacemapMinLengthInput, setSpacemapMinLengthInput] = useState('')
+  const [spacemapTxgMinInput, setSpacemapTxgMinInput] = useState('')
+  const [spacemapTxgMaxInput, setSpacemapTxgMaxInput] = useState('')
   const [poolDetailsOpen, setPoolDetailsOpen] = useState(false)
   const [poolTreeExpanded, setPoolTreeExpanded] = useState<Record<string, boolean>>({
     root: true,
@@ -702,7 +785,9 @@ function App() {
   const [graphExpandedFrom, setGraphExpandedFrom] = useState<number[]>([])
   const [graphExpanding, setGraphExpanding] = useState(false)
   const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
-  const [centerView, setCenterView] = useState<'explore' | 'graph' | 'physical'>('explore')
+  const [centerView, setCenterView] = useState<'explore' | 'graph' | 'physical' | 'spacemap'>(
+    'explore'
+  )
   const [isNarrow, setIsNarrow] = useState(false)
   const hexRequestKey = useRef<string | null>(null)
   const fsStatKey = useRef<string | null>(null)
@@ -1022,6 +1107,17 @@ function App() {
     setGraphExpandError(null)
     setShowPhysicalEdges(false)
     setCenterView('explore')
+    setSpacemapSummary(null)
+    setSpacemapSummaryLoading(false)
+    setSpacemapSummaryError(null)
+    setSpacemapRanges([])
+    setSpacemapRangesNext(null)
+    setSpacemapRangesLoading(false)
+    setSpacemapRangesError(null)
+    setSpacemapOpFilter('all')
+    setSpacemapMinLengthInput('')
+    setSpacemapTxgMinInput('')
+    setSpacemapTxgMaxInput('')
   }
 
   const formatTimestamp = (ts?: { sec: number; nsec: number }) => {
@@ -2648,6 +2744,89 @@ function App() {
     }
   }
 
+  const parseOptionalUnsigned = (raw: string, label: string): number | null => {
+    const trimmed = raw.trim()
+    if (!trimmed) return null
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      throw new Error(`${label} must be a non-negative integer`)
+    }
+    return parsed
+  }
+
+  const fetchSpacemapSummary = async (objid: number) => {
+    if (!selectedPool) return
+    setSpacemapSummaryLoading(true)
+    setSpacemapSummaryError(null)
+    try {
+      const summary = await fetchJson<SpacemapSummaryResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/spacemap/${objid}/summary`
+      )
+      setSpacemapSummary(summary)
+    } catch (err) {
+      setSpacemapSummary(null)
+      setSpacemapSummaryError((err as Error).message)
+    } finally {
+      setSpacemapSummaryLoading(false)
+    }
+  }
+
+  const fetchSpacemapRanges = async (
+    objid: number,
+    cursor: number,
+    append: boolean,
+    overrides?: {
+      op?: 'all' | 'alloc' | 'free'
+      minLengthInput?: string
+      txgMinInput?: string
+      txgMaxInput?: string
+    }
+  ) => {
+    if (!selectedPool) return
+
+    const op = overrides?.op ?? spacemapOpFilter
+    const minLengthRaw = overrides?.minLengthInput ?? spacemapMinLengthInput
+    const txgMinRaw = overrides?.txgMinInput ?? spacemapTxgMinInput
+    const txgMaxRaw = overrides?.txgMaxInput ?? spacemapTxgMaxInput
+
+    let minLength = 0
+    let txgMin: number | null = null
+    let txgMax: number | null = null
+    try {
+      minLength = parseOptionalUnsigned(minLengthRaw, 'min_length') ?? 0
+      txgMin = parseOptionalUnsigned(txgMinRaw, 'txg_min')
+      txgMax = parseOptionalUnsigned(txgMaxRaw, 'txg_max')
+      if (txgMin !== null && txgMax !== null && txgMin > txgMax) {
+        throw new Error('txg_min must be <= txg_max')
+      }
+    } catch (err) {
+      setSpacemapRangesError((err as Error).message)
+      return
+    }
+
+    setSpacemapRangesLoading(true)
+    setSpacemapRangesError(null)
+    try {
+      const params = new URLSearchParams()
+      params.set('cursor', String(cursor))
+      params.set('limit', String(SPACEMAP_PAGE_LIMIT))
+      params.set('op', op)
+      if (minLength > 0) params.set('min_length', String(minLength))
+      if (txgMin !== null) params.set('txg_min', String(txgMin))
+      if (txgMax !== null) params.set('txg_max', String(txgMax))
+
+      const data = await fetchJson<SpacemapRangesResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/spacemap/${objid}/ranges?${params.toString()}`
+      )
+      setSpacemapRanges(prev => (append ? [...prev, ...data.ranges] : data.ranges))
+      setSpacemapRangesNext(data.next)
+    } catch (err) {
+      setSpacemapRangesError((err as Error).message)
+    } finally {
+      setSpacemapRangesLoading(false)
+    }
+  }
+
   async function fetchInspector(objid: number) {
     if (!selectedPool) return
     setInspectorLoading(true)
@@ -2666,6 +2845,17 @@ function App() {
     setZapEntries([])
     setZapNext(null)
     setZapError(null)
+    setSpacemapSummary(null)
+    setSpacemapSummaryLoading(false)
+    setSpacemapSummaryError(null)
+    setSpacemapRanges([])
+    setSpacemapRangesNext(null)
+    setSpacemapRangesLoading(false)
+    setSpacemapRangesError(null)
+    setSpacemapOpFilter('all')
+    setSpacemapMinLengthInput('')
+    setSpacemapTxgMinInput('')
+    setSpacemapTxgMaxInput('')
     try {
       const [infoData, blkData] = await Promise.all([
         fetchJson<DnodeInfo>(
@@ -2677,6 +2867,12 @@ function App() {
       ])
       setObjectInfo(infoData)
       setBlkptrs(blkData)
+      if (isSpacemapDnode(infoData)) {
+        setCenterView('spacemap')
+      }
+      if (!isSpacemapDnode(infoData) && inspectorTab === 'spacemap') {
+        setInspectorTab('summary')
+      }
 
       if (infoData.is_zap) {
         await fetchZapInfo(objid)
@@ -2722,6 +2918,31 @@ function App() {
     if (Number.isNaN(objid)) return
     navigateTo(objid)
     setGraphSearch('')
+  }
+
+  const applySpacemapFilters = () => {
+    if (selectedObject === null) return
+    fetchSpacemapRanges(selectedObject, 0, false)
+  }
+
+  const clearSpacemapFilters = () => {
+    setSpacemapOpFilter('all')
+    setSpacemapMinLengthInput('')
+    setSpacemapTxgMinInput('')
+    setSpacemapTxgMaxInput('')
+    if (selectedObject === null) return
+    fetchSpacemapRanges(selectedObject, 0, false, {
+      op: 'all',
+      minLengthInput: '',
+      txgMinInput: '',
+      txgMaxInput: '',
+    })
+  }
+
+  const refreshSpacemap = () => {
+    if (selectedObject === null) return
+    fetchSpacemapSummary(selectedObject)
+    fetchSpacemapRanges(selectedObject, 0, false)
   }
 
   useEffect(() => {
@@ -2774,6 +2995,9 @@ function App() {
   }, [semanticEdges, zapEntries])
 
   const effectiveCenterView = useMemo(() => {
+    if (centerView === 'spacemap') {
+      return 'spacemap'
+    }
     if (centerView === 'explore') {
       return objectInfo?.is_zap ? 'map' : 'graph'
     }
@@ -2794,6 +3018,64 @@ function App() {
     }
     return null
   }, [blkptrs])
+
+  const isSpacemapObject = useMemo(() => isSpacemapDnode(objectInfo), [objectInfo])
+
+  const spacemapHistogramMax = useMemo(() => {
+    if (!spacemapSummary || spacemapSummary.histogram.length === 0) return 0
+    return Math.max(
+      ...spacemapSummary.histogram.map(bucket => bucket.alloc_count + bucket.free_count),
+      0
+    )
+  }, [spacemapSummary])
+
+  const spacemapLargestRanges = useMemo(() => {
+    return [...spacemapRanges]
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 8)
+  }, [spacemapRanges])
+
+  const spacemapSmallestRanges = useMemo(() => {
+    return [...spacemapRanges]
+      .filter(range => range.length > 0)
+      .sort((a, b) => a.length - b.length)
+      .slice(0, 8)
+  }, [spacemapRanges])
+
+  const spacemapTopWindows = useMemo<SpacemapTopWindow[]>(() => {
+    if (!spacemapSummary || spacemapRanges.length === 0) return []
+    const binCount = 64
+    const size = Math.max(1, spacemapSummary.size)
+    const windowSize = Math.max(1, Math.floor(size / binCount))
+    const windows = new Map<number, SpacemapTopWindow>()
+
+    spacemapRanges.forEach(range => {
+      const relative = Math.max(0, range.offset - spacemapSummary.start)
+      const bucket = Math.min(binCount - 1, Math.floor(relative / windowSize))
+      const existing = windows.get(bucket)
+      if (existing) {
+        existing.ops += 1
+        if (range.op === 'alloc') {
+          existing.alloc_bytes += range.length
+        } else {
+          existing.free_bytes += range.length
+        }
+        return
+      }
+
+      windows.set(bucket, {
+        window_start: spacemapSummary.start + bucket * windowSize,
+        window_end: spacemapSummary.start + (bucket + 1) * windowSize - 1,
+        ops: 1,
+        alloc_bytes: range.op === 'alloc' ? range.length : 0,
+        free_bytes: range.op === 'free' ? range.length : 0,
+      })
+    })
+
+    return Array.from(windows.values())
+      .sort((a, b) => b.ops - a.ops)
+      .slice(0, 8)
+  }, [spacemapRanges, spacemapSummary])
 
   const formattedHexDump = useMemo(() => {
     if (!hexDump) return ''
@@ -2840,6 +3122,48 @@ function App() {
         setHexLoading(false)
       })
   }, [selectedPool, selectedObject, rawView, firstDataDva])
+
+  useEffect(() => {
+    if (
+      !selectedPool ||
+      selectedObject === null ||
+      !isSpacemapObject
+    ) {
+      return
+    }
+
+    const spacemapRequested =
+      inspectorTab === 'spacemap' || effectiveCenterView === 'spacemap'
+    if (!spacemapRequested) {
+      return
+    }
+
+    if (!spacemapSummary && !spacemapSummaryLoading && !spacemapSummaryError) {
+      fetchSpacemapSummary(selectedObject)
+    }
+
+    if (
+      spacemapRanges.length === 0 &&
+      !spacemapRangesLoading &&
+      !spacemapRangesError &&
+      spacemapRangesNext === null
+    ) {
+      fetchSpacemapRanges(selectedObject, 0, false)
+    }
+  }, [
+    effectiveCenterView,
+    inspectorTab,
+    isSpacemapObject,
+    selectedObject,
+    selectedPool,
+    spacemapRanges.length,
+    spacemapRangesError,
+    spacemapRangesLoading,
+    spacemapRangesNext,
+    spacemapSummary,
+    spacemapSummaryError,
+    spacemapSummaryLoading,
+  ])
 
   useEffect(() => {
     if (!showPhysicalEdgesActive) {
@@ -2914,6 +3238,264 @@ function App() {
     setGraphExpandedFrom([])
     setGraphExpandError(null)
   }
+
+  const renderSpacemapPanel = (mode: 'center' | 'inspector') => (
+    <div className={mode === 'center' ? 'spacemap-center' : 'inspector-section spacemap-section'}>
+      {mode === 'center' && (
+        <div className="spacemap-center-header">
+          <h3>Spacemap Activity</h3>
+          <span className="muted">Address-range transaction log view</span>
+        </div>
+      )}
+
+      <div className="spacemap-toolbar">
+        <button
+          type="button"
+          className="fs-action-btn"
+          onClick={refreshSpacemap}
+          disabled={selectedObject === null || spacemapSummaryLoading}
+        >
+          {spacemapSummaryLoading ? 'Refreshing…' : 'Refresh'}
+        </button>
+      </div>
+
+      <div className="spacemap-filters">
+        <label>
+          Op
+          <select
+            className="pool-select spacemap-select"
+            value={spacemapOpFilter}
+            onChange={event =>
+              setSpacemapOpFilter(event.target.value as 'all' | 'alloc' | 'free')
+            }
+          >
+            <option value="all">all</option>
+            <option value="alloc">alloc</option>
+            <option value="free">free</option>
+          </select>
+        </label>
+        <label>
+          Min length
+          <input
+            className="spacemap-input"
+            type="text"
+            placeholder="0 or 0x1000"
+            value={spacemapMinLengthInput}
+            onChange={event => setSpacemapMinLengthInput(event.target.value)}
+          />
+        </label>
+        <label>
+          TXG min
+          <input
+            className="spacemap-input"
+            type="text"
+            placeholder="optional"
+            value={spacemapTxgMinInput}
+            onChange={event => setSpacemapTxgMinInput(event.target.value)}
+          />
+        </label>
+        <label>
+          TXG max
+          <input
+            className="spacemap-input"
+            type="text"
+            placeholder="optional"
+            value={spacemapTxgMaxInput}
+            onChange={event => setSpacemapTxgMaxInput(event.target.value)}
+          />
+        </label>
+        <div className="spacemap-filter-actions">
+          <button type="button" className="fs-action-btn" onClick={applySpacemapFilters}>
+            Apply
+          </button>
+          <button type="button" className="fs-action-btn" onClick={clearSpacemapFilters}>
+            Clear
+          </button>
+        </div>
+      </div>
+
+      {spacemapSummaryError && (
+        <div className="error">
+          <strong>Summary:</strong> {spacemapSummaryError}
+        </div>
+      )}
+      {spacemapRangesError && (
+        <div className="error">
+          <strong>Ranges:</strong> {spacemapRangesError}
+        </div>
+      )}
+
+      {spacemapSummaryLoading && <p className="muted">Loading spacemap summary…</p>}
+      {spacemapSummary && (
+        <>
+          <dl className="info-grid">
+            <div>
+              <dt>Object</dt>
+              <dd>{spacemapSummary.object}</dd>
+            </div>
+            <div>
+              <dt>Shift</dt>
+              <dd>{spacemapSummary.shift}</dd>
+            </div>
+            <div>
+              <dt>Start</dt>
+              <dd>{formatAddr(spacemapSummary.start)}</dd>
+            </div>
+            <div>
+              <dt>Size</dt>
+              <dd>{formatAddr(spacemapSummary.size)}</dd>
+            </div>
+            <div>
+              <dt>Entries</dt>
+              <dd>{spacemapSummary.range_entries}</dd>
+            </div>
+            <div>
+              <dt>Length</dt>
+              <dd>{formatAddr(spacemapSummary.length)}</dd>
+            </div>
+            <div>
+              <dt>Alloc Bytes</dt>
+              <dd>{formatAddr(spacemapSummary.alloc_bytes)}</dd>
+            </div>
+            <div>
+              <dt>Free Bytes</dt>
+              <dd>{formatAddr(spacemapSummary.free_bytes)}</dd>
+            </div>
+            <div>
+              <dt>Net Bytes</dt>
+              <dd>{formatAddr(spacemapSummary.net_bytes)}</dd>
+            </div>
+            <div>
+              <dt>TXG Span</dt>
+              <dd>
+                {spacemapSummary.txg_min !== null && spacemapSummary.txg_max !== null
+                  ? `${spacemapSummary.txg_min} – ${spacemapSummary.txg_max}`
+                  : '—'}
+              </dd>
+            </div>
+          </dl>
+
+          <div className="spacemap-histogram">
+            <h3>Distribution</h3>
+            {spacemapSummary.histogram.length === 0 ? (
+              <p className="muted">No histogram buckets.</p>
+            ) : (
+              <div className="spacemap-hist-list">
+                {spacemapSummary.histogram.map(bucket => {
+                  const total = bucket.alloc_count + bucket.free_count
+                  const width =
+                    spacemapHistogramMax > 0
+                      ? `${(total / spacemapHistogramMax) * 100}%`
+                      : '0%'
+                  return (
+                    <div
+                      className="spacemap-hist-row"
+                      key={`${bucket.bucket}-${bucket.min_length}`}
+                    >
+                      <div className="spacemap-hist-label">
+                        {formatAddr(bucket.min_length)}
+                        {' - '}
+                        {bucket.max_length === null
+                          ? '∞'
+                          : formatAddr(bucket.max_length)}
+                      </div>
+                      <div className="spacemap-hist-bar-wrap">
+                        <div className="spacemap-hist-bar" style={{ width }} />
+                      </div>
+                      <div className="spacemap-hist-count">
+                        {bucket.alloc_count}/{bucket.free_count}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      <div className="spacemap-top-grid">
+        <div className="spacemap-top-card">
+          <h3>Largest ranges</h3>
+          {spacemapLargestRanges.length === 0 ? (
+            <p className="muted">No ranges loaded.</p>
+          ) : (
+            <ul>
+              {spacemapLargestRanges.map(range => (
+                <li key={`largest-${range.index}`}>
+                  #{range.index} · {range.op} · len {formatAddr(range.length)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="spacemap-top-card">
+          <h3>Smallest ranges</h3>
+          {spacemapSmallestRanges.length === 0 ? (
+            <p className="muted">No ranges loaded.</p>
+          ) : (
+            <ul>
+              {spacemapSmallestRanges.map(range => (
+                <li key={`smallest-${range.index}`}>
+                  #{range.index} · {range.op} · len {formatAddr(range.length)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="spacemap-top-card">
+          <h3>Highest-op windows</h3>
+          {spacemapTopWindows.length === 0 ? (
+            <p className="muted">No windows yet.</p>
+          ) : (
+            <ul>
+              {spacemapTopWindows.map((window, idx) => (
+                <li key={`window-${idx}`}>
+                  {formatAddr(window.window_start)} - {formatAddr(window.window_end)}
+                  {' · '}ops {window.ops}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      <div className="spacemap-ranges">
+        <div className="spacemap-ranges-header">
+          <span>#</span>
+          <span>Op</span>
+          <span>Offset</span>
+          <span>Length</span>
+          <span>TXG</span>
+          <span>VDEV</span>
+        </div>
+        {spacemapRanges.length === 0 && !spacemapRangesLoading ? (
+          <div className="spacemap-ranges-empty">No ranges for current filter.</div>
+        ) : (
+          spacemapRanges.map(range => (
+            <div className="spacemap-ranges-row" key={`range-${range.index}`}>
+              <span>{range.index}</span>
+              <span>{range.op}</span>
+              <span>{formatAddr(range.offset)}</span>
+              <span>{formatAddr(range.length)}</span>
+              <span>{range.txg ?? '—'}</span>
+              <span>{range.vdev ?? '—'}</span>
+            </div>
+          ))
+        )}
+      </div>
+
+      {spacemapRangesLoading && <p className="muted">Loading ranges…</p>}
+      {spacemapRangesNext !== null && !spacemapRangesLoading && selectedObject !== null && (
+        <button
+          className="load-more"
+          onClick={() => fetchSpacemapRanges(selectedObject, spacemapRangesNext, true)}
+        >
+          Load more ranges
+        </button>
+      )}
+    </div>
+  )
 
   const togglePoolTreeNode = (path: string) => {
     setPoolTreeExpanded(prev => ({ ...prev, [path]: !prev[path] }))
@@ -3039,6 +3621,12 @@ function App() {
       'com.delphix:vdev_zap_top',
       'com.delphix:vdev_zap_leaf',
     ]
+    const detailEntries = detailKeys
+      .filter(key => key in node)
+      .map(key => ({
+        key,
+        value: scalarToZdb(node[key]),
+      }))
 
     return (
       <div
@@ -3077,15 +3665,16 @@ function App() {
           </span>
         </div>
 
-        <div className="pool-vdev-meta">
-          {detailKeys
-            .filter(key => key in node)
-            .map(key => (
-              <span key={`${path}:${key}`} className="pool-vdev-pill">
-                {key}: {scalarToZdb(node[key])}
-              </span>
+        {detailEntries.length > 0 && (
+          <div className="pool-vdev-meta-table">
+            {detailEntries.map(({ key, value }) => (
+              <div key={`${path}:${key}`} className="pool-vdev-meta-row">
+                <span className="pool-vdev-meta-key">{key}</span>
+                <span className="pool-vdev-meta-value">{value}</span>
+              </div>
             ))}
-        </div>
+          </div>
+        )}
 
         {expanded &&
           hasChildren &&
@@ -3128,7 +3717,7 @@ function App() {
       <header className="topbar">
         <div>
           <strong>ZFS Explorer</strong>
-          <p className="subtitle">Milestone 6: Filesystem Navigation</p>
+          <p className="subtitle">Milestone 7: Spacemap Visualizer</p>
         </div>
         <div className="status">
           <div className="status-item">
@@ -3646,30 +4235,42 @@ function App() {
 
               {poolSummary && (
                 <div className="pool-summary-center">
-                  <div className="pool-summary-cards">
-                    <div className="pool-summary-card">
-                      <span>State</span>
-                      <strong>{poolSummary.pool.state}</strong>
+                  <div className="pool-summary-table">
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">Name</span>
+                      <span className="pool-summary-value">{poolSummary.pool.name}</span>
                     </div>
-                    <div className="pool-summary-card">
-                      <span>TXG</span>
-                      <strong>{poolSummary.pool.txg}</strong>
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">State</span>
+                      <span className="pool-summary-value">{poolSummary.pool.state}</span>
                     </div>
-                    <div className="pool-summary-card">
-                      <span>Version</span>
-                      <strong>{poolSummary.pool.version}</strong>
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">TXG</span>
+                      <span className="pool-summary-value">{poolSummary.pool.txg}</span>
                     </div>
-                    <div className="pool-summary-card">
-                      <span>Features</span>
-                      <strong>{poolSummary.features_for_read.length}</strong>
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">Version</span>
+                      <span className="pool-summary-value">{poolSummary.pool.version}</span>
                     </div>
-                    <div className="pool-summary-card">
-                      <span>Host</span>
-                      <strong>{poolSummary.pool.hostname ?? '(none)'}</strong>
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">Features</span>
+                      <span className="pool-summary-value">
+                        {poolSummary.features_for_read.length}
+                      </span>
                     </div>
-                    <div className="pool-summary-card">
-                      <span>GUID</span>
-                      <strong>{poolSummary.pool.guid}</strong>
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">Host</span>
+                      <span className="pool-summary-value">
+                        {poolSummary.pool.hostname ?? '(none)'}
+                      </span>
+                    </div>
+                    <div className="pool-summary-row pool-summary-row-wide">
+                      <span className="pool-summary-key">GUID</span>
+                      <span className="pool-summary-value">{poolSummary.pool.guid}</span>
+                    </div>
+                    <div className="pool-summary-row">
+                      <span className="pool-summary-key">Errata</span>
+                      <span className="pool-summary-value">{poolSummary.pool.errata}</span>
                     </div>
                   </div>
 
@@ -4535,6 +5136,15 @@ function App() {
                     >
                       Physical
                     </button>
+                    {isSpacemapObject && (
+                      <button
+                        className={`graph-btn ${centerView === 'spacemap' ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setCenterView('spacemap')}
+                      >
+                        Spacemap
+                      </button>
+                    )}
                   </div>
                   {effectiveCenterView === 'map' ? (
                     <>
@@ -4554,6 +5164,8 @@ function App() {
                         </button>
                       )}
                     </>
+                  ) : effectiveCenterView === 'spacemap' ? (
+                    <span className="muted">Address-range activity and distribution</span>
                   ) : (
                     <>
                       <input
@@ -4572,7 +5184,7 @@ function App() {
                       </button>
                     </>
                   )}
-                  {effectiveCenterView !== 'map' && (
+                  {effectiveCenterView !== 'map' && effectiveCenterView !== 'spacemap' && (
                     <>
                       {effectiveCenterView !== 'physical' && (
                         <button
@@ -4618,6 +5230,8 @@ function App() {
                     filter={zapMapFilter}
                     onNavigate={navigateTo}
                   />
+                ) : effectiveCenterView === 'spacemap' ? (
+                  renderSpacemapPanel('center')
                 ) : (
                   <ObjectGraph
                     selectedObject={selectedObject}
@@ -5021,6 +5635,14 @@ function App() {
                 >
                   Blkptr {blkptrs && `(${blkptrs.blkptrs.length})`}
                 </button>
+                {isSpacemapObject && (
+                  <button
+                    className={`tab ${inspectorTab === 'spacemap' ? 'active' : ''}`}
+                    onClick={() => setInspectorTab('spacemap')}
+                  >
+                    Spacemap
+                  </button>
+                )}
                 <button
                   className={`tab ${inspectorTab === 'raw' ? 'active' : ''}`}
                   onClick={() => setInspectorTab('raw')}
@@ -5503,6 +6125,8 @@ function App() {
                     </div>
                   </div>
                 )}
+
+                {inspectorTab === 'spacemap' && isSpacemapObject && renderSpacemapPanel('inspector')}
 
                 {inspectorTab === 'raw' && (
                   <div className="inspector-section raw-section">

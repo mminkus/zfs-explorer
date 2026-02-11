@@ -1,34 +1,45 @@
-# Screenshot Capture Guide
+# Screenshot Guide
 
-This checklist tracks the representative screenshots required for release-readiness.
+This file tracks the screenshots currently captured in `docs/screenshots/`
+and provides reusable captions for README/docs.
 
-## Required images
+## Current gallery
 
-Place captured images in `docs/screenshots/` using these filenames:
+1. `docs/screenshots/01-pool-summary.png`
+   Caption: Pool summary view with vdev tree and zdb-like configuration context.
+2. `docs/screenshots/02-mos-zap-map.png`
+   Caption: MOS explorer with ZAP semantics rendered in the center map view.
+3. `docs/screenshots/03-dataset-tree-fs.png`
+   Caption: Dataset tree + filesystem navigator showing left-to-center workflow.
+4. `docs/screenshots/04-dsl-directory-graph.png`
+   Caption: DSL directory object graph with semantic edges and inspector details.
+5. `docs/screenshots/05-spacemap.png`
+   Caption: Spacemap inspector/visualizer with summary, histogram, and ranges.
 
-1. `01-pool-summary.png`
-   - Pool tab with summary cards + vdev tree visible.
-2. `02-mos-zap-map.png`
-   - MOS mode with a ZAP object selected and map/explore table visible.
-3. `03-dataset-tree-fs.png`
-   - Datasets tree on left + filesystem center pane populated.
-4. `04-persistent-errors.png`
-   - Pool tab persistent errors table with paging/actions visible.
+## Development history
 
-Optional:
-- `05-offline-mode.png` (offline mode badge + pool summary)
-- `06-dsl-dataset-inspector.png` (DSL dataset inspector section and FS handoff)
+These are optional progress images kept for milestone history and release notes.
+
+- `docs/screenshots/development/milestone_0_proof_of_life.png`
+- `docs/screenshots/development/milestone_1_mos_browser_dsl_dir_child_map1.png`
+- `docs/screenshots/development/milestone_1_mos_browser_dsl_dir_child_map2.png`
+- `docs/screenshots/development/milestone_1_mos_browser_dsl_props_object_graph.png`
+- `docs/screenshots/development/milestone_5_mos_browser_object_1_graph.png`
+- `docs/screenshots/development/milestone_5_mos_browser_object_1_zap.png`
+- `docs/screenshots/development/milestone_6_dsl_directory_graph1.png`
+- `docs/screenshots/development/milestone_6_dsl_directory_graph2.png`
+- `docs/screenshots/development/milestone_7_spacemap_visualizer1.png`
+- `docs/screenshots/development/milestone_7_spacemap_visualizer2.png`
 
 ## Capture notes
 
 - Use real pool data with non-sensitive names where possible.
 - Keep browser zoom at `100%`.
-- Prefer desktop viewport wide enough to show all 3 panes.
-- Verify dark theme contrast remains readable in each screenshot.
+- Prefer a desktop viewport that shows all 3 panes.
+- Verify dark-theme contrast remains readable.
 
-## Final wiring
+## Next wiring steps
 
-After screenshots are added:
-
-1. Update `README.md` with an image gallery section referencing these files.
-2. Mark Milestone `R.4` screenshot task complete in `PLAN.md`.
+1. Add a screenshot gallery section in `README.md` referencing the five files
+   above.
+2. Mark Milestone `R.4` complete in `PLAN.md` when README wiring is done.

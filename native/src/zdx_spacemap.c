@@ -1,6 +1,9 @@
 #include "zdbdecode_internal.h"
 
 #define ZDX_SPACEMAP_PAGE_STOP 1
+#define ZDX_SPACEMAP_OP_ANY 0
+#define ZDX_SPACEMAP_OP_ALLOC 1
+#define ZDX_SPACEMAP_OP_FREE 2
 
 typedef struct zdx_spacemap_summary_ctx {
     uint64_t range_entries;
@@ -21,6 +24,12 @@ typedef struct zdx_spacemap_page_ctx {
     uint64_t seen;
     uint64_t added;
     boolean_t has_more;
+    int op_filter;
+    uint64_t min_length;
+    uint64_t txg_min;
+    uint64_t txg_max;
+    boolean_t use_txg_min;
+    boolean_t use_txg_max;
     char *ranges_json;
     int ranges_count;
 } zdx_spacemap_page_ctx_t;
@@ -133,6 +142,33 @@ zdx_spacemap_summary_cb(space_map_entry_t *sme, void *arg)
 }
 
 static int
+zdx_spacemap_entry_matches(const space_map_entry_t *sme,
+    const zdx_spacemap_page_ctx_t *ctx)
+{
+    if (!sme || !ctx)
+        return 0;
+
+    if (ctx->op_filter == ZDX_SPACEMAP_OP_ALLOC && sme->sme_type != SM_ALLOC)
+        return 0;
+    if (ctx->op_filter == ZDX_SPACEMAP_OP_FREE && sme->sme_type != SM_FREE)
+        return 0;
+    if (sme->sme_run < ctx->min_length)
+        return 0;
+
+    if (ctx->use_txg_min) {
+        if (sme->sme_txg == 0 || sme->sme_txg < ctx->txg_min)
+            return 0;
+    }
+
+    if (ctx->use_txg_max) {
+        if (sme->sme_txg == 0 || sme->sme_txg > ctx->txg_max)
+            return 0;
+    }
+
+    return 1;
+}
+
+static int
 zdx_spacemap_page_cb(space_map_entry_t *sme, void *arg)
 {
     zdx_spacemap_page_ctx_t *ctx = arg;
@@ -148,6 +184,9 @@ zdx_spacemap_page_cb(space_map_entry_t *sme, void *arg)
 
     if (!sme || !ctx)
         return EINVAL;
+
+    if (!zdx_spacemap_entry_matches(sme, ctx))
+        return 0;
 
     if (ctx->seen < ctx->cursor) {
         ctx->seen++;
@@ -416,7 +455,8 @@ zdx_spacemap_summary(zdx_pool_t *pool, uint64_t objid)
 
 zdx_result_t
 zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
-    uint64_t limit)
+    uint64_t limit, int op_filter, uint64_t min_length, uint64_t txg_min,
+    uint64_t txg_max)
 {
     space_map_t *sm = NULL;
     dmu_object_info_t doi;
@@ -424,13 +464,35 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
     char *ranges_final = NULL;
     char *result = NULL;
     char next_buf[32];
+    char txg_min_buf[32];
+    char txg_max_buf[32];
     const char *next_json = "null";
+    const char *txg_min_json = "null";
+    const char *txg_max_json = "null";
+    const char *op_filter_json = "all";
     int err;
 
     if (limit == 0)
         limit = 200;
-    if (limit > 10000)
-        limit = 10000;
+    if (limit > 2000)
+        limit = 2000;
+
+    if (op_filter != ZDX_SPACEMAP_OP_ANY &&
+        op_filter != ZDX_SPACEMAP_OP_ALLOC &&
+        op_filter != ZDX_SPACEMAP_OP_FREE) {
+        return make_error(EINVAL, "invalid spacemap op_filter=%d", op_filter);
+    }
+
+    if (op_filter == ZDX_SPACEMAP_OP_ALLOC)
+        op_filter_json = "alloc";
+    else if (op_filter == ZDX_SPACEMAP_OP_FREE)
+        op_filter_json = "free";
+
+    if (txg_min != 0 && txg_max != 0 && txg_min > txg_max) {
+        return make_error(EINVAL,
+            "txg_min (%llu) must be <= txg_max (%llu)",
+            (unsigned long long)txg_min, (unsigned long long)txg_max);
+    }
 
     err = zdx_spacemap_doi(pool, objid, &doi);
     if (err != 0) {
@@ -462,6 +524,12 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
 
     page.cursor = cursor;
     page.limit = limit;
+    page.op_filter = op_filter;
+    page.min_length = min_length;
+    page.txg_min = txg_min;
+    page.txg_max = txg_max;
+    page.use_txg_min = (txg_min != 0) ? B_TRUE : B_FALSE;
+    page.use_txg_max = (txg_max != 0) ? B_TRUE : B_FALSE;
     page.ranges_json = json_array_start();
     if (!page.ranges_json) {
         space_map_close(sm);
@@ -490,6 +558,17 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
         next_json = next_buf;
     }
 
+    if (page.use_txg_min) {
+        (void) snprintf(txg_min_buf, sizeof (txg_min_buf), "%llu",
+            (unsigned long long)txg_min);
+        txg_min_json = txg_min_buf;
+    }
+    if (page.use_txg_max) {
+        (void) snprintf(txg_max_buf, sizeof (txg_max_buf), "%llu",
+            (unsigned long long)txg_max);
+        txg_max_json = txg_max_buf;
+    }
+
     result = json_format(
         "{"
         "\"object\":%llu,"
@@ -500,6 +579,12 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
         "\"limit\":%llu,"
         "\"count\":%llu,"
         "\"next\":%s,"
+        "\"filters\":{"
+        "\"op\":\"%s\","
+        "\"min_length\":%llu,"
+        "\"txg_min\":%s,"
+        "\"txg_max\":%s"
+        "},"
         "\"ranges\":%s"
         "}",
         (unsigned long long)objid,
@@ -510,6 +595,10 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
         (unsigned long long)limit,
         (unsigned long long)page.added,
         next_json,
+        op_filter_json,
+        (unsigned long long)min_length,
+        txg_min_json,
+        txg_max_json,
         ranges_final);
 
     free(ranges_final);

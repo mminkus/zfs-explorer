@@ -11,6 +11,8 @@ use crate::AppState;
 
 const DEFAULT_PAGE_LIMIT: u64 = 200;
 const MAX_PAGE_LIMIT: u64 = 10_000;
+const SPACEMAP_DEFAULT_LIMIT: u64 = 200;
+const SPACEMAP_MAX_LIMIT: u64 = 2_000;
 const BACKEND_NAME: &str = env!("CARGO_PKG_NAME");
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_SHA: &str = match option_env!("ZFS_EXPLORER_GIT_SHA") {
@@ -234,6 +236,29 @@ fn normalize_limit(limit: Option<u64>) -> u64 {
 
 fn normalize_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (u64, u64) {
     (cursor.unwrap_or(0), normalize_limit(limit))
+}
+
+fn normalize_spacemap_limit(limit: Option<u64>) -> u64 {
+    limit
+        .unwrap_or(SPACEMAP_DEFAULT_LIMIT)
+        .clamp(1, SPACEMAP_MAX_LIMIT)
+}
+
+fn normalize_spacemap_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (u64, u64) {
+    (cursor.unwrap_or(0), normalize_spacemap_limit(limit))
+}
+
+fn parse_spacemap_op_filter(op: Option<&str>) -> Result<i32, ApiError> {
+    let normalized = op.unwrap_or("all").trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "all" => Ok(0),
+        "alloc" => Ok(1),
+        "free" => Ok(2),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid op filter '{normalized}'; expected all, alloc, or free"),
+        )),
+    }
 }
 
 fn parse_graph_include(include: Option<&str>) -> (bool, bool, bool) {
@@ -788,10 +813,7 @@ fn resolve_dataset_objset(
             tracing::error!("FFI error: {}", err_msg);
             StatusCode::INTERNAL_SERVER_ERROR
         };
-        return Err(api_error(
-            status,
-            err_msg.to_string(),
-        ));
+        return Err(api_error(status, err_msg.to_string()));
     }
 
     let objset_json = objset_result.json().ok_or_else(|| {
@@ -882,6 +904,10 @@ pub async fn objset_stat(
 pub struct SpacemapRangesQuery {
     pub cursor: Option<u64>,
     pub limit: Option<u64>,
+    pub op: Option<String>,
+    pub min_length: Option<u64>,
+    pub txg_min: Option<u64>,
+    pub txg_max: Option<u64>,
 }
 
 /// GET /api/pools/:pool/spacemap/:objid/summary
@@ -909,15 +935,28 @@ pub async fn spacemap_summary(
     Ok(Json(value))
 }
 
-/// GET /api/pools/:pool/spacemap/:objid/ranges?cursor=&limit=
+/// GET /api/pools/:pool/spacemap/:objid/ranges?cursor=&limit=&op=&min_length=&txg_min=&txg_max=
 pub async fn spacemap_ranges(
     State(state): State<AppState>,
     Path((pool, objid)): Path<(String, u64)>,
     Query(params): Query<SpacemapRangesQuery>,
 ) -> ApiResult {
     let pool_ptr = ensure_pool(&state, &pool)?;
-    let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
-    let result = crate::ffi::spacemap_ranges(pool_ptr, objid, cursor, limit);
+    let (cursor, limit) = normalize_spacemap_cursor_limit(params.cursor, params.limit);
+    let op_filter = parse_spacemap_op_filter(params.op.as_deref())?;
+    let min_length = params.min_length.unwrap_or(0);
+    let txg_min = params.txg_min.unwrap_or(0);
+    let txg_max = params.txg_max.unwrap_or(0);
+    if txg_min != 0 && txg_max != 0 && txg_min > txg_max {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "txg_min must be <= txg_max",
+        ));
+    }
+
+    let result = crate::ffi::spacemap_ranges(
+        pool_ptr, objid, cursor, limit, op_filter, min_length, txg_min, txg_max,
+    );
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
         let status = if is_spacemap_user_input_error(err_msg) {
@@ -1068,6 +1107,31 @@ mod tests {
     }
 
     #[test]
+    fn normalize_spacemap_limit_uses_default_and_bounds() {
+        assert_eq!(normalize_spacemap_limit(None), SPACEMAP_DEFAULT_LIMIT);
+        assert_eq!(normalize_spacemap_limit(Some(0)), 1);
+        assert_eq!(normalize_spacemap_limit(Some(17)), 17);
+        assert_eq!(
+            normalize_spacemap_limit(Some(SPACEMAP_MAX_LIMIT + 1)),
+            SPACEMAP_MAX_LIMIT
+        );
+    }
+
+    #[test]
+    fn parse_spacemap_op_filter_accepts_expected_values() {
+        assert_eq!(parse_spacemap_op_filter(None).unwrap(), 0);
+        assert_eq!(parse_spacemap_op_filter(Some("all")).unwrap(), 0);
+        assert_eq!(parse_spacemap_op_filter(Some("alloc")).unwrap(), 1);
+        assert_eq!(parse_spacemap_op_filter(Some("free")).unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_spacemap_op_filter_rejects_invalid_values() {
+        let err = parse_spacemap_op_filter(Some("bogus")).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn parse_graph_include_handles_defaults_and_flags() {
         assert_eq!(parse_graph_include(None), (true, true, false));
         assert_eq!(
@@ -1127,7 +1191,9 @@ mod tests {
         assert!(is_spacemap_user_input_error(
             "failed to inspect spacemap object 999999: No such file or directory"
         ));
-        assert!(!is_spacemap_user_input_error("failed to iterate spacemap object 264"));
+        assert!(!is_spacemap_user_input_error(
+            "failed to iterate spacemap object 264"
+        ));
     }
 
     #[test]

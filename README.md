@@ -61,6 +61,41 @@ You can think of this project as:
 3. Traverse `child_dir_zapobj` / `head_dataset_obj` edges.
 4. Handoff into FS view from dataset-linked inspector actions.
 
+## Screenshots
+
+Screenshots were captured on a high-DPI display. The README shows scaled previews
+for readability; click any image to open the full-resolution PNG.
+
+### 1. Pool summary + vdev tree
+
+<a href="docs/screenshots/01-pool-summary.png">
+  <img src="docs/screenshots/01-pool-summary.png" alt="Pool summary with vdev tree" width="1200" />
+</a>
+
+### 2. MOS ZAP map view
+
+<a href="docs/screenshots/02-mos-zap-map.png">
+  <img src="docs/screenshots/02-mos-zap-map.png" alt="MOS browser with ZAP map view" width="1200" />
+</a>
+
+### 3. Dataset tree + filesystem view
+
+<a href="docs/screenshots/03-dataset-tree-fs.png">
+  <img src="docs/screenshots/03-dataset-tree-fs.png" alt="Dataset tree and filesystem center pane" width="1200" />
+</a>
+
+### 4. DSL directory graph exploration
+
+<a href="docs/screenshots/04-dsl-directory-graph.png">
+  <img src="docs/screenshots/04-dsl-directory-graph.png" alt="DSL directory graph and inspector details" width="1200" />
+</a>
+
+### 5. Spacemap visualizer
+
+<a href="docs/screenshots/05-spacemap.png">
+  <img src="docs/screenshots/05-spacemap.png" alt="Spacemap summary, distribution, and ranges" width="1200" />
+</a>
+
 ## Architecture
 
 ```
