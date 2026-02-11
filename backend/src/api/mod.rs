@@ -24,6 +24,21 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     (status, Json(json!({ "error": message.into() })))
 }
 
+fn is_dataset_user_input_error(err_msg: &str) -> bool {
+    err_msg.contains("has no head dataset")
+        || err_msg.contains("head dataset bonus unsupported")
+        || err_msg.contains("is $ORIGIN")
+        || err_msg.contains("no user-visible ZPL objset")
+}
+
+fn is_spacemap_user_input_error(err_msg: &str) -> bool {
+    err_msg.contains("expected \"space map\"")
+        || err_msg.contains("bonus is too small for space map payload")
+        || (err_msg.contains("failed to inspect spacemap object")
+            && (err_msg.contains("Invalid argument")
+                || err_msg.contains("No such file or directory")))
+}
+
 fn pool_open_mode_name(mode: crate::PoolOpenMode) -> &'static str {
     match mode {
         crate::PoolOpenMode::Live => "live",
@@ -543,7 +558,9 @@ pub async fn dataset_tree(
             )
         })?;
         let head_value = parse_json_value(head_json)?;
-        let head_dataset_obj = head_value["head_dataset_obj"].as_u64();
+        let head_dataset_obj = head_value["head_dataset_obj"]
+            .as_u64()
+            .filter(|value| *value != 0);
 
         let children_result = crate::ffi::dsl_dir_children(pool_ptr, objid);
         if !children_result.is_ok() {
@@ -632,6 +649,103 @@ pub async fn dataset_objset(
     Ok(Json(response))
 }
 
+/// GET /api/pools/:pool/dataset/:dsl_dir_obj/snapshots
+pub async fn dataset_snapshots(
+    State(state): State<AppState>,
+    Path((pool, dir_obj)): Path<(String, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::dataset_snapshots(pool_ptr, dir_obj);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_dataset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/dataset/:dsl_dir_obj/snapshot-count
+pub async fn dataset_snapshot_count(
+    State(state): State<AppState>,
+    Path((pool, dir_obj)): Path<(String, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::dataset_snapshot_count(pool_ptr, dir_obj);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_dataset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/snapshot/:dsobj/objset
+pub async fn snapshot_objset(
+    State(state): State<AppState>,
+    Path((pool, dsobj)): Path<(String, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::dataset_objset(pool_ptr, dsobj);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_dataset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnapshotLineageQuery {
+    pub max_prev: Option<u64>,
+    pub max_next: Option<u64>,
+}
+
+/// GET /api/pools/:pool/snapshot/:dsobj/lineage?max_prev=&max_next=
+pub async fn snapshot_lineage(
+    State(state): State<AppState>,
+    Path((pool, dsobj)): Path<(String, u64)>,
+    Query(params): Query<SnapshotLineageQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let max_prev = params.max_prev.unwrap_or(64).clamp(1, 4096);
+    let max_next = params.max_next.unwrap_or(64).clamp(1, 4096);
+    let result = crate::ffi::dataset_lineage(pool_ptr, dsobj, max_prev, max_next);
+    json_from_result(result)
+}
+
 fn resolve_dataset_objset(
     pool_ptr: *mut crate::ffi::zdx_pool_t,
     dir_obj: u64,
@@ -657,17 +771,25 @@ fn resolve_dataset_objset(
     let head_obj = head_value["head_dataset_obj"].as_u64().unwrap_or(0);
     if head_obj == 0 {
         return Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "head_dataset_obj missing",
+            StatusCode::BAD_REQUEST,
+            format!(
+                "DSL dir {} has no head dataset (special internal dir such as $FREE/$MOS)",
+                dir_obj
+            ),
         ));
     }
 
     let objset_result = crate::ffi::dataset_objset(pool_ptr, head_obj);
     if !objset_result.is_ok() {
         let err_msg = objset_result.error_msg().unwrap_or("Unknown error");
-        tracing::error!("FFI error: {}", err_msg);
+        let status = if is_dataset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
         return Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             err_msg.to_string(),
         ));
     }
@@ -754,6 +876,64 @@ pub async fn objset_stat(
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::objset_stat(pool_ptr, objset_id, objid);
     json_from_result(result)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpacemapRangesQuery {
+    pub cursor: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// GET /api/pools/:pool/spacemap/:objid/summary
+pub async fn spacemap_summary(
+    State(state): State<AppState>,
+    Path((pool, objid)): Path<(String, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::spacemap_summary(pool_ptr, objid);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_spacemap_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/spacemap/:objid/ranges?cursor=&limit=
+pub async fn spacemap_ranges(
+    State(state): State<AppState>,
+    Path((pool, objid)): Path<(String, u64)>,
+    Query(params): Query<SpacemapRangesQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
+    let result = crate::ffi::spacemap_ranges(pool_ptr, objid, cursor, limit);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_spacemap_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
 }
 
 #[derive(Debug, Deserialize)]
@@ -934,6 +1114,20 @@ mod tests {
         assert_eq!(payload["head_dataset_obj"], 54);
         assert_eq!(payload["objset_id"], 54);
         assert_eq!(payload["rootbp"]["ndvas"], 2);
+    }
+
+    #[test]
+    fn spacemap_user_input_error_detection() {
+        assert!(is_spacemap_user_input_error(
+            "object 265 is type \"object array\" (11); expected \"space map\""
+        ));
+        assert!(is_spacemap_user_input_error(
+            "object 265 bonus is too small for space map payload (bonus=0, need>=24)"
+        ));
+        assert!(is_spacemap_user_input_error(
+            "failed to inspect spacemap object 999999: No such file or directory"
+        ));
+        assert!(!is_spacemap_user_input_error("failed to iterate spacemap object 264"));
     }
 
     #[test]

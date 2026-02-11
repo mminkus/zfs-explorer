@@ -243,12 +243,77 @@ type DatasetTreeNode = {
   children: DatasetTreeNode[]
 }
 
+const INTERNAL_DSL_DATASET_NAMES = new Set(['$FREE', '$MOS', '$ORIGIN'])
+
+const isInternalDslDatasetName = (name: string): boolean =>
+  INTERNAL_DSL_DATASET_NAMES.has(name.trim().toUpperCase())
+
+const isBrowsableDatasetNode = (node: DatasetTreeNode | null | undefined): node is DatasetTreeNode =>
+  !!node &&
+  !isInternalDslDatasetName(node.name) &&
+  node.head_dataset_obj !== null &&
+  node.head_dataset_obj !== undefined &&
+  node.head_dataset_obj !== 0
+
 type DatasetTreeResponse = {
   root: DatasetTreeNode
   depth: number
   limit: number
   truncated: boolean
   count: number
+}
+
+type DatasetSnapshotRef = {
+  name: string
+  dsobj: number
+}
+
+type DatasetSnapshotsResponse = {
+  dsl_dir_obj: number
+  head_dataset_obj: number
+  snapnames_zapobj: number
+  count: number
+  entries: DatasetSnapshotRef[]
+}
+
+type DatasetSnapshotCountResponse = {
+  dsl_dir_obj: number
+  head_dataset_obj: number
+  snapnames_zapobj: number
+  count: number
+}
+
+type SnapshotRecord = {
+  name: string
+  dsobj: number
+  creation_txg: number | null
+  creation_time: number | null
+  referenced_bytes: number | null
+  unique_bytes: number | null
+  deadlist_obj: number | null
+}
+
+type SnapshotLineageEntry = {
+  dsobj: number
+  dir_obj: number
+  prev_snap_obj: number
+  next_snap_obj: number
+  deadlist_obj: number
+  snapnames_zapobj: number
+  next_clones_obj: number
+  creation_txg: number
+  creation_time: number
+  referenced_bytes: number
+  unique_bytes: number
+  is_start: boolean
+}
+
+type SnapshotLineageResponse = {
+  start_dsobj: number
+  count: number
+  prev_truncated: boolean
+  next_truncated: boolean
+  entries: SnapshotLineageEntry[]
 }
 
 type DatasetCatalogEntry = {
@@ -575,6 +640,31 @@ function App() {
     key: 'name' | 'type' | 'size' | 'mtime'
     dir: 'asc' | 'desc'
   }>({ key: 'name', dir: 'asc' })
+  const [snapshotView, setSnapshotView] = useState<{
+    dslDirObj: number
+    datasetName: string
+    headDatasetObj: number | null
+  } | null>(null)
+  const [snapshotRows, setSnapshotRows] = useState<SnapshotRecord[]>([])
+  const [snapshotLoading, setSnapshotLoading] = useState(false)
+  const [snapshotError, setSnapshotError] = useState<string | null>(null)
+  const [snapshotSearch, setSnapshotSearch] = useState('')
+  const [snapshotSort, setSnapshotSort] = useState<{
+    key: 'name' | 'dsobj' | 'creation_txg' | 'creation_time' | 'referenced_bytes' | 'unique_bytes'
+    dir: 'asc' | 'desc'
+  }>({ key: 'name', dir: 'asc' })
+  const [snapshotOpeningDsobj, setSnapshotOpeningDsobj] = useState<number | null>(null)
+  const [snapshotViewMode, setSnapshotViewMode] = useState<'table' | 'lineage'>('table')
+  const [snapshotLineageDsobj, setSnapshotLineageDsobj] = useState<number | null>(null)
+  const [snapshotLineage, setSnapshotLineage] = useState<SnapshotLineageResponse | null>(null)
+  const [snapshotLineageLoading, setSnapshotLineageLoading] = useState(false)
+  const [snapshotLineageError, setSnapshotLineageError] = useState<string | null>(null)
+  const [snapshotCountsByDir, setSnapshotCountsByDir] = useState<Record<number, number | null>>(
+    {}
+  )
+  const [snapshotCountLoadingByDir, setSnapshotCountLoadingByDir] = useState<Record<number, boolean>>(
+    {}
+  )
   const [navStack, setNavStack] = useState<number[]>([])
   const [navIndex, setNavIndex] = useState(-1)
   const [inspectorTab, setInspectorTab] = useState<'summary' | 'zap' | 'blkptr' | 'raw'>('summary')
@@ -618,6 +708,7 @@ function App() {
   const fsStatKey = useRef<string | null>(null)
   const fsFilterRef = useRef<HTMLInputElement | null>(null)
   const fsAutoMetaKey = useRef<string | null>(null)
+  const snapshotRequestKey = useRef<string | null>(null)
   const suppressBrowserHistory = useRef(false)
   const historyInitialized = useRef(false)
   const initialHistoryApplied = useRef(false)
@@ -685,6 +776,26 @@ function App() {
     )
   }, [datasetIndex, selectedObject])
 
+  const datasetForMosIsBrowsable = useMemo(
+    () => isBrowsableDatasetNode(datasetForMos),
+    [datasetForMos]
+  )
+
+  const visibleDatasetNodes = useMemo(() => {
+    if (!datasetTree) return [] as DatasetTreeNode[]
+
+    const visible: DatasetTreeNode[] = []
+    const walk = (node: DatasetTreeNode, depth: number) => {
+      visible.push(node)
+      const expanded = datasetExpanded[node.dsl_dir_obj] ?? depth === 0
+      if (!expanded) return
+      node.children?.forEach(child => walk(child, depth + 1))
+    }
+
+    walk(datasetTree.root, 0)
+    return visible
+  }, [datasetTree, datasetExpanded])
+
   const dslDatasetBonus = useMemo(() => {
     const bonus = objectInfo?.bonus_decoded
     if (!bonus || !('kind' in bonus) || bonus.kind !== 'dsl_dataset') {
@@ -746,6 +857,100 @@ function App() {
     })
     return entries
   }, [filteredFsEntries, fsSort, fsEntryStats])
+
+  const filteredSnapshotRows = useMemo(() => {
+    const term = snapshotSearch.trim().toLowerCase()
+    if (!term) return snapshotRows
+    return snapshotRows.filter(row => {
+      if (row.name.toLowerCase().includes(term)) return true
+      if (row.dsobj.toString().includes(term)) return true
+      return false
+    })
+  }, [snapshotRows, snapshotSearch])
+
+  const sortedSnapshotRows = useMemo(() => {
+    const rows = [...filteredSnapshotRows]
+    const dir = snapshotSort.dir === 'asc' ? 1 : -1
+    const compareMaybeNumber = (a: number | null, b: number | null) => {
+      if (a === null && b === null) return 0
+      if (a === null) return 1
+      if (b === null) return -1
+      return a - b
+    }
+    rows.sort((a, b) => {
+      switch (snapshotSort.key) {
+        case 'dsobj':
+          return (a.dsobj - b.dsobj) * dir
+        case 'creation_txg': {
+          const cmp = compareMaybeNumber(a.creation_txg, b.creation_txg)
+          if (cmp !== 0) return cmp * dir
+          return a.name.localeCompare(b.name) * dir
+        }
+        case 'creation_time': {
+          const cmp = compareMaybeNumber(a.creation_time, b.creation_time)
+          if (cmp !== 0) return cmp * dir
+          return a.name.localeCompare(b.name) * dir
+        }
+        case 'referenced_bytes': {
+          const cmp = compareMaybeNumber(a.referenced_bytes, b.referenced_bytes)
+          if (cmp !== 0) return cmp * dir
+          return a.name.localeCompare(b.name) * dir
+        }
+        case 'unique_bytes': {
+          const cmp = compareMaybeNumber(a.unique_bytes, b.unique_bytes)
+          if (cmp !== 0) return cmp * dir
+          return a.name.localeCompare(b.name) * dir
+        }
+        case 'name':
+        default:
+          return a.name.localeCompare(b.name) * dir
+      }
+    })
+    return rows
+  }, [filteredSnapshotRows, snapshotSort])
+
+  const snapshotNameByDsobj = useMemo(() => {
+    const map = new Map<number, string>()
+    snapshotRows.forEach(row => map.set(row.dsobj, row.name))
+    return map
+  }, [snapshotRows])
+
+  const snapshotDatasetLabel = useCallback(
+    (dsobj: number) => {
+      if (!snapshotView) return `Object ${dsobj}`
+      if (snapshotView.headDatasetObj !== null && dsobj === snapshotView.headDatasetObj) {
+        return snapshotView.datasetName
+      }
+      const snapName = snapshotNameByDsobj.get(dsobj)
+      if (snapName) return `${snapshotView.datasetName}@${snapName}`
+      return `${snapshotView.datasetName}@#${dsobj}`
+    },
+    [snapshotView, snapshotNameByDsobj]
+  )
+
+  const snapshotLineageCandidates = useMemo(() => {
+    const candidates: { dsobj: number; label: string }[] = []
+    const seen = new Set<number>()
+
+    if (snapshotView?.headDatasetObj !== null && snapshotView?.headDatasetObj !== undefined) {
+      seen.add(snapshotView.headDatasetObj)
+      candidates.push({
+        dsobj: snapshotView.headDatasetObj,
+        label: `${snapshotView.datasetName} (head)`,
+      })
+    }
+
+    snapshotRows.forEach(row => {
+      if (seen.has(row.dsobj)) return
+      seen.add(row.dsobj)
+      candidates.push({
+        dsobj: row.dsobj,
+        label: `${snapshotView?.datasetName ?? 'dataset'}@${row.name}`,
+      })
+    })
+
+    return candidates
+  }, [snapshotRows, snapshotView])
 
   const fsDisplayPath = useMemo(() => {
     if (!fsState) return '/'
@@ -1030,6 +1235,7 @@ function App() {
   const isMosMode = leftPaneTab === 'mos'
   const isFsTab = leftPaneTab === 'fs'
   const isDatasetsTab = leftPaneTab === 'datasets'
+  const isSnapshotsView = isDatasetsTab && snapshotView !== null
   const isFsMode = leftPaneTab === 'datasets' || leftPaneTab === 'fs'
   const poolMode = apiVersionInfo?.pool_open?.mode === 'offline' ? 'offline' : 'live'
   const poolModeLabel = poolMode === 'offline' ? 'Offline' : 'Live'
@@ -1158,6 +1364,8 @@ function App() {
   const fetchDatasetTree = async (pool: string) => {
     setDatasetLoading(true)
     setDatasetError(null)
+    setSnapshotCountsByDir({})
+    setSnapshotCountLoadingByDir({})
     try {
       const params = new URLSearchParams()
       params.set('depth', '4')
@@ -1189,6 +1397,77 @@ function App() {
       setDatasetCatalog({})
     }
   }
+
+  useEffect(() => {
+    if (!selectedPool || !datasetTree) return
+
+    const pending = visibleDatasetNodes
+      .filter(node => isBrowsableDatasetNode(node))
+      .map(node => node.dsl_dir_obj)
+      .filter(
+        dirObj =>
+          snapshotCountsByDir[dirObj] === undefined &&
+          !snapshotCountLoadingByDir[dirObj]
+      )
+
+    if (pending.length === 0) return
+
+    const batch = pending.slice(0, 24)
+    let cancelled = false
+
+    setSnapshotCountLoadingByDir(prev => {
+      const next = { ...prev }
+      batch.forEach(dirObj => {
+        next[dirObj] = true
+      })
+      return next
+    })
+
+    const queue = [...batch]
+    const workerCount = Math.min(4, queue.length)
+
+    const worker = async () => {
+      while (!cancelled && queue.length > 0) {
+        const dirObj = queue.shift()
+        if (dirObj === undefined) break
+
+        try {
+          const data = await fetchJson<DatasetSnapshotCountResponse>(
+            `${API_BASE}/api/pools/${encodeURIComponent(
+              selectedPool
+            )}/dataset/${dirObj}/snapshot-count`
+          )
+          if (cancelled) return
+          setSnapshotCountsByDir(prev => ({
+            ...prev,
+            [dirObj]: Number.isFinite(data.count) ? data.count : null,
+          }))
+        } catch {
+          if (cancelled) return
+          setSnapshotCountsByDir(prev => ({ ...prev, [dirObj]: null }))
+        } finally {
+          if (cancelled) return
+          setSnapshotCountLoadingByDir(prev => {
+            const next = { ...prev }
+            delete next[dirObj]
+            return next
+          })
+        }
+      }
+    }
+
+    void Promise.all(Array.from({ length: workerCount }, () => worker()))
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    datasetTree,
+    selectedPool,
+    snapshotCountLoadingByDir,
+    snapshotCountsByDir,
+    visibleDatasetNodes,
+  ])
 
   const fetchPoolSummary = async (pool: string) => {
     setPoolSummaryLoading(true)
@@ -1274,6 +1553,15 @@ function App() {
   const handlePoolSelect = (pool: string) => {
     if (!pool) return
     setSelectedPool(pool)
+    setSnapshotView(null)
+    setSnapshotRows([])
+    setSnapshotError(null)
+    setSnapshotSearch('')
+    setSnapshotViewMode('table')
+    setSnapshotLineageDsobj(null)
+    setSnapshotLineage(null)
+    setSnapshotLineageLoading(false)
+    setSnapshotLineageError(null)
     setNavStack([])
     setNavIndex(-1)
     setFsHistory([])
@@ -1289,6 +1577,14 @@ function App() {
 
   const setLeftPaneTabWithHistory = (mode: NavigatorMode) => {
     setLeftPaneTab(mode)
+    if (mode !== 'datasets') {
+      setSnapshotView(null)
+      setSnapshotViewMode('table')
+      setSnapshotLineageDsobj(null)
+      setSnapshotLineage(null)
+      setSnapshotLineageLoading(false)
+      setSnapshotLineageError(null)
+    }
     if (mode === 'pool') {
       commitBrowserState({ mode: 'pool', pool: selectedPool ?? null })
       return
@@ -1312,6 +1608,9 @@ function App() {
       datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
     const catalog = datasetCatalog[fullName]
     const mountHint = catalog?.mountpoint ? ` · ${catalog.mountpoint}` : ''
+    const hasHeadDataset = isBrowsableDatasetNode(node)
+    const snapshotCount = snapshotCountsByDir[node.dsl_dir_obj]
+    const snapshotCountLoading = snapshotCountLoadingByDir[node.dsl_dir_obj] ?? false
 
     return (
       <div
@@ -1346,9 +1645,48 @@ function App() {
           <button
             className="dsl-name"
             onClick={() => enterFsFromDataset(node)}
-            title={`Dataset ${fullName} (#${node.dsl_dir_obj})${mountHint}`}
+            disabled={!hasHeadDataset}
+            title={
+              hasHeadDataset
+                ? `Dataset ${fullName} (#${node.dsl_dir_obj})${mountHint}`
+                : `${fullName} is a special/internal DSL directory`
+            }
           >
             {node.name}
+          </button>
+          <button
+            className="dsl-snapshots-btn"
+            onClick={() =>
+              void openSnapshotBrowser(
+                node.dsl_dir_obj,
+                fullName,
+                node.head_dataset_obj
+              )
+            }
+            disabled={!hasHeadDataset}
+            title={
+              hasHeadDataset
+                ? snapshotCount !== undefined && snapshotCount !== null
+                  ? `Open ${snapshotCount} snapshots for ${fullName}`
+                  : `Open snapshots for ${fullName}`
+                : `Snapshots unavailable for ${fullName}`
+            }
+          >
+            <span>Snapshots</span>
+            {hasHeadDataset && (snapshotCountLoading || snapshotCount !== undefined) && (
+              <span
+                className={`dsl-snapshots-count ${snapshotCountLoading ? 'loading' : ''}`}
+                aria-label={
+                  snapshotCountLoading
+                    ? 'Loading snapshot count'
+                    : snapshotCount === null
+                    ? 'Snapshot count unavailable'
+                    : `${snapshotCount} snapshots`
+                }
+              >
+                {snapshotCountLoading ? '…' : snapshotCount === null ? '?' : snapshotCount}
+              </span>
+            )}
           </button>
           <span className="dsl-id">#{node.dsl_dir_obj}</span>
         </div>
@@ -1360,6 +1698,207 @@ function App() {
       </div>
     )
   }
+
+  const loadSnapshotMetadata = useCallback(
+    async (pool: string, refs: DatasetSnapshotRef[]): Promise<SnapshotRecord[]> => {
+      if (refs.length === 0) return []
+
+      const queue = refs.map((entry, idx) => ({ entry, idx }))
+      const rows: SnapshotRecord[] = new Array(refs.length)
+
+      const worker = async () => {
+        while (queue.length > 0) {
+          const item = queue.shift()
+          if (!item) break
+          const { entry, idx } = item
+
+          let row: SnapshotRecord = {
+            name: entry.name,
+            dsobj: entry.dsobj,
+            creation_txg: null,
+            creation_time: null,
+            referenced_bytes: null,
+            unique_bytes: null,
+            deadlist_obj: null,
+          }
+
+          try {
+            const info = await fetchJson<DnodeInfo>(
+              `${API_BASE}/api/pools/${encodeURIComponent(pool)}/obj/${entry.dsobj}`
+            )
+            const bonus = info.bonus_decoded
+            if (bonus && 'kind' in bonus && bonus.kind === 'dsl_dataset') {
+              const dsBonus = bonus as BonusDecodedDslDataset
+              row = {
+                ...row,
+                creation_txg: dsBonus.creation_txg,
+                creation_time: dsBonus.creation_time,
+                referenced_bytes: dsBonus.referenced_bytes,
+                unique_bytes: dsBonus.unique_bytes,
+                deadlist_obj: dsBonus.deadlist_obj,
+              }
+            }
+          } catch {
+            // Best-effort metadata hydration; keep row with base fields only.
+          }
+
+          rows[idx] = row
+        }
+      }
+
+      const workers = Array.from({ length: Math.min(6, refs.length) }, () => worker())
+      await Promise.all(workers)
+      return rows
+    },
+    []
+  )
+
+  const openSnapshotBrowser = useCallback(
+    async (dslDirObj: number, datasetName: string, headDatasetObj: number | null = null) => {
+      if (!selectedPool) return
+      setLeftPaneTabWithHistory('datasets')
+      setSnapshotView({ dslDirObj, datasetName, headDatasetObj })
+      setSnapshotRows([])
+      setSnapshotViewMode('table')
+      setSnapshotLineageDsobj(null)
+      setSnapshotLineage(null)
+      setSnapshotLineageError(null)
+      setSnapshotSearch('')
+      setSnapshotSort({ key: 'name', dir: 'asc' })
+      setSnapshotLoading(true)
+      setSnapshotError(null)
+
+      const requestKey = `${selectedPool}:${dslDirObj}:${Date.now()}`
+      snapshotRequestKey.current = requestKey
+
+      try {
+        const data = await fetchJson<DatasetSnapshotsResponse>(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/dataset/${dslDirObj}/snapshots`
+        )
+
+        const rows = await loadSnapshotMetadata(selectedPool, data.entries ?? [])
+        if (snapshotRequestKey.current !== requestKey) return
+        setSnapshotRows(rows)
+        const defaultDsobj = headDatasetObj ?? rows[0]?.dsobj ?? null
+        setSnapshotLineageDsobj(defaultDsobj)
+      } catch (err) {
+        if (snapshotRequestKey.current !== requestKey) return
+        setSnapshotError((err as Error).message)
+      } finally {
+        if (snapshotRequestKey.current === requestKey) {
+          setSnapshotLoading(false)
+        }
+      }
+    },
+    [selectedPool, loadSnapshotMetadata]
+  )
+
+  const loadSnapshotLineage = useCallback(
+    async (dsobj: number, opts?: { switchMode?: boolean }) => {
+      if (!selectedPool || !snapshotView) return
+      if (opts?.switchMode) {
+        setSnapshotViewMode('lineage')
+      }
+      setSnapshotLineageDsobj(dsobj)
+      setSnapshotLineageLoading(true)
+      setSnapshotLineageError(null)
+      try {
+        const data = await fetchJson<SnapshotLineageResponse>(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/snapshot/${dsobj}/lineage?max_prev=128&max_next=128`
+        )
+        setSnapshotLineage(data)
+      } catch (err) {
+        setSnapshotLineageError((err as Error).message)
+      } finally {
+        setSnapshotLineageLoading(false)
+      }
+    },
+    [selectedPool, snapshotView]
+  )
+
+  const openSnapshotAsObject = useCallback(
+    (row: SnapshotRecord) => {
+      setLeftPaneTabWithHistory('mos')
+      setInspectorTab('summary')
+      navigateTo(row.dsobj, { reset: true })
+    },
+    [navigateTo]
+  )
+
+  const openSnapshotDsobjInFs = useCallback(
+    async (dsobj: number, datasetLabel?: string) => {
+      if (!selectedPool) return
+      setSnapshotOpeningDsobj(dsobj)
+      setFsError(null)
+      try {
+        const objsetData = await fetchJson<{ objset_id?: number }>(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/snapshot/${dsobj}/objset`
+        )
+        const objsetId = Number(objsetData.objset_id)
+        if (!objsetId) {
+          throw new Error('Missing objset_id for snapshot')
+        }
+
+        const rootData = await fetchJson<{ root_obj?: number }>(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/objset/${objsetId}/root`
+        )
+        const rootObj = Number(rootData.root_obj)
+        if (!rootObj) {
+          throw new Error('Missing root_obj for snapshot objset')
+        }
+
+        const datasetName = datasetLabel ?? snapshotDatasetLabel(dsobj)
+        const baseState: FsLocation = {
+          datasetName,
+          mountpoint: null,
+          mounted: null,
+          dslDirObj: snapshotView?.dslDirObj ?? dsobj,
+          headDatasetObj: dsobj,
+          objsetId,
+          rootObj,
+          currentDir: rootObj,
+          path: [{ name: datasetName, objid: rootObj, kind: 'dir' }],
+        }
+
+        setSnapshotView(null)
+        setSnapshotViewMode('table')
+        setSnapshotLineageDsobj(null)
+        setSnapshotLineage(null)
+        setSnapshotLineageLoading(false)
+        setSnapshotLineageError(null)
+        setLeftPaneTab('fs')
+        setFsState(baseState)
+        setFsPathInput('/')
+        setFsCenterView('list')
+        await fetchFsDir(objsetId, rootObj, baseState.path, {
+          baseState,
+          history: 'reset',
+          browser: 'replace',
+        })
+      } catch (err) {
+        setSnapshotError((err as Error).message)
+      } finally {
+        setSnapshotOpeningDsobj(null)
+      }
+    },
+    [selectedPool, snapshotDatasetLabel, snapshotView, fetchFsDir]
+  )
+
+  const openSnapshotInFs = useCallback(
+    async (row: SnapshotRecord) => {
+      const label = snapshotView ? `${snapshotView.datasetName}@${row.name}` : undefined
+      await openSnapshotDsobjInFs(row.dsobj, label)
+    },
+    [openSnapshotDsobjInFs, snapshotView]
+  )
 
   const handleFsPathClick = (index: number) => {
     if (!fsState) return
@@ -1722,6 +2261,12 @@ function App() {
 
   const enterFsFromDataset = async (node: DatasetTreeNode) => {
     if (!selectedPool) return
+    setSnapshotView(null)
+    setSnapshotViewMode('table')
+    setSnapshotLineageDsobj(null)
+    setSnapshotLineage(null)
+    setSnapshotLineageLoading(false)
+    setSnapshotLineageError(null)
     setLeftPaneTab('fs')
     resetInspector()
     setFsLoading(true)
@@ -1788,7 +2333,7 @@ function App() {
   }
 
   const openFsFromMos = () => {
-    if (!datasetForMos) return
+    if (!datasetForMosIsBrowsable || !datasetForMos) return
     enterFsFromDataset(datasetForMos)
   }
 
@@ -2018,11 +2563,38 @@ function App() {
       setFsCenterView('list')
       setFsSearch('')
       setFsSort({ key: 'name', dir: 'asc' })
+      setSnapshotView(null)
+      setSnapshotRows([])
+      setSnapshotLoading(false)
+      setSnapshotError(null)
+      setSnapshotSearch('')
+      setSnapshotSort({ key: 'name', dir: 'asc' })
+      setSnapshotViewMode('table')
+      setSnapshotLineageDsobj(null)
+      setSnapshotLineage(null)
+      setSnapshotLineageLoading(false)
+      setSnapshotLineageError(null)
+      setSnapshotCountsByDir({})
+      setSnapshotCountLoadingByDir({})
+      snapshotRequestKey.current = null
       setNavStack([])
       setNavIndex(-1)
       setShowBlkptrDetails(false)
       return
     }
+    setSnapshotView(null)
+    setSnapshotRows([])
+    setSnapshotLoading(false)
+    setSnapshotError(null)
+    setSnapshotSearch('')
+    setSnapshotViewMode('table')
+    setSnapshotLineageDsobj(null)
+    setSnapshotLineage(null)
+    setSnapshotLineageLoading(false)
+    setSnapshotLineageError(null)
+    setSnapshotCountsByDir({})
+    setSnapshotCountLoadingByDir({})
+    snapshotRequestKey.current = null
     resetInspector()
     setNavStack([])
     setNavIndex(-1)
@@ -2678,8 +3250,33 @@ function App() {
         )}
         <span className="crumb-sep">→</span>
         {isPoolTab && <span className="crumb active">Pool</span>}
-        {isDatasetsTab && (
-          <span className="crumb active">Datasets</span>
+        {isDatasetsTab && !isSnapshotsView && <span className="crumb active">Datasets</span>}
+        {isSnapshotsView && snapshotView && (
+          <>
+            <button
+              className="crumb"
+              onClick={() => {
+                setSnapshotView(null)
+                setSnapshotRows([])
+                setSnapshotError(null)
+                setSnapshotSearch('')
+                setSnapshotViewMode('table')
+                setSnapshotLineageDsobj(null)
+                setSnapshotLineage(null)
+                setSnapshotLineageLoading(false)
+                setSnapshotLineageError(null)
+              }}
+              title="Back to dataset tree"
+            >
+              Datasets
+            </button>
+            <span className="crumb-sep">→</span>
+            <span className="crumb active">Snapshots</span>
+            <span className="crumb-sep">→</span>
+            <span className="crumb active" title={`DSL dir ${snapshotView.dslDirObj}`}>
+              {snapshotView.datasetName}
+            </span>
+          </>
         )}
         {isFsTab && (
           <>
@@ -3304,7 +3901,369 @@ function App() {
               )}
             </>
           ) : !isMosMode ? (
-            <>
+            isSnapshotsView && snapshotView ? (
+              <>
+                <div className="panel-header graph-header">
+                  <div>
+                    <h2>Snapshots</h2>
+                    <span className="muted">
+                      {snapshotView.datasetName} · {snapshotRows.length} snapshot
+                      {snapshotRows.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                  <div className="graph-controls">
+                    <div className="graph-view-toggle">
+                      <button
+                        className={`graph-btn ${snapshotViewMode === 'table' ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setSnapshotViewMode('table')}
+                      >
+                        Table
+                      </button>
+                      <button
+                        className={`graph-btn ${snapshotViewMode === 'lineage' ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => {
+                          const target = snapshotLineageDsobj ?? snapshotView.headDatasetObj
+                          if (target) {
+                            void loadSnapshotLineage(target, { switchMode: true })
+                          } else {
+                            setSnapshotViewMode('lineage')
+                          }
+                        }}
+                        disabled={snapshotRows.length === 0 && snapshotView.headDatasetObj === null}
+                      >
+                        Lineage
+                      </button>
+                    </div>
+                    {snapshotViewMode === 'table' ? (
+                      <>
+                        <input
+                          className="graph-search"
+                          placeholder="Filter by snapshot name or object id"
+                          value={snapshotSearch}
+                          onChange={e => setSnapshotSearch(e.target.value)}
+                        />
+                        <select
+                          className="graph-select"
+                          value={snapshotSort.key}
+                          onChange={e =>
+                            setSnapshotSort(prev => ({
+                              ...prev,
+                              key: e.target.value as
+                                | 'name'
+                                | 'dsobj'
+                                | 'creation_txg'
+                                | 'creation_time'
+                                | 'referenced_bytes'
+                                | 'unique_bytes',
+                            }))
+                          }
+                        >
+                          <option value="name">Name</option>
+                          <option value="dsobj">Object</option>
+                          <option value="creation_txg">Creation TXG</option>
+                          <option value="creation_time">Creation Time</option>
+                          <option value="referenced_bytes">Referenced</option>
+                          <option value="unique_bytes">Unique</option>
+                        </select>
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() =>
+                            setSnapshotSort(prev => ({
+                              ...prev,
+                              dir: prev.dir === 'asc' ? 'desc' : 'asc',
+                            }))
+                          }
+                        >
+                          {snapshotSort.dir === 'asc' ? '↑' : '↓'}
+                        </button>
+                        {snapshotSearch && (
+                          <button
+                            className="graph-btn"
+                            type="button"
+                            onClick={() => setSnapshotSearch('')}
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <select
+                          className="graph-select"
+                          value={snapshotLineageDsobj ?? ''}
+                          onChange={e => {
+                            const next = Number(e.target.value)
+                            if (next) {
+                              void loadSnapshotLineage(next)
+                            }
+                          }}
+                        >
+                          <option value="" disabled>
+                            Select snapshot object
+                          </option>
+                          {snapshotLineageCandidates.map(candidate => (
+                            <option key={candidate.dsobj} value={candidate.dsobj}>
+                              {candidate.label} (#{candidate.dsobj})
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() => {
+                            if (snapshotLineageDsobj) {
+                              void loadSnapshotLineage(snapshotLineageDsobj)
+                            }
+                          }}
+                          disabled={!snapshotLineageDsobj || snapshotLineageLoading}
+                        >
+                          {snapshotLineageLoading ? 'Loading…' : 'Refresh lineage'}
+                        </button>
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() => {
+                            const oldest = snapshotLineage?.entries[0]
+                            if (oldest) {
+                              void loadSnapshotLineage(oldest.dsobj)
+                            }
+                          }}
+                          disabled={!snapshotLineage || snapshotLineage.entries.length === 0}
+                        >
+                          Oldest
+                        </button>
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() => {
+                            const entries = snapshotLineage?.entries ?? []
+                            const newest = entries.length ? entries[entries.length - 1] : null
+                            if (newest) {
+                              void loadSnapshotLineage(newest.dsobj)
+                            }
+                          }}
+                          disabled={!snapshotLineage || snapshotLineage.entries.length === 0}
+                        >
+                          Newest
+                        </button>
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() => {
+                            if (snapshotView.headDatasetObj) {
+                              void loadSnapshotLineage(snapshotView.headDatasetObj)
+                            }
+                          }}
+                          disabled={snapshotView.headDatasetObj === null}
+                        >
+                          Parent
+                        </button>
+                      </>
+                    )}
+                    <button
+                      className="graph-btn"
+                      type="button"
+                      onClick={() => {
+                        if (snapshotViewMode === 'lineage' && snapshotLineageDsobj) {
+                          void loadSnapshotLineage(snapshotLineageDsobj)
+                        } else {
+                          void openSnapshotBrowser(
+                            snapshotView.dslDirObj,
+                            snapshotView.datasetName,
+                            snapshotView.headDatasetObj
+                          )
+                        }
+                      }}
+                      disabled={snapshotLoading || snapshotLineageLoading}
+                    >
+                      {snapshotViewMode === 'lineage'
+                        ? snapshotLineageLoading
+                          ? 'Refreshing…'
+                          : 'Refresh'
+                        : snapshotLoading
+                        ? 'Refreshing…'
+                        : 'Refresh'}
+                    </button>
+                    <button
+                      className="graph-btn"
+                      type="button"
+                      onClick={() => {
+                        setSnapshotView(null)
+                        setSnapshotRows([])
+                        setSnapshotError(null)
+                        setSnapshotLineage(null)
+                        setSnapshotLineageLoading(false)
+                        setSnapshotLineageError(null)
+                        setSnapshotLineageDsobj(null)
+                        setSnapshotViewMode('table')
+                      }}
+                    >
+                      Close
+                    </button>
+                  </div>
+                </div>
+                {snapshotLoading && <p className="muted">Loading snapshots...</p>}
+                {snapshotError && (
+                  <div className="error">
+                    <strong>Error:</strong> {snapshotError}
+                  </div>
+                )}
+                <div className="graph">
+                  {snapshotViewMode === 'lineage' ? (
+                    <div className="fs-center-list">
+                      {snapshotLineageError && (
+                        <div className="error">
+                          <strong>Error:</strong> {snapshotLineageError}
+                        </div>
+                      )}
+                      {snapshotLineageLoading && <p className="muted">Loading lineage...</p>}
+                      {!snapshotLineageLoading && snapshotLineage && (
+                        <div className="fs-table snapshot-table">
+                          <div className="fs-row fs-header snapshot-header">
+                            <div>Name</div>
+                            <div>Snapshot Obj</div>
+                            <div>Creation TXG</div>
+                            <div>Creation Time</div>
+                            <div className="align-right">Referenced</div>
+                            <div className="align-right">Unique</div>
+                            <div>Actions</div>
+                          </div>
+                          {snapshotLineage.entries.map(entry => {
+                            const rowLike: SnapshotRecord = {
+                              name: snapshotNameByDsobj.get(entry.dsobj) ?? `#${entry.dsobj}`,
+                              dsobj: entry.dsobj,
+                              creation_txg: entry.creation_txg,
+                              creation_time: entry.creation_time,
+                              referenced_bytes: entry.referenced_bytes,
+                              unique_bytes: entry.unique_bytes,
+                              deadlist_obj: entry.deadlist_obj,
+                            }
+                            return (
+                              <div key={`lineage-${entry.dsobj}`} className="fs-row snapshot-row">
+                                <div className="fs-name">
+                                  {snapshotDatasetLabel(entry.dsobj)}
+                                  {entry.is_start && <span className="muted"> (anchor)</span>}
+                                </div>
+                                <div className="fs-obj">#{entry.dsobj}</div>
+                                <div>{entry.creation_txg}</div>
+                                <div>
+                                  {entry.creation_time
+                                    ? new Date(entry.creation_time * 1000).toLocaleString()
+                                    : '—'}
+                                </div>
+                                <div className="fs-size">{formatBytes(entry.referenced_bytes)}</div>
+                                <div className="fs-size">{formatBytes(entry.unique_bytes)}</div>
+                                <div className="snapshot-actions">
+                                  <button
+                                    type="button"
+                                    className="pool-errors-action-btn"
+                                    onClick={() => openSnapshotAsObject(rowLike)}
+                                  >
+                                    MOS
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="pool-errors-action-btn"
+                                    onClick={() => {
+                                      void openSnapshotDsobjInFs(
+                                        entry.dsobj,
+                                        snapshotDatasetLabel(entry.dsobj)
+                                      )
+                                    }}
+                                    disabled={snapshotOpeningDsobj === entry.dsobj}
+                                  >
+                                    {snapshotOpeningDsobj === entry.dsobj ? 'Opening…' : 'Open in FS'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="pool-errors-action-btn"
+                                    onClick={() => {
+                                      void loadSnapshotLineage(entry.dsobj)
+                                    }}
+                                  >
+                                    Anchor
+                                  </button>
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                      {!snapshotLineageLoading && !snapshotLineage && (
+                        <div className="fs-empty">Select a snapshot object to load lineage.</div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="fs-center-list">
+                      <div className="fs-table snapshot-table">
+                        <div className="fs-row fs-header snapshot-header">
+                          <div>Name</div>
+                          <div>Snapshot Obj</div>
+                          <div>Creation TXG</div>
+                          <div>Creation Time</div>
+                          <div className="align-right">Referenced</div>
+                          <div className="align-right">Unique</div>
+                          <div>Actions</div>
+                        </div>
+                        {sortedSnapshotRows.map(row => (
+                          <div key={`${row.name}-${row.dsobj}`} className="fs-row snapshot-row">
+                            <div className="fs-name">{row.name}</div>
+                            <div className="fs-obj">#{row.dsobj}</div>
+                            <div>{row.creation_txg ?? '—'}</div>
+                            <div>
+                              {row.creation_time
+                                ? new Date(row.creation_time * 1000).toLocaleString()
+                                : '—'}
+                            </div>
+                            <div className="fs-size">
+                              {row.referenced_bytes === null ? '—' : formatBytes(row.referenced_bytes)}
+                            </div>
+                            <div className="fs-size">
+                              {row.unique_bytes === null ? '—' : formatBytes(row.unique_bytes)}
+                            </div>
+                            <div className="snapshot-actions">
+                              <button
+                                type="button"
+                                className="pool-errors-action-btn"
+                                onClick={() => openSnapshotAsObject(row)}
+                              >
+                                MOS
+                              </button>
+                              <button
+                                type="button"
+                                className="pool-errors-action-btn"
+                                onClick={() => {
+                                  void openSnapshotInFs(row)
+                                }}
+                                disabled={snapshotOpeningDsobj === row.dsobj}
+                              >
+                                {snapshotOpeningDsobj === row.dsobj ? 'Opening…' : 'Open in FS'}
+                              </button>
+                              <button
+                                type="button"
+                                className="pool-errors-action-btn"
+                                onClick={() => {
+                                  void loadSnapshotLineage(row.dsobj, { switchMode: true })
+                                }}
+                              >
+                                Lineage
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                        {!snapshotLoading && sortedSnapshotRows.length === 0 && (
+                          <div className="fs-empty">No snapshots match this filter.</div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
               <div className="panel-header graph-header">
                 <div>
                   <h2>Filesystem</h2>
@@ -3545,6 +4504,7 @@ function App() {
                 )}
               </div>
             </>
+            )
           ) : (
             <>
               <div className="panel-header graph-header">
@@ -3726,7 +4686,49 @@ function App() {
             {modeSwitching && <span className="muted">switching…</span>}
           </div>
 
-          {isFsMode && fsState && (
+          {isSnapshotsView && snapshotView && (
+            <div className="inspector-content">
+              <div className="inspector-section">
+                <h3>Snapshot Browser</h3>
+                <dl className="info-grid">
+                  <div>
+                    <dt>Dataset</dt>
+                    <dd>{snapshotView.datasetName}</dd>
+                  </div>
+                  <div>
+                    <dt>DSL Dir Obj</dt>
+                    <dd>{snapshotView.dslDirObj}</dd>
+                  </div>
+                  <div>
+                    <dt>Head Dataset Obj</dt>
+                    <dd>{snapshotView.headDatasetObj ?? '—'}</dd>
+                  </div>
+                  <div>
+                    <dt>Rows</dt>
+                    <dd>{snapshotRows.length}</dd>
+                  </div>
+                  <div>
+                    <dt>View</dt>
+                    <dd>{snapshotViewMode === 'lineage' ? 'lineage' : 'table'}</dd>
+                  </div>
+                  <div>
+                    <dt>Anchor Obj</dt>
+                    <dd>{snapshotLineageDsobj ?? '—'}</dd>
+                  </div>
+                  <div>
+                    <dt>Lineage Rows</dt>
+                    <dd>{snapshotLineage?.count ?? 0}</dd>
+                  </div>
+                </dl>
+                {snapshotLoading && <p className="muted">Loading snapshot metadata...</p>}
+                {snapshotError && <p className="muted">Error: {snapshotError}</p>}
+                {snapshotLineageLoading && <p className="muted">Loading lineage...</p>}
+                {snapshotLineageError && <p className="muted">Lineage error: {snapshotLineageError}</p>}
+              </div>
+            </div>
+          )}
+
+          {!isSnapshotsView && isFsMode && fsState && (
             <div className="inspector-content">
               <div className="inspector-section">
                 <h3>Filesystem Context</h3>
@@ -3762,6 +4764,27 @@ function App() {
                     <dd>{fsState.rootObj}</dd>
                   </div>
                 </dl>
+                <div className="fs-actions">
+                  {fsState.headDatasetObj === null || fsState.headDatasetObj === 0 ? (
+                    <span className="muted">
+                      Snapshots unavailable for this special dataset.
+                    </span>
+                  ) : (
+                  <button
+                    type="button"
+                    className="fs-action-btn"
+                    onClick={() =>
+                      void openSnapshotBrowser(
+                        fsState.dslDirObj,
+                        fsState.datasetName,
+                        fsState.headDatasetObj
+                      )
+                    }
+                  >
+                    Snapshots
+                  </button>
+                  )}
+                </div>
               </div>
 
               {fsSelected && (
@@ -3873,7 +4896,7 @@ function App() {
             </div>
           )}
 
-          {isFsMode && !fsState && (
+          {!isSnapshotsView && isFsMode && !fsState && (
             <p className="muted">Select a dataset to view filesystem metadata.</p>
           )}
 
@@ -4076,8 +5099,31 @@ function App() {
                             type="button"
                             className="fs-action-btn"
                             onClick={openFsFromMos}
+                            disabled={!datasetForMosIsBrowsable}
+                            title={
+                              datasetForMosIsBrowsable
+                                ? 'Open dataset root in Filesystem view'
+                                : 'Dataset is internal and not filesystem-browseable'
+                            }
                           >
                             Open in FS
+                          </button>
+                          <button
+                            type="button"
+                            className="fs-action-btn"
+                            onClick={() =>
+                              openSnapshotBrowser(
+                                datasetForMos.dsl_dir_obj,
+                                datasetIndex.fullNameById.get(datasetForMos.dsl_dir_obj) ??
+                                  datasetForMos.name,
+                                datasetForMos.head_dataset_obj
+                              )
+                            }
+                            disabled={
+                              !datasetForMosIsBrowsable
+                            }
+                          >
+                            Snapshots
                           </button>
                         </div>
                       </div>
@@ -4258,9 +5304,55 @@ function App() {
                             <button
                               type="button"
                               className="fs-action-btn"
-                              onClick={() => enterFsFromDataset(dslDatasetNode)}
+                              onClick={() => {
+                                if (isBrowsableDatasetNode(dslDatasetNode)) {
+                                  enterFsFromDataset(dslDatasetNode)
+                                }
+                              }}
+                              disabled={!isBrowsableDatasetNode(dslDatasetNode)}
+                              title={
+                                isBrowsableDatasetNode(dslDatasetNode)
+                                  ? 'Open dataset root in Filesystem view'
+                                  : 'Dataset is internal and not filesystem-browseable'
+                              }
                             >
                               Open Dataset in FS
+                            </button>
+                            <button
+                              type="button"
+                              className="fs-action-btn"
+                              onClick={() =>
+                                openSnapshotBrowser(
+                                  dslDatasetNode.dsl_dir_obj,
+                                  datasetIndex.fullNameById.get(dslDatasetNode.dsl_dir_obj) ??
+                                    dslDatasetNode.name,
+                                  dslDatasetNode.head_dataset_obj
+                                )
+                              }
+                              disabled={
+                                !isBrowsableDatasetNode(dslDatasetNode)
+                              }
+                            >
+                              Snapshots
+                            </button>
+                          </div>
+                        )}
+
+                        {!dslDatasetNode && dslDatasetBonus.dir_obj !== 0 && (
+                          <div className="fs-actions">
+                            <button
+                              type="button"
+                              className="fs-action-btn"
+                              onClick={() =>
+                                openSnapshotBrowser(
+                                  dslDatasetBonus.dir_obj,
+                                  datasetIndex.fullNameById.get(dslDatasetBonus.dir_obj) ??
+                                    `dsl_dir_${dslDatasetBonus.dir_obj}`,
+                                  selectedObject
+                                )
+                              }
+                            >
+                              Snapshots
                             </button>
                           </div>
                         )}

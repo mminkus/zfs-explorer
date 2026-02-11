@@ -64,7 +64,11 @@ zdx_result_t zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_dsl_root_dir(zdx_pool_t *pool);
 
 /* === Dataset / Objset === */
+zdx_result_t zdx_dataset_snapshots(zdx_pool_t *pool, uint64_t dir_obj);
+zdx_result_t zdx_dataset_snapshot_count(zdx_pool_t *pool, uint64_t dir_obj);
 zdx_result_t zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj);
+zdx_result_t zdx_dataset_lineage(zdx_pool_t *pool, uint64_t dsobj,
+                                 uint64_t max_prev, uint64_t max_next);
 zdx_result_t zdx_objset_root(zdx_pool_t *pool, uint64_t objset_id);
 zdx_result_t zdx_objset_dir_entries(zdx_pool_t *pool, uint64_t objset_id,
                                     uint64_t dir_obj, uint64_t cursor,
@@ -73,6 +77,11 @@ zdx_result_t zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id,
                              const char *path);
 zdx_result_t zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id,
                              uint64_t objid);
+
+/* === Spacemap inspection === */
+zdx_result_t zdx_spacemap_summary(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid,
+                                 uint64_t cursor, uint64_t limit);
 
 /* === Version info === */
 const char *zdx_version(void); /* returns OpenZFS commit hash (injected at build time) */

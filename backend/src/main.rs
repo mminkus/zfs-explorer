@@ -1,10 +1,7 @@
 mod api;
 mod ffi;
 
-use axum::{
-    routing::get,
-    Router,
-};
+use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
@@ -147,6 +144,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(api::dataset_objset),
         )
         .route(
+            "/api/pools/{pool}/dataset/{objid}/snapshots",
+            get(api::dataset_snapshots),
+        )
+        .route(
+            "/api/pools/{pool}/dataset/{objid}/snapshot-count",
+            get(api::dataset_snapshot_count),
+        )
+        .route(
+            "/api/pools/{pool}/snapshot/{dsobj}/objset",
+            get(api::snapshot_objset),
+        )
+        .route(
+            "/api/pools/{pool}/snapshot/{dsobj}/lineage",
+            get(api::snapshot_lineage),
+        )
+        .route(
             "/api/pools/{pool}/objset/{objset_id}/root",
             get(api::objset_root),
         )
@@ -161,6 +174,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/pools/{pool}/objset/{objset_id}/stat/{objid}",
             get(api::objset_stat),
+        )
+        .route(
+            "/api/pools/{pool}/spacemap/{objid}/summary",
+            get(api::spacemap_summary),
+        )
+        .route(
+            "/api/pools/{pool}/spacemap/{objid}/ranges",
+            get(api::spacemap_ranges),
         )
         .route("/api/pools/{pool}/block", get(api::read_block))
         .route("/api/pools/{pool}/graph/from/{objid}", get(api::graph_from))

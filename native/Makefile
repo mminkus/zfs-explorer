@@ -49,6 +49,7 @@ SRCS = src/zdx_core.c \
        src/zdx_objset.c \
        src/zdx_catalog.c \
        src/zdx_zap.c \
+       src/zdx_spacemap.c \
        src/zdx_block.c \
        src/json.c
 OBJS = $(SRCS:.c=.o)

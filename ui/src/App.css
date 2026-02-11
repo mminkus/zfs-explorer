@@ -969,6 +969,21 @@ footer code {
   text-align: center;
 }
 
+.snapshot-table .snapshot-header,
+.snapshot-table .snapshot-row {
+  grid-template-columns: minmax(140px, 1.8fr) 100px 110px 170px 110px 100px 150px;
+}
+
+.snapshot-table .snapshot-header .align-right {
+  text-align: right;
+}
+
+.snapshot-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
 .pinned-section {
   display: flex;
   flex-direction: column;
@@ -1243,6 +1258,59 @@ footer code {
 
 .dsl-name:hover {
   color: var(--accent);
+}
+
+.dsl-name:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dsl-snapshots-btn {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(12, 14, 18, 0.7);
+  color: var(--muted);
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.dsl-snapshots-btn:hover {
+  border-color: rgba(255, 140, 66, 0.6);
+  color: var(--accent-2);
+  background: rgba(255, 140, 66, 0.12);
+}
+
+.dsl-snapshots-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.dsl-snapshots-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.05rem;
+  padding: 0 0.26rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 140, 66, 0.44);
+  background: rgba(255, 140, 66, 0.14);
+  color: var(--accent-2);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.25;
+}
+
+.dsl-snapshots-count.loading {
+  opacity: 0.75;
 }
 
 .dsl-id {

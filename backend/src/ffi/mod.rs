@@ -269,6 +269,32 @@ pub fn dataset_objset(pool: *mut zdx_pool_t, dsobj: u64) -> ZdxResult {
     ZdxResult::from_raw(raw)
 }
 
+/// DSL dir -> snapshots list
+pub fn dataset_snapshots(pool: *mut zdx_pool_t, dir_obj: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dataset_snapshots(pool, dir_obj) };
+    ZdxResult::from_raw(raw)
+}
+
+/// DSL dir -> snapshot count
+pub fn dataset_snapshot_count(pool: *mut zdx_pool_t, dir_obj: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dataset_snapshot_count(pool, dir_obj) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Snapshot lineage chain around a DSL dataset object
+pub fn dataset_lineage(
+    pool: *mut zdx_pool_t,
+    dsobj: u64,
+    max_prev: u64,
+    max_next: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dataset_lineage(pool, dsobj, max_prev, max_next) };
+    ZdxResult::from_raw(raw)
+}
+
 /// Objset root lookup
 pub fn objset_root(pool: *mut zdx_pool_t, objset_id: u64) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
@@ -301,6 +327,20 @@ pub fn objset_walk(pool: *mut zdx_pool_t, objset_id: u64, path: &str) -> Result<
 pub fn objset_stat(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
     let raw = unsafe { zdx_objset_stat(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Space-map summary for a specific MOS space-map object
+pub fn spacemap_summary(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_spacemap_summary(pool, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Paginated decoded space-map ranges
+pub fn spacemap_ranges(pool: *mut zdx_pool_t, objid: u64, cursor: u64, limit: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_spacemap_ranges(pool, objid, cursor, limit) };
     ZdxResult::from_raw(raw)
 }
 

@@ -28,6 +28,7 @@
 #include <sys/sa.h>
 #include <sys/zap.h>
 #include <sys/zap_impl.h>
+#include <sys/space_map.h>
 #include <sys/zfs_refcount.h>
 #include <sys/vdev.h>
 #include <sys/zio.h>

@@ -1,5 +1,123 @@
 #include "zdbdecode_internal.h"
 
+typedef struct zdx_dsl_dataset_lineage_info {
+    uint64_t dsobj;
+    uint64_t dir_obj;
+    uint64_t prev_snap_obj;
+    uint64_t next_snap_obj;
+    uint64_t deadlist_obj;
+    uint64_t snapnames_zapobj;
+    uint64_t next_clones_obj;
+    uint64_t creation_txg;
+    uint64_t creation_time;
+    uint64_t referenced_bytes;
+    uint64_t unique_bytes;
+} zdx_dsl_dataset_lineage_info_t;
+
+static int
+zdx_read_dsl_dataset_lineage_info(objset_t *mos, uint64_t dsobj,
+    zdx_dsl_dataset_lineage_info_t *info)
+{
+    if (!mos || !info || dsobj == 0)
+        return EINVAL;
+
+    dnode_t *dn = NULL;
+    int err = dnode_hold(mos, dsobj, FTAG, &dn);
+    if (err != 0)
+        return err;
+
+    dmu_object_info_t doi;
+    dmu_object_info_from_dnode(dn, &doi);
+    if (doi.doi_bonus_type != DMU_OT_DSL_DATASET ||
+        dn->dn_bonuslen < sizeof (dsl_dataset_phys_t)) {
+        dnode_rele(dn, FTAG);
+        return EINVAL;
+    }
+
+    dsl_dataset_phys_t *ds = (dsl_dataset_phys_t *)DN_BONUS(dn->dn_phys);
+    info->dsobj = dsobj;
+    info->dir_obj = ds->ds_dir_obj;
+    info->prev_snap_obj = ds->ds_prev_snap_obj;
+    info->next_snap_obj = ds->ds_next_snap_obj;
+    info->deadlist_obj = ds->ds_deadlist_obj;
+    info->snapnames_zapobj = ds->ds_snapnames_zapobj;
+    info->next_clones_obj = ds->ds_next_clones_obj;
+    info->creation_txg = ds->ds_creation_txg;
+    info->creation_time = ds->ds_creation_time;
+    info->referenced_bytes = ds->ds_referenced_bytes;
+    info->unique_bytes = ds->ds_unique_bytes;
+
+    dnode_rele(dn, FTAG);
+    return 0;
+}
+
+static boolean_t
+zdx_id_in_info_array(const zdx_dsl_dataset_lineage_info_t *items, uint64_t count,
+    uint64_t dsobj)
+{
+    for (uint64_t i = 0; i < count; i++) {
+        if (items[i].dsobj == dsobj)
+            return (B_TRUE);
+    }
+    return (B_FALSE);
+}
+
+static boolean_t
+zdx_dataset_in_special_dir(const dsl_dataset_t *ds, const char *special_name)
+{
+    if (!ds || !ds->ds_dir || !special_name)
+        return (B_FALSE);
+
+    if (strcmp(ds->ds_dir->dd_myname, special_name) == 0)
+        return (B_TRUE);
+
+    /*
+     * dd_myname is expected to be the leaf DSL dir name, but fall back to
+     * dsl_dir_name() for robustness across builds/layouts.
+     */
+    char dir_name[ZFS_MAX_DATASET_NAME_LEN];
+    dsl_dir_name(ds->ds_dir, dir_name);
+    const char *leaf = strrchr(dir_name, '/');
+    leaf = (leaf != NULL) ? (leaf + 1) : dir_name;
+
+    return (strcmp(leaf, special_name) == 0);
+}
+
+static char *
+zdx_lineage_item_json(const zdx_dsl_dataset_lineage_info_t *info, boolean_t is_start)
+{
+    if (!info)
+        return NULL;
+
+    return json_format(
+        "{"
+        "\"dsobj\":%llu,"
+        "\"dir_obj\":%llu,"
+        "\"prev_snap_obj\":%llu,"
+        "\"next_snap_obj\":%llu,"
+        "\"deadlist_obj\":%llu,"
+        "\"snapnames_zapobj\":%llu,"
+        "\"next_clones_obj\":%llu,"
+        "\"creation_txg\":%llu,"
+        "\"creation_time\":%llu,"
+        "\"referenced_bytes\":%llu,"
+        "\"unique_bytes\":%llu,"
+        "\"is_start\":%s"
+        "}",
+        (unsigned long long)info->dsobj,
+        (unsigned long long)info->dir_obj,
+        (unsigned long long)info->prev_snap_obj,
+        (unsigned long long)info->next_snap_obj,
+        (unsigned long long)info->deadlist_obj,
+        (unsigned long long)info->snapnames_zapobj,
+        (unsigned long long)info->next_clones_obj,
+        (unsigned long long)info->creation_txg,
+        (unsigned long long)info->creation_time,
+        (unsigned long long)info->referenced_bytes,
+        (unsigned long long)info->unique_bytes,
+        is_start ? "true" : "false");
+}
+
 /*
  * DSL dir children
  */
@@ -246,6 +364,249 @@ zdx_dsl_root_dir(zdx_pool_t *pool)
 }
 
 /*
+ * Snapshot list for a DSL directory
+ */
+zdx_result_t
+zdx_dataset_snapshots(zdx_pool_t *pool, uint64_t dir_obj)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    dnode_t *dir_dn = NULL;
+    int err = dnode_hold(mos, dir_obj, FTAG, &dir_dn);
+    if (err != 0) {
+        return make_error(err, "dnode_hold failed for DSL dir %llu",
+            (unsigned long long)dir_obj);
+    }
+
+    dmu_object_info_t dir_doi;
+    dmu_object_info_from_dnode(dir_dn, &dir_doi);
+    if (dir_doi.doi_bonus_type != DMU_OT_DSL_DIR ||
+        dir_dn->dn_bonuslen < sizeof (dsl_dir_phys_t)) {
+        dnode_rele(dir_dn, FTAG);
+        return make_error(EINVAL, "object %llu is not DSL dir",
+            (unsigned long long)dir_obj);
+    }
+
+    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dir_dn->dn_phys);
+    uint64_t head_dataset_obj = dd->dd_head_dataset_obj;
+    dnode_rele(dir_dn, FTAG);
+
+    if (head_dataset_obj == 0) {
+        return make_error(EINVAL, "DSL dir %llu has no head dataset",
+            (unsigned long long)dir_obj);
+    }
+
+    dnode_t *ds_dn = NULL;
+    err = dnode_hold(mos, head_dataset_obj, FTAG, &ds_dn);
+    if (err != 0) {
+        return make_error(err, "dnode_hold failed for dataset %llu",
+            (unsigned long long)head_dataset_obj);
+    }
+
+    dmu_object_info_t ds_doi;
+    dmu_object_info_from_dnode(ds_dn, &ds_doi);
+    if (ds_doi.doi_bonus_type != DMU_OT_DSL_DATASET ||
+        ds_dn->dn_bonuslen < sizeof (dsl_dataset_phys_t)) {
+        dnode_rele(ds_dn, FTAG);
+        return make_error(EINVAL, "head dataset bonus unsupported");
+    }
+
+    dsl_dataset_phys_t *ds = (dsl_dataset_phys_t *)DN_BONUS(ds_dn->dn_phys);
+    uint64_t snapnames_zapobj = ds->ds_snapnames_zapobj;
+    dnode_rele(ds_dn, FTAG);
+
+    char *entries = json_array_start();
+    if (!entries)
+        return make_error(ENOMEM, "failed to allocate snapshots array");
+    int count = 0;
+
+    if (snapnames_zapobj != 0) {
+        zap_cursor_t zc;
+        zap_cursor_init(&zc, mos, snapnames_zapobj);
+        zap_attribute_t *attrp = zap_attribute_long_alloc();
+        if (!attrp) {
+            zap_cursor_fini(&zc);
+            free(entries);
+            return make_error(ENOMEM, "failed to allocate zap attribute");
+        }
+
+        while ((err = zap_cursor_retrieve(&zc, attrp)) == 0) {
+            uint64_t snap_dsobj = 0;
+            if (attrp->za_integer_length != 8 || attrp->za_num_integers != 1) {
+                zap_cursor_advance(&zc);
+                continue;
+            }
+
+            err = zap_lookup(mos, snapnames_zapobj, attrp->za_name, 8, 1,
+                &snap_dsobj);
+            if (err != 0) {
+                zap_cursor_advance(&zc);
+                continue;
+            }
+
+            char *name_json = json_string(attrp->za_name);
+            if (!name_json) {
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                free(entries);
+                return make_error(ENOMEM, "failed to allocate snapshot name");
+            }
+
+            char *item = json_format(
+                "{\"name\":%s,\"dsobj\":%llu}",
+                name_json,
+                (unsigned long long)snap_dsobj);
+            free(name_json);
+            if (!item) {
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                free(entries);
+                return make_error(ENOMEM, "failed to allocate snapshot item");
+            }
+
+            char *new_entries = json_array_append(entries, item);
+            free(item);
+            if (!new_entries) {
+                zap_attribute_free(attrp);
+                zap_cursor_fini(&zc);
+                free(entries);
+                return make_error(ENOMEM, "failed to append snapshot item");
+            }
+
+            free(entries);
+            entries = new_entries;
+            count++;
+            zap_cursor_advance(&zc);
+        }
+
+        if (err != 0 && err != ENOENT) {
+            zap_attribute_free(attrp);
+            zap_cursor_fini(&zc);
+            free(entries);
+            return make_error(err, "snapshot ZAP traversal failed: %s",
+                strerror(err));
+        }
+
+        zap_attribute_free(attrp);
+        zap_cursor_fini(&zc);
+    }
+
+    char *entries_json = json_array_end(entries, count > 0);
+    free(entries);
+    if (!entries_json)
+        return make_error(ENOMEM, "failed to finalize snapshots array");
+
+    char *result = json_format(
+        "{"
+        "\"dsl_dir_obj\":%llu,"
+        "\"head_dataset_obj\":%llu,"
+        "\"snapnames_zapobj\":%llu,"
+        "\"count\":%d,"
+        "\"entries\":%s"
+        "}",
+        (unsigned long long)dir_obj,
+        (unsigned long long)head_dataset_obj,
+        (unsigned long long)snapnames_zapobj,
+        count,
+        entries_json);
+    free(entries_json);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * Snapshot count for a DSL directory (cheap metadata-only query).
+ */
+zdx_result_t
+zdx_dataset_snapshot_count(zdx_pool_t *pool, uint64_t dir_obj)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    dnode_t *dir_dn = NULL;
+    int err = dnode_hold(mos, dir_obj, FTAG, &dir_dn);
+    if (err != 0) {
+        return make_error(err, "dnode_hold failed for DSL dir %llu",
+            (unsigned long long)dir_obj);
+    }
+
+    dmu_object_info_t dir_doi;
+    dmu_object_info_from_dnode(dir_dn, &dir_doi);
+    if (dir_doi.doi_bonus_type != DMU_OT_DSL_DIR ||
+        dir_dn->dn_bonuslen < sizeof (dsl_dir_phys_t)) {
+        dnode_rele(dir_dn, FTAG);
+        return make_error(EINVAL, "object %llu is not DSL dir",
+            (unsigned long long)dir_obj);
+    }
+
+    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dir_dn->dn_phys);
+    uint64_t head_dataset_obj = dd->dd_head_dataset_obj;
+    dnode_rele(dir_dn, FTAG);
+
+    if (head_dataset_obj == 0) {
+        return make_error(EINVAL, "DSL dir %llu has no head dataset",
+            (unsigned long long)dir_obj);
+    }
+
+    dnode_t *ds_dn = NULL;
+    err = dnode_hold(mos, head_dataset_obj, FTAG, &ds_dn);
+    if (err != 0) {
+        return make_error(err, "dnode_hold failed for dataset %llu",
+            (unsigned long long)head_dataset_obj);
+    }
+
+    dmu_object_info_t ds_doi;
+    dmu_object_info_from_dnode(ds_dn, &ds_doi);
+    if (ds_doi.doi_bonus_type != DMU_OT_DSL_DATASET ||
+        ds_dn->dn_bonuslen < sizeof (dsl_dataset_phys_t)) {
+        dnode_rele(ds_dn, FTAG);
+        return make_error(EINVAL, "head dataset bonus unsupported");
+    }
+
+    dsl_dataset_phys_t *ds = (dsl_dataset_phys_t *)DN_BONUS(ds_dn->dn_phys);
+    uint64_t snapnames_zapobj = ds->ds_snapnames_zapobj;
+    dnode_rele(ds_dn, FTAG);
+
+    uint64_t count = 0;
+    if (snapnames_zapobj != 0) {
+        err = zap_count(mos, snapnames_zapobj, &count);
+        if (err != 0) {
+            return make_error(err, "failed to count snapshots for DSL dir %llu",
+                (unsigned long long)dir_obj);
+        }
+    }
+
+    char *result = json_format(
+        "{"
+        "\"dsl_dir_obj\":%llu,"
+        "\"head_dataset_obj\":%llu,"
+        "\"snapnames_zapobj\":%llu,"
+        "\"count\":%llu"
+        "}",
+        (unsigned long long)dir_obj,
+        (unsigned long long)head_dataset_obj,
+        (unsigned long long)snapnames_zapobj,
+        (unsigned long long)count);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
  * Dataset -> objset resolution
  */
 zdx_result_t
@@ -265,6 +626,35 @@ zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj)
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
         return make_error(err, "dsl_dataset_hold_obj failed: %s",
             strerror(err));
+    }
+
+    /*
+     * Internal datasets ($ORIGIN, $MOS, $FREE) are not user-visible ZPL
+     * filesystems. Guard before dmu_objset_from_ds() so we return a normal
+     * error instead of tripping assertions in lower layers.
+     */
+    if (zdx_dataset_in_special_dir(ds, ORIGIN_DIR_NAME)) {
+        dsl_dataset_rele(ds, FTAG);
+        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
+        return make_error(EINVAL,
+            "dataset %llu is $ORIGIN and has no user-visible ZPL objset",
+            (unsigned long long)dsobj);
+    }
+
+    if (zdx_dataset_in_special_dir(ds, MOS_DIR_NAME)) {
+        dsl_dataset_rele(ds, FTAG);
+        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
+        return make_error(EINVAL,
+            "dataset %llu is $MOS and has no user-visible ZPL objset",
+            (unsigned long long)dsobj);
+    }
+
+    if (zdx_dataset_in_special_dir(ds, FREE_DIR_NAME)) {
+        dsl_dataset_rele(ds, FTAG);
+        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
+        return make_error(EINVAL,
+            "dataset %llu is $FREE and has no user-visible ZPL objset",
+            (unsigned long long)dsobj);
     }
 
     err = dmu_objset_from_ds(ds, &os);
@@ -297,6 +687,201 @@ zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj)
         (unsigned long long)dsobj,
         (unsigned long long)objset_id,
         rootbp_json);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+}
+
+/*
+ * Snapshot lineage around a DSL dataset object.
+ */
+zdx_result_t
+zdx_dataset_lineage(zdx_pool_t *pool, uint64_t dsobj, uint64_t max_prev,
+    uint64_t max_next)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+    if (dsobj == 0)
+        return make_error(EINVAL, "dataset object must be non-zero");
+
+    if (max_prev == 0)
+        max_prev = 64;
+    if (max_next == 0)
+        max_next = 64;
+
+    const uint64_t max_chain_cap = 4096;
+    max_prev = MIN(max_prev, max_chain_cap);
+    max_next = MIN(max_next, max_chain_cap);
+
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
+
+    zdx_dsl_dataset_lineage_info_t start = { 0 };
+    int err = zdx_read_dsl_dataset_lineage_info(mos, dsobj, &start);
+    if (err != 0)
+        return make_error(err, "object %llu is not a DSL dataset",
+            (unsigned long long)dsobj);
+
+    zdx_dsl_dataset_lineage_info_t *prev_items = calloc(max_prev,
+        sizeof (*prev_items));
+    zdx_dsl_dataset_lineage_info_t *next_items = calloc(max_next,
+        sizeof (*next_items));
+    if ((!prev_items && max_prev > 0) || (!next_items && max_next > 0)) {
+        free(prev_items);
+        free(next_items);
+        return make_error(ENOMEM, "failed to allocate lineage buffers");
+    }
+
+    uint64_t prev_count = 0;
+    uint64_t next_count = 0;
+    boolean_t prev_truncated = B_FALSE;
+    boolean_t next_truncated = B_FALSE;
+
+    uint64_t cur_prev = start.prev_snap_obj;
+    while (cur_prev != 0) {
+        if (cur_prev == dsobj ||
+            zdx_id_in_info_array(prev_items, prev_count, cur_prev) ||
+            zdx_id_in_info_array(next_items, next_count, cur_prev)) {
+            prev_truncated = B_TRUE;
+            break;
+        }
+        if (prev_count >= max_prev) {
+            prev_truncated = B_TRUE;
+            break;
+        }
+
+        zdx_dsl_dataset_lineage_info_t info = { 0 };
+        err = zdx_read_dsl_dataset_lineage_info(mos, cur_prev, &info);
+        if (err != 0) {
+            free(prev_items);
+            free(next_items);
+            return make_error(err, "failed to read prev snapshot %llu",
+                (unsigned long long)cur_prev);
+        }
+
+        prev_items[prev_count++] = info;
+        cur_prev = info.prev_snap_obj;
+    }
+
+    uint64_t cur_next = start.next_snap_obj;
+    while (cur_next != 0) {
+        if (cur_next == dsobj ||
+            zdx_id_in_info_array(next_items, next_count, cur_next) ||
+            zdx_id_in_info_array(prev_items, prev_count, cur_next)) {
+            next_truncated = B_TRUE;
+            break;
+        }
+        if (next_count >= max_next) {
+            next_truncated = B_TRUE;
+            break;
+        }
+
+        zdx_dsl_dataset_lineage_info_t info = { 0 };
+        err = zdx_read_dsl_dataset_lineage_info(mos, cur_next, &info);
+        if (err != 0) {
+            free(prev_items);
+            free(next_items);
+            return make_error(err, "failed to read next snapshot %llu",
+                (unsigned long long)cur_next);
+        }
+
+        next_items[next_count++] = info;
+        cur_next = info.next_snap_obj;
+    }
+
+    char *entries = json_array_start();
+    if (!entries) {
+        free(prev_items);
+        free(next_items);
+        return make_error(ENOMEM, "failed to allocate lineage JSON array");
+    }
+
+    int item_count = 0;
+    for (uint64_t i = prev_count; i > 0; i--) {
+        char *item = zdx_lineage_item_json(&prev_items[i - 1], B_FALSE);
+        if (!item) {
+            free(entries);
+            free(prev_items);
+            free(next_items);
+            return make_error(ENOMEM, "failed to allocate lineage item");
+        }
+        char *next = json_array_append(entries, item);
+        free(item);
+        if (!next) {
+            free(entries);
+            free(prev_items);
+            free(next_items);
+            return make_error(ENOMEM, "failed to append lineage item");
+        }
+        free(entries);
+        entries = next;
+        item_count++;
+    }
+
+    char *start_item = zdx_lineage_item_json(&start, B_TRUE);
+    if (!start_item) {
+        free(entries);
+        free(prev_items);
+        free(next_items);
+        return make_error(ENOMEM, "failed to allocate start lineage item");
+    }
+    char *with_start = json_array_append(entries, start_item);
+    free(start_item);
+    if (!with_start) {
+        free(entries);
+        free(prev_items);
+        free(next_items);
+        return make_error(ENOMEM, "failed to append start lineage item");
+    }
+    free(entries);
+    entries = with_start;
+    item_count++;
+
+    for (uint64_t i = 0; i < next_count; i++) {
+        char *item = zdx_lineage_item_json(&next_items[i], B_FALSE);
+        if (!item) {
+            free(entries);
+            free(prev_items);
+            free(next_items);
+            return make_error(ENOMEM, "failed to allocate lineage item");
+        }
+        char *next = json_array_append(entries, item);
+        free(item);
+        if (!next) {
+            free(entries);
+            free(prev_items);
+            free(next_items);
+            return make_error(ENOMEM, "failed to append lineage item");
+        }
+        free(entries);
+        entries = next;
+        item_count++;
+    }
+
+    char *entries_json = json_array_end(entries, item_count > 0);
+    free(entries);
+    free(prev_items);
+    free(next_items);
+    if (!entries_json)
+        return make_error(ENOMEM, "failed to finalize lineage array");
+
+    char *result = json_format(
+        "{"
+        "\"start_dsobj\":%llu,"
+        "\"count\":%d,"
+        "\"prev_truncated\":%s,"
+        "\"next_truncated\":%s,"
+        "\"entries\":%s"
+        "}",
+        (unsigned long long)dsobj,
+        item_count,
+        prev_truncated ? "true" : "false",
+        next_truncated ? "true" : "false",
+        entries_json);
+    free(entries_json);
 
     if (!result)
         return make_error(ENOMEM, "failed to allocate JSON result");

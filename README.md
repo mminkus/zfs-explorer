@@ -226,6 +226,9 @@ zfs-explorer/
 - `GET /api/pools/:pool/graph/from/:objid` - 1-hop graph slice
 - `GET /api/pools/:pool/datasets/tree` - Dataset tree
 - `GET /api/pools/:pool/dataset/:dsl_dir_obj/head` - Dataset → objset
+- `GET /api/pools/:pool/dataset/:dsl_dir_obj/snapshots` - Snapshot list for a DSL dir
+- `GET /api/pools/:pool/snapshot/:dsobj/objset` - Snapshot dataset object → objset
+- `GET /api/pools/:pool/snapshot/:dsobj/lineage?max_prev=&max_next=` - Bounded snapshot lineage chain
 - `GET /api/pools/:pool/objset/:objset_id/root` - ZPL root znode
 - `GET /api/pools/:pool/objset/:objset_id/dir/:dir_obj/entries` - Directory entries
 - `GET /api/pools/:pool/objset/:objset_id/walk?path=/a/b` - Path walk
