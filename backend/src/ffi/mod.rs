@@ -302,6 +302,19 @@ pub fn objset_root(pool: *mut zdx_pool_t, objset_id: u64) -> ZdxResult {
     ZdxResult::from_raw(raw)
 }
 
+/// List objects from a ZFS objset
+pub fn objset_list_objects(
+    pool: *mut zdx_pool_t,
+    objset_id: u64,
+    type_filter: i32,
+    start: u64,
+    limit: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_list_objects(pool, objset_id, type_filter, start, limit) };
+    ZdxResult::from_raw(raw)
+}
+
 /// Directory entries from ZPL
 pub fn objset_dir_entries(
     pool: *mut zdx_pool_t,
@@ -327,6 +340,53 @@ pub fn objset_walk(pool: *mut zdx_pool_t, objset_id: u64, path: &str) -> Result<
 pub fn objset_stat(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
     let raw = unsafe { zdx_objset_stat(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Objset object metadata (dnode view)
+pub fn objset_get_object(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_get_object(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Objset object blkptrs
+pub fn objset_get_blkptrs(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_get_blkptrs(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Objset object ZAP metadata
+pub fn objset_zap_info(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_zap_info(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Objset object ZAP entries
+pub fn objset_zap_entries(
+    pool: *mut zdx_pool_t,
+    objset_id: u64,
+    objid: u64,
+    cursor: u64,
+    limit: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_zap_entries(pool, objset_id, objid, cursor, limit) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Read logical object data from a ZFS objset object
+pub fn objset_read_data(
+    pool: *mut zdx_pool_t,
+    objset_id: u64,
+    objid: u64,
+    offset: u64,
+    limit: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_read_data(pool, objset_id, objid, offset, limit) };
     ZdxResult::from_raw(raw)
 }
 

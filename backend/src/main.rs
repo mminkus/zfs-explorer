@@ -164,6 +164,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(api::objset_root),
         )
         .route(
+            "/api/pools/{pool}/objset/{objset_id}/objects",
+            get(api::objset_list_objects),
+        )
+        .route(
             "/api/pools/{pool}/objset/{objset_id}/dir/{dir_obj}/entries",
             get(api::objset_dir_entries),
         )
@@ -174,6 +178,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/pools/{pool}/objset/{objset_id}/stat/{objid}",
             get(api::objset_stat),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}",
+            get(api::objset_get_object),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/blkptrs",
+            get(api::objset_get_blkptrs),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/zap/info",
+            get(api::objset_zap_info),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/zap",
+            get(api::objset_zap_entries),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/full",
+            get(api::objset_get_full),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/data",
+            get(api::objset_read_data),
         )
         .route(
             "/api/pools/{pool}/spacemap/{objid}/summary",

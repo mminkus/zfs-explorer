@@ -13,6 +13,8 @@ const DEFAULT_PAGE_LIMIT: u64 = 200;
 const MAX_PAGE_LIMIT: u64 = 10_000;
 const SPACEMAP_DEFAULT_LIMIT: u64 = 200;
 const SPACEMAP_MAX_LIMIT: u64 = 2_000;
+const OBJSET_DATA_DEFAULT_LIMIT: u64 = 64 * 1024;
+const OBJSET_DATA_MAX_LIMIT: u64 = 1 << 20;
 const BACKEND_NAME: &str = env!("CARGO_PKG_NAME");
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_SHA: &str = match option_env!("ZFS_EXPLORER_GIT_SHA") {
@@ -39,6 +41,18 @@ fn is_spacemap_user_input_error(err_msg: &str) -> bool {
         || (err_msg.contains("failed to inspect spacemap object")
             && (err_msg.contains("Invalid argument")
                 || err_msg.contains("No such file or directory")))
+}
+
+fn is_objset_user_input_error(err_msg: &str) -> bool {
+    err_msg.contains("dnode_hold failed for object")
+        || err_msg.contains("objset is not ZFS")
+        || err_msg.contains("dsl_dataset_hold_obj failed")
+        || err_msg.contains("dmu_object_next failed")
+        || err_msg.contains("dmu_object_info failed for object")
+        || err_msg.contains("dmu_read failed for object")
+        || err_msg.contains("zap_get_stats failed")
+        || err_msg.contains("zap_lookup failed")
+        || err_msg.contains("zap_cursor_retrieve failed")
 }
 
 fn pool_open_mode_name(mode: crate::PoolOpenMode) -> &'static str {
@@ -248,6 +262,12 @@ fn normalize_spacemap_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (
     (cursor.unwrap_or(0), normalize_spacemap_limit(limit))
 }
 
+fn normalize_objset_data_limit(limit: Option<u64>) -> u64 {
+    limit
+        .unwrap_or(OBJSET_DATA_DEFAULT_LIMIT)
+        .clamp(1, OBJSET_DATA_MAX_LIMIT)
+}
+
 fn parse_spacemap_op_filter(op: Option<&str>) -> Result<i32, ApiError> {
     let normalized = op.unwrap_or("all").trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -365,6 +385,36 @@ pub async fn mos_list_objects(
 
     let result = crate::ffi::mos_list_objects(pool_ptr, type_filter, start, limit);
     json_from_result(result)
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/objects
+pub async fn objset_list_objects(
+    State(state): State<AppState>,
+    Path((pool, objset_id)): Path<(String, u64)>,
+    Query(params): Query<MosListQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+
+    let type_filter = params.type_filter.unwrap_or(-1);
+    let start = params.start.unwrap_or(0);
+    let limit = normalize_limit(params.limit);
+
+    let result = crate::ffi::objset_list_objects(pool_ptr, objset_id, type_filter, start, limit);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
 }
 
 /// GET /api/pools/:pool/obj/:objid
@@ -898,6 +948,240 @@ pub async fn objset_stat(
     let pool_ptr = ensure_pool(&state, &pool)?;
     let result = crate::ffi::objset_stat(pool_ptr, objset_id, objid);
     json_from_result(result)
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/obj/:objid
+pub async fn objset_get_object(
+    State(state): State<AppState>,
+    Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::objset_get_object(pool_ptr, objset_id, objid);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/obj/:objid/blkptrs
+pub async fn objset_get_blkptrs(
+    State(state): State<AppState>,
+    Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::objset_get_blkptrs(pool_ptr, objset_id, objid);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/obj/:objid/zap/info
+pub async fn objset_zap_info(
+    State(state): State<AppState>,
+    Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let result = crate::ffi::objset_zap_info(pool_ptr, objset_id, objid);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/obj/:objid/zap
+pub async fn objset_zap_entries(
+    State(state): State<AppState>,
+    Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
+    Query(params): Query<ZapEntriesQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let (cursor, limit) = normalize_cursor_limit(params.cursor, params.limit);
+    let result = crate::ffi::objset_zap_entries(pool_ptr, objset_id, objid, cursor, limit);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/obj/:objid/full
+pub async fn objset_get_full(
+    State(state): State<AppState>,
+    Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+
+    let obj_result = crate::ffi::objset_get_object(pool_ptr, objset_id, objid);
+    if !obj_result.is_ok() {
+        let err_msg = obj_result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let blk_result = crate::ffi::objset_get_blkptrs(pool_ptr, objset_id, objid);
+    if !blk_result.is_ok() {
+        let err_msg = blk_result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let obj_json = obj_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in object result"))?;
+    let blk_json = blk_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in blkptr result"))?;
+
+    let obj_value = parse_json_value(obj_json)?;
+    let blk_value = parse_json_value(blk_json)?;
+
+    let mut zap_info_value = Value::Null;
+    let mut zap_entries_value = Value::Null;
+    let is_zap = obj_value
+        .get("is_zap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_zap {
+        let zinfo_result = crate::ffi::objset_zap_info(pool_ptr, objset_id, objid);
+        if !zinfo_result.is_ok() {
+            let err_msg = zinfo_result.error_msg().unwrap_or("Unknown error");
+            let status = if is_objset_user_input_error(err_msg) {
+                StatusCode::BAD_REQUEST
+            } else {
+                tracing::error!("FFI error: {}", err_msg);
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return Err(api_error(status, err_msg.to_string()));
+        }
+
+        let zents_result = crate::ffi::objset_zap_entries(
+            pool_ptr,
+            objset_id,
+            objid,
+            0,
+            DEFAULT_PAGE_LIMIT,
+        );
+        if !zents_result.is_ok() {
+            let err_msg = zents_result.error_msg().unwrap_or("Unknown error");
+            let status = if is_objset_user_input_error(err_msg) {
+                StatusCode::BAD_REQUEST
+            } else {
+                tracing::error!("FFI error: {}", err_msg);
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return Err(api_error(status, err_msg.to_string()));
+        }
+
+        let zinfo_json = zinfo_result.json().ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Missing JSON in objset zap info result",
+            )
+        })?;
+        let zents_json = zents_result.json().ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Missing JSON in objset zap entries result",
+            )
+        })?;
+
+        zap_info_value = parse_json_value(zinfo_json)?;
+        zap_entries_value = parse_json_value(zents_json)?;
+    }
+
+    Ok(Json(json!({
+        "object": obj_value,
+        "blkptrs": blk_value,
+        "zap_info": zap_info_value,
+        "zap_entries": zap_entries_value
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ObjsetDataQuery {
+    pub offset: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+/// GET /api/pools/:pool/objset/:objset_id/obj/:objid/data?offset=&limit=
+pub async fn objset_read_data(
+    State(state): State<AppState>,
+    Path((pool, objset_id, objid)): Path<(String, u64, u64)>,
+    Query(params): Query<ObjsetDataQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let offset = params.offset.unwrap_or(0);
+    let limit = normalize_objset_data_limit(params.limit);
+    let result = crate::ffi::objset_read_data(pool_ptr, objset_id, objid, offset, limit);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
 }
 
 #[derive(Debug, Deserialize)]

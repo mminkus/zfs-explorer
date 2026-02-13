@@ -842,17 +842,8 @@ footer code {
   font-size: 0.7rem;
 }
 
-.fs-object-link {
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  cursor: pointer;
-  font: inherit;
-  padding: 0;
-}
-
-.fs-object-link:hover {
-  color: var(--accent-2);
+.fs-object-local {
+  color: var(--muted);
 }
 
 .fs-actions {
@@ -893,6 +884,11 @@ footer code {
   border-color: rgba(77, 208, 225, 0.5);
   color: var(--accent);
   background: rgba(77, 208, 225, 0.14);
+}
+
+.fs-action-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .fs-table {
@@ -978,6 +974,25 @@ footer code {
 
 .fs-obj {
   color: var(--muted);
+}
+
+.fs-obj-btn {
+  border: 1px solid rgba(77, 208, 225, 0.28);
+  background: rgba(77, 208, 225, 0.08);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.1;
+  border-radius: 999px;
+  padding: 0.12rem 0.42rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.fs-obj-btn:hover {
+  border-color: rgba(77, 208, 225, 0.64);
+  color: var(--accent);
+  background: rgba(77, 208, 225, 0.18);
 }
 
 .fs-size {
@@ -1118,12 +1133,16 @@ footer code {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  min-height: 0;
-  flex: 1;
 }
 
-.mos-objects-scroll {
+.mos-objset-tree-body,
+.mos-objects-body {
   padding-right: 0.25rem;
+}
+
+.mos-objects-body {
+  display: flex;
+  flex-direction: column;
 }
 
 .mos-objects-section h3 {
@@ -1134,6 +1153,16 @@ footer code {
   font-weight: 600;
   margin: 0;
   flex-shrink: 0;
+}
+
+.mos-objset-tree {
+  margin-bottom: 0.2rem;
+}
+
+.scope-label {
+  margin: -0.3rem 0 0.2rem;
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
 }
 
 .pane-scroll {
@@ -1289,6 +1318,11 @@ footer code {
   color: var(--accent);
 }
 
+.dsl-name.active {
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(77, 208, 225, 0.28);
+}
+
 .dsl-name:disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -1314,6 +1348,12 @@ footer code {
   border-color: rgba(255, 140, 66, 0.6);
   color: var(--accent-2);
   background: rgba(255, 140, 66, 0.12);
+}
+
+.dsl-snapshots-btn.active {
+  border-color: rgba(255, 140, 66, 0.58);
+  color: var(--accent-2);
+  background: rgba(255, 140, 66, 0.16);
 }
 
 .dsl-snapshots-btn:disabled {
@@ -1352,6 +1392,42 @@ footer code {
   margin-left: 0.46rem;
   padding-left: 0.6rem;
   border-left: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.objset-snapshot-list {
+  margin: 0.26rem 0 0.38rem 1.8rem;
+  padding-left: 0.62rem;
+  border-left: 1px dashed rgba(255, 255, 255, 0.13);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.objset-snapshot-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+}
+
+.objset-snapshot-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  cursor: pointer;
+  text-align: left;
+  padding: 0;
+}
+
+.objset-snapshot-btn:hover {
+  color: var(--accent-2);
+}
+
+.objset-snapshot-btn.active {
+  color: var(--accent-2);
+  text-shadow: 0 0 8px rgba(255, 140, 66, 0.25);
 }
 
 .muted {
@@ -2487,6 +2563,61 @@ footer code {
 .spacemap-toolbar {
   display: flex;
   justify-content: flex-end;
+}
+
+.hex-center {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  overflow: auto;
+  padding: 1rem;
+  padding-right: 0.6rem;
+}
+
+.hex-center-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hex-center-header h3 {
+  position: static;
+  margin: 0;
+  padding: 0;
+  font-size: 1.05rem;
+}
+
+.hex-toolbar {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 220px)) minmax(0, 1fr);
+  gap: 0.55rem 0.7rem;
+  align-items: end;
+}
+
+.hex-toolbar label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.hex-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.hex-center-preview {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
 }
 
 .spacemap-filters {

@@ -70,6 +70,9 @@ zdx_result_t zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj);
 zdx_result_t zdx_dataset_lineage(zdx_pool_t *pool, uint64_t dsobj,
                                  uint64_t max_prev, uint64_t max_next);
 zdx_result_t zdx_objset_root(zdx_pool_t *pool, uint64_t objset_id);
+zdx_result_t zdx_objset_list_objects(zdx_pool_t *pool, uint64_t objset_id,
+                                     int type_filter, uint64_t start,
+                                     uint64_t limit);
 zdx_result_t zdx_objset_dir_entries(zdx_pool_t *pool, uint64_t objset_id,
                                     uint64_t dir_obj, uint64_t cursor,
                                     uint64_t limit);
@@ -77,6 +80,18 @@ zdx_result_t zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id,
                              const char *path);
 zdx_result_t zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id,
                              uint64_t objid);
+zdx_result_t zdx_objset_get_object(zdx_pool_t *pool, uint64_t objset_id,
+                                   uint64_t objid);
+zdx_result_t zdx_objset_get_blkptrs(zdx_pool_t *pool, uint64_t objset_id,
+                                    uint64_t objid);
+zdx_result_t zdx_objset_zap_info(zdx_pool_t *pool, uint64_t objset_id,
+                                 uint64_t objid);
+zdx_result_t zdx_objset_zap_entries(zdx_pool_t *pool, uint64_t objset_id,
+                                    uint64_t objid, uint64_t cursor,
+                                    uint64_t limit);
+zdx_result_t zdx_objset_read_data(zdx_pool_t *pool, uint64_t objset_id,
+                                  uint64_t objid, uint64_t offset,
+                                  uint64_t limit);
 
 /* === Spacemap inspection === */
 zdx_result_t zdx_spacemap_summary(zdx_pool_t *pool, uint64_t objid);

@@ -14,6 +14,10 @@ import type {
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
 const SPACEMAP_PAGE_LIMIT = 200
+const OBJSET_DATA_DEFAULT_LIMIT = 64 * 1024
+const OBJSET_DATA_MAX_LIMIT = 1 << 20
+const OBJSET_DOWNLOAD_CHUNK = 256 * 1024
+const OBJSET_DOWNLOAD_MAX_TOTAL = 512 * 1024 * 1024
 
 type ApiErrorPayload = {
   error?: string
@@ -72,6 +76,41 @@ type MosListResponse = {
   objects: MosObject[]
 }
 
+type ObjsetListResponse = {
+  objset_id: number
+  start: number
+  limit: number
+  count: number
+  next: number | null
+  objects: MosObject[]
+}
+
+type ObjectScope =
+  | {
+      kind: 'mos'
+      key: 'mos'
+      label: string
+    }
+  | {
+      kind: 'dataset'
+      key: string
+      dslDirObj: number
+      headDatasetObj: number
+      datasetName: string
+      objsetId: number
+      label: string
+    }
+  | {
+      kind: 'snapshot'
+      key: string
+      dslDirObj: number
+      dsobj: number
+      datasetName: string
+      snapshotName: string
+      objsetId: number
+      label: string
+    }
+
 type DnodeInfo = {
   id: number
   type: { id: number; name: string }
@@ -129,10 +168,18 @@ type BlkptrInfo = {
 }
 
 type BlkptrResponse = {
+  objset_id?: number
   id: number
   nblkptr: number
   has_spill: boolean
   blkptrs: BlkptrInfo[]
+}
+
+type ObjsetObjectFullResponse = {
+  object: DnodeInfo & { objset_id: number }
+  blkptrs: BlkptrResponse & { objset_id: number }
+  zap_info: ZapInfo | null
+  zap_entries: ZapResponse | null
 }
 
 type RawBlockResponse = {
@@ -142,6 +189,17 @@ type RawBlockResponse = {
   asize: number
   requested: number
   truncated: boolean
+  data_hex: string
+}
+
+type ObjsetDataResponse = {
+  objset_id: number
+  id: number
+  offset: number
+  requested: number
+  size: number
+  max_offset: number
+  eof: boolean
   data_hex: string
 }
 
@@ -654,6 +712,12 @@ const poolSummaryToZdb = (summary: PoolSummaryResponse): string => {
   return lines.join('\n')
 }
 
+const MOS_OBJECT_SCOPE: ObjectScope = {
+  kind: 'mos',
+  key: 'mos',
+  label: 'MOS (objset 0)',
+}
+
 function App() {
   const [pools, setPools] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -667,6 +731,27 @@ function App() {
   const [mosNext, setMosNext] = useState<number | null>(null)
   const [mosLoading, setMosLoading] = useState(false)
   const [mosError, setMosError] = useState<string | null>(null)
+  const [objectScope, setObjectScope] = useState<ObjectScope>(MOS_OBJECT_SCOPE)
+  const [objsetObjects, setObjsetObjects] = useState<MosObject[]>([])
+  const [objsetNext, setObjsetNext] = useState<number | null>(null)
+  const [objsetLoading, setObjsetLoading] = useState(false)
+  const [objsetError, setObjsetError] = useState<string | null>(null)
+  const [datasetObjsetByDir, setDatasetObjsetByDir] = useState<
+    Record<number, { objsetId: number; headDatasetObj: number }>
+  >({})
+  const [snapshotObjsetByDsobj, setSnapshotObjsetByDsobj] = useState<Record<number, number>>({})
+  const [objsetSnapshotsByDir, setObjsetSnapshotsByDir] = useState<
+    Record<number, DatasetSnapshotRef[]>
+  >({})
+  const [objsetSnapshotsExpandedByDir, setObjsetSnapshotsExpandedByDir] = useState<
+    Record<number, boolean>
+  >({})
+  const [objsetSnapshotsLoadingByDir, setObjsetSnapshotsLoadingByDir] = useState<
+    Record<number, boolean>
+  >({})
+  const [objsetSnapshotsErrorByDir, setObjsetSnapshotsErrorByDir] = useState<
+    Record<number, string | null>
+  >({})
   const [selectedObject, setSelectedObject] = useState<number | null>(null)
   const [objectInfo, setObjectInfo] = useState<DnodeInfo | null>(null)
   const [blkptrs, setBlkptrs] = useState<BlkptrResponse | null>(null)
@@ -689,6 +774,8 @@ function App() {
   const [fsEntries, setFsEntries] = useState<FsEntry[]>([])
   const [fsLoading, setFsLoading] = useState(false)
   const [fsError, setFsError] = useState<string | null>(null)
+  const [objsetNameHints, setObjsetNameHints] = useState<Record<string, string>>({})
+  const [objsetSizeHints, setObjsetSizeHints] = useState<Record<string, number>>({})
   const [fsPathInput, setFsPathInput] = useState('')
   const [fsPathView, setFsPathView] = useState<'zpl' | 'mount'>('zpl')
   const [fsPathError, setFsPathError] = useState<string | null>(null)
@@ -698,6 +785,22 @@ function App() {
     objid: number
     type_name: string
   } | null>(null)
+  const [fsObjectInfo, setFsObjectInfo] = useState<(DnodeInfo & { objset_id: number }) | null>(
+    null
+  )
+  const [fsObjectBlkptrs, setFsObjectBlkptrs] = useState<
+    (BlkptrResponse & { objset_id: number }) | null
+  >(null)
+  const [fsObjectInspectorTab, setFsObjectInspectorTab] = useState<'summary' | 'zap' | 'blkptr'>(
+    'summary'
+  )
+  const [fsObjectZapInfo, setFsObjectZapInfo] = useState<ZapInfo | null>(null)
+  const [fsObjectZapEntries, setFsObjectZapEntries] = useState<ZapEntry[]>([])
+  const [fsObjectZapNext, setFsObjectZapNext] = useState<number | null>(null)
+  const [fsObjectZapLoading, setFsObjectZapLoading] = useState(false)
+  const [fsObjectZapError, setFsObjectZapError] = useState<string | null>(null)
+  const [fsObjectLoading, setFsObjectLoading] = useState(false)
+  const [fsObjectError, setFsObjectError] = useState<string | null>(null)
   const [fsStat, setFsStat] = useState<FsStat | null>(null)
   const [fsStatLoading, setFsStatLoading] = useState(false)
   const [fsStatError, setFsStatError] = useState<string | null>(null)
@@ -744,6 +847,14 @@ function App() {
   const [hexDump, setHexDump] = useState<RawBlockResponse | null>(null)
   const [hexLoading, setHexLoading] = useState(false)
   const [hexError, setHexError] = useState<string | null>(null)
+  const [centerHexDump, setCenterHexDump] = useState<ObjsetDataResponse | null>(null)
+  const [centerHexLoading, setCenterHexLoading] = useState(false)
+  const [centerHexError, setCenterHexError] = useState<string | null>(null)
+  const [centerHexOffsetInput, setCenterHexOffsetInput] = useState('0')
+  const [centerHexLimitInput, setCenterHexLimitInput] = useState(String(OBJSET_DATA_DEFAULT_LIMIT))
+  const [centerHexNonce, setCenterHexNonce] = useState(0)
+  const [centerHexDownloadLoading, setCenterHexDownloadLoading] = useState(false)
+  const [centerHexDownloadError, setCenterHexDownloadError] = useState<string | null>(null)
   const [zdbCopied, setZdbCopied] = useState(false)
   const [debugCopied, setDebugCopied] = useState(false)
   const [debugCopyError, setDebugCopyError] = useState<string | null>(null)
@@ -785,12 +896,17 @@ function App() {
   const [graphExpandedFrom, setGraphExpandedFrom] = useState<number[]>([])
   const [graphExpanding, setGraphExpanding] = useState(false)
   const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
-  const [centerView, setCenterView] = useState<'explore' | 'graph' | 'physical' | 'spacemap'>(
+  const [centerView, setCenterView] = useState<
+    'explore' | 'graph' | 'physical' | 'spacemap' | 'hex'
+  >(
     'explore'
   )
   const [isNarrow, setIsNarrow] = useState(false)
   const hexRequestKey = useRef<string | null>(null)
+  const centerHexRequestKey = useRef<string | null>(null)
   const fsStatKey = useRef<string | null>(null)
+  const fsObjectRequestKey = useRef<string | null>(null)
+  const fsObjectZapRequestKey = useRef<string | null>(null)
   const fsFilterRef = useRef<HTMLInputElement | null>(null)
   const fsAutoMetaKey = useRef<string | null>(null)
   const snapshotRequestKey = useRef<string | null>(null)
@@ -814,17 +930,21 @@ function App() {
     []
   )
 
-  const mosObjectMap = useMemo(() => {
-    const map = new Map<number, MosObject>()
-    mosObjects.forEach(obj => map.set(obj.id, obj))
-    return map
-  }, [mosObjects])
+  const activeObjects = useMemo(() => {
+    return objectScope.kind === 'mos' ? mosObjects : objsetObjects
+  }, [objectScope.kind, mosObjects, objsetObjects])
 
-  const mosTypeMap = useMemo(() => {
-    const map = new Map<number, string>()
-    mosObjects.forEach(obj => map.set(obj.id, obj.type_name))
+  const activeObjectMap = useMemo(() => {
+    const map = new Map<number, MosObject>()
+    activeObjects.forEach(obj => map.set(obj.id, obj))
     return map
-  }, [mosObjects])
+  }, [activeObjects])
+
+  const activeTypeMap = useMemo(() => {
+    const map = new Map<number, string>()
+    activeObjects.forEach(obj => map.set(obj.id, obj.type_name))
+    return map
+  }, [activeObjects])
 
   const datasetIndex = useMemo(() => {
     const nodeById = new Map<number, DatasetTreeNode>()
@@ -854,12 +974,13 @@ function App() {
 
   const datasetForMos = useMemo(() => {
     if (selectedObject === null) return null
+    if (objectScope.kind !== 'mos') return null
     return (
       datasetIndex.nodeById.get(selectedObject) ??
       datasetIndex.childZapToNode.get(selectedObject) ??
       null
     )
-  }, [datasetIndex, selectedObject])
+  }, [datasetIndex, objectScope.kind, selectedObject])
 
   const datasetForMosIsBrowsable = useMemo(
     () => isBrowsableDatasetNode(datasetForMos),
@@ -1090,6 +1211,36 @@ function App() {
     return lines.join('\n')
   }
 
+  const parseNumericInput = (raw: string): number | null => {
+    const trimmed = raw.trim()
+    if (!trimmed) return null
+    const parsed = Number.parseInt(trimmed, 0)
+    if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed < 0) return null
+    return parsed
+  }
+
+  const hexToBytes = (hex: string): Uint8Array => {
+    if (hex.length === 0) return new Uint8Array(0)
+    const pairs = hex.match(/.{1,2}/g) ?? []
+    const out = new Uint8Array(pairs.length)
+    pairs.forEach((pair, idx) => {
+      out[idx] = Number.parseInt(pair, 16)
+    })
+    return out
+  }
+
+  const sanitizeDownloadFilename = (name: string): string | null => {
+    const trimmed = name.trim()
+    if (!trimmed) return null
+    const safe = trimmed
+      .replace(/[\/\\]/g, '_')
+      .replace(/[\x00-\x1f<>:"|?*]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!safe || safe === '.' || safe === '..') return null
+    return safe
+  }
+
   const resetInspector = () => {
     setSelectedObject(null)
     setObjectInfo(null)
@@ -1118,6 +1269,29 @@ function App() {
     setSpacemapMinLengthInput('')
     setSpacemapTxgMinInput('')
     setSpacemapTxgMaxInput('')
+    setCenterHexDump(null)
+    setCenterHexLoading(false)
+    setCenterHexError(null)
+    setCenterHexOffsetInput('0')
+    setCenterHexLimitInput(String(OBJSET_DATA_DEFAULT_LIMIT))
+    setCenterHexNonce(0)
+    setCenterHexDownloadLoading(false)
+    setCenterHexDownloadError(null)
+  }
+
+  function clearFsObjectInspector() {
+    fsObjectRequestKey.current = null
+    fsObjectZapRequestKey.current = null
+    setFsObjectInfo(null)
+    setFsObjectBlkptrs(null)
+    setFsObjectInspectorTab('summary')
+    setFsObjectZapInfo(null)
+    setFsObjectZapEntries([])
+    setFsObjectZapNext(null)
+    setFsObjectZapLoading(false)
+    setFsObjectZapError(null)
+    setFsObjectError(null)
+    setFsObjectLoading(false)
   }
 
   const formatTimestamp = (ts?: { sec: number; nsec: number }) => {
@@ -1221,11 +1395,12 @@ function App() {
 
       if (state.mode === 'mos') {
         setLeftPaneTab('mos')
+        setObjectScope(MOS_OBJECT_SCOPE)
         if (state.objid) {
           setNavStack([state.objid])
           setNavIndex(0)
           setSelectedObject(state.objid)
-          fetchInspector(state.objid)
+          fetchInspector(state.objid, MOS_OBJECT_SCOPE)
         } else {
           setSelectedObject(null)
           resetInspector()
@@ -1251,6 +1426,7 @@ function App() {
           setFsEntries([])
           setFsSelected(null)
           setFsStat(null)
+          clearFsObjectInspector()
         }
       }
     },
@@ -1259,7 +1435,9 @@ function App() {
 
   const pinnedObjects = selectedPool ? pinnedByPool[selectedPool] ?? [] : []
   const isPinned =
-    selectedObject !== null && pinnedObjects.some(entry => entry.objid === selectedObject)
+    objectScope.kind === 'mos' &&
+    selectedObject !== null &&
+    pinnedObjects.some(entry => entry.objid === selectedObject)
 
   const navigateTo = useCallback(
     (
@@ -1269,10 +1447,12 @@ function App() {
         replace?: boolean
         navAction?: 'back' | 'forward' | 'jump'
         jumpIndex?: number
+        scope?: ObjectScope
       }
     ) => {
+      const scope = opts?.scope ?? objectScope
       setSelectedObject(objid)
-      fetchInspector(objid)
+      fetchInspector(objid, scope)
 
       if (opts?.navAction === 'back' || opts?.navAction === 'forward') {
         // Just update index, don't modify stack
@@ -1324,7 +1504,7 @@ function App() {
       })
       commitBrowserState({ mode: 'mos', pool: selectedPool ?? null, objid })
     },
-    [navIndex, selectedPool, commitBrowserState]
+    [navIndex, selectedPool, objectScope, commitBrowserState]
   )
 
   const isPoolTab = leftPaneTab === 'pool'
@@ -1333,6 +1513,11 @@ function App() {
   const isDatasetsTab = leftPaneTab === 'datasets'
   const isSnapshotsView = isDatasetsTab && snapshotView !== null
   const isFsMode = leftPaneTab === 'datasets' || leftPaneTab === 'fs'
+  const isMosScope = objectScope.kind === 'mos'
+  const scopedObjects = isMosScope ? mosObjects : objsetObjects
+  const scopedNext = isMosScope ? mosNext : objsetNext
+  const scopedLoading = isMosScope ? mosLoading : objsetLoading
+  const scopedError = isMosScope ? mosError : objsetError
   const poolMode = apiVersionInfo?.pool_open?.mode === 'offline' ? 'offline' : 'live'
   const poolModeLabel = poolMode === 'offline' ? 'Offline' : 'Live'
   const offlinePoolNames = apiVersionInfo?.pool_open?.offline_pools ?? []
@@ -1649,6 +1834,16 @@ function App() {
   const handlePoolSelect = (pool: string) => {
     if (!pool) return
     setSelectedPool(pool)
+    setObjectScope(MOS_OBJECT_SCOPE)
+    setObjsetObjects([])
+    setObjsetNext(null)
+    setObjsetError(null)
+    setDatasetObjsetByDir({})
+    setSnapshotObjsetByDsobj({})
+    setObjsetSnapshotsByDir({})
+    setObjsetSnapshotsExpandedByDir({})
+    setObjsetSnapshotsLoadingByDir({})
+    setObjsetSnapshotsErrorByDir({})
     setSnapshotView(null)
     setSnapshotRows([])
     setSnapshotError(null)
@@ -1795,6 +1990,142 @@ function App() {
     )
   }
 
+  const renderObjsetNavigatorNode = (node: DatasetTreeNode, depth: number) => {
+    const expanded = datasetExpanded[node.dsl_dir_obj] ?? depth === 0
+    const children = (node.children ?? []).filter(child => !isInternalDslDatasetName(child.name))
+    const hasChildren = children.length > 0
+    const hasHeadDataset = isBrowsableDatasetNode(node)
+    const fullName = datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
+    const cached = datasetObjsetByDir[node.dsl_dir_obj]
+    const isActiveDataset =
+      objectScope.kind === 'dataset' && objectScope.dslDirObj === node.dsl_dir_obj
+    const snapshots = objsetSnapshotsByDir[node.dsl_dir_obj] ?? []
+    const snapshotsExpanded = objsetSnapshotsExpandedByDir[node.dsl_dir_obj] ?? false
+    const snapshotsLoading = objsetSnapshotsLoadingByDir[node.dsl_dir_obj] ?? false
+    const snapshotsError = objsetSnapshotsErrorByDir[node.dsl_dir_obj]
+    const snapshotCount = snapshotCountsByDir[node.dsl_dir_obj]
+
+    return (
+      <div
+        key={`objset-${node.dsl_dir_obj}-${node.name}`}
+        className={`dsl-item ${depth === 0 ? 'dsl-root' : ''}`}
+        style={{ marginLeft: depth * 14 }}
+      >
+        <div className={`dsl-node ${depth > 0 ? 'dsl-node-child' : ''}`}>
+          <button
+            className={`dsl-toggle ${hasChildren ? (expanded ? 'expanded' : 'collapsed') : 'leaf'}`}
+            onClick={() => toggleDatasetNode(node.dsl_dir_obj)}
+            disabled={!hasChildren}
+            aria-label={
+              hasChildren
+                ? expanded
+                  ? `Collapse ${node.name}`
+                  : `Expand ${node.name}`
+                : `${node.name} has no children`
+            }
+          >
+            {hasChildren ? (
+              <span className="tree-toggle-glyph" aria-hidden>
+                ▸
+              </span>
+            ) : (
+              <span className="tree-toggle-leaf" aria-hidden>
+                •
+              </span>
+            )}
+          </button>
+          <button
+            className={`dsl-name ${isActiveDataset ? 'active' : ''}`}
+            onClick={() => {
+              void openDatasetObjsetScope(node)
+            }}
+            disabled={!hasHeadDataset}
+            title={
+              hasHeadDataset
+                ? `Open ${fullName} objset scope`
+                : `${fullName} is not a user-visible dataset`
+            }
+          >
+            {node.name}
+          </button>
+          <button
+            className={`dsl-snapshots-btn ${snapshotsExpanded ? 'active' : ''}`}
+            onClick={() => {
+              void toggleObjsetSnapshots(node)
+            }}
+            disabled={!hasHeadDataset}
+            title={
+              hasHeadDataset
+                ? snapshotCount !== undefined && snapshotCount !== null
+                  ? `Show ${snapshotCount} snapshots for ${fullName}`
+                  : `Show snapshots for ${fullName}`
+                : `Snapshots unavailable for ${fullName}`
+            }
+          >
+            <span>Snapshots</span>
+            {hasHeadDataset && (snapshotsLoading || snapshotCount !== undefined) && (
+              <span
+                className={`dsl-snapshots-count ${snapshotsLoading ? 'loading' : ''}`}
+                aria-label={
+                  snapshotsLoading
+                    ? 'Loading snapshot count'
+                    : snapshotCount === null
+                    ? 'Snapshot count unavailable'
+                    : `${snapshotCount} snapshots`
+                }
+              >
+                {snapshotsLoading ? '…' : snapshotCount === null ? '?' : snapshotCount}
+              </span>
+            )}
+          </button>
+          <span className="dsl-id">{cached ? `objset ${cached.objsetId}` : `#${node.dsl_dir_obj}`}</span>
+        </div>
+
+        {snapshotsExpanded && hasHeadDataset && (
+          <div className="objset-snapshot-list">
+            {snapshotsLoading && <p className="muted">Loading snapshots…</p>}
+            {!snapshotsLoading && snapshotsError && <p className="muted">Error: {snapshotsError}</p>}
+            {!snapshotsLoading && !snapshotsError && snapshots.length === 0 && (
+              <p className="muted">No snapshots.</p>
+            )}
+            {!snapshotsLoading &&
+              !snapshotsError &&
+              snapshots.map(snapshot => {
+                const cachedObjset = snapshotObjsetByDsobj[snapshot.dsobj]
+                const isActiveSnapshot =
+                  objectScope.kind === 'snapshot' && objectScope.dsobj === snapshot.dsobj
+                return (
+                  <div
+                    key={`snap-${snapshot.dsobj}`}
+                    className={`objset-snapshot-item ${isActiveSnapshot ? 'active' : ''}`}
+                  >
+                    <button
+                      className={`objset-snapshot-btn ${isActiveSnapshot ? 'active' : ''}`}
+                      onClick={() => {
+                        void openSnapshotObjsetScope(node, snapshot)
+                      }}
+                      title={`Open ${fullName}@${snapshot.name} objset scope`}
+                    >
+                      @{snapshot.name}
+                    </button>
+                    <span className="dsl-id">
+                      {cachedObjset ? `objset ${cachedObjset}` : `#${snapshot.dsobj}`}
+                    </span>
+                  </div>
+                )
+              })}
+          </div>
+        )}
+
+        {expanded && hasChildren && (
+          <div className="dsl-children">
+            {children.map(child => renderObjsetNavigatorNode(child, depth + 1))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   const loadSnapshotMetadata = useCallback(
     async (pool: string, refs: DatasetSnapshotRef[]): Promise<SnapshotRecord[]> => {
       if (refs.length === 0) return []
@@ -1919,10 +2250,17 @@ function App() {
   const openSnapshotAsObject = useCallback(
     (row: SnapshotRecord) => {
       setLeftPaneTabWithHistory('mos')
+      if (objectScope.kind !== 'mos') {
+        setObjectScope(MOS_OBJECT_SCOPE)
+        setObjsetObjects([])
+        setObjsetNext(null)
+        setObjsetError(null)
+        void fetchMosObjects(0, false)
+      }
       setInspectorTab('summary')
-      navigateTo(row.dsobj, { reset: true })
+      navigateTo(row.dsobj, { reset: true, scope: MOS_OBJECT_SCOPE })
     },
-    [navigateTo]
+    [navigateTo, objectScope.kind]
   )
 
   const openSnapshotDsobjInFs = useCallback(
@@ -2003,6 +2341,18 @@ function App() {
     fetchFsDir(fsState.objsetId, target.objid, nextPath)
   }
 
+  const inspectFsObjectById = (objid: number, name = `object #${objid}`, typeName = 'unknown') => {
+    if (!fsState) return
+    clearFsObjectInspector()
+    setFsSelected({ name, objid, type_name: typeName })
+    fetchFsStat(fsState.objsetId, objid)
+    fetchFsObjectInspector(fsState.objsetId, objid)
+  }
+
+  const inspectFsObject = (entry: FsEntry) => {
+    inspectFsObjectById(entry.objid, entry.name, entry.type_name)
+  }
+
   const handleFsEntryClick = (entry: FsEntry) => {
     if (!fsState) return
     if (entry.type_name === 'dir') {
@@ -2014,6 +2364,7 @@ function App() {
       }
     }
     if (entry.type_name !== 'dir') {
+      clearFsObjectInspector()
       setFsSelected(entry)
       fetchFsStat(fsState.objsetId, entry.objid)
       return
@@ -2076,6 +2427,7 @@ function App() {
       )
       if (fsStatKey.current !== key) return
       setFsStat(data)
+      setObjsetSizeHints(prev => ({ ...prev, [key]: data.size }))
     } catch (err) {
       if (fsStatKey.current === key) {
         setFsStatError((err as Error).message)
@@ -2084,6 +2436,80 @@ function App() {
     } finally {
       if (fsStatKey.current === key) {
         setFsStatLoading(false)
+      }
+    }
+  }
+
+  const fetchFsObjectInspector = async (objsetId: number, objid: number) => {
+    if (!selectedPool) return
+    const key = `${objsetId}:${objid}`
+    fsObjectRequestKey.current = key
+    setFsObjectLoading(true)
+    setFsObjectError(null)
+    try {
+      const data = await fetchJson<ObjsetObjectFullResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${objsetId}/obj/${objid}/full`
+      )
+      if (fsObjectRequestKey.current !== key) return
+      setFsObjectInfo(data.object)
+      setFsObjectBlkptrs(data.blkptrs)
+      setFsObjectInspectorTab('summary')
+      if (data.object.is_zap && data.zap_info && data.zap_entries) {
+        setFsObjectZapInfo(data.zap_info)
+        setFsObjectZapEntries(data.zap_entries.entries ?? [])
+        setFsObjectZapNext(data.zap_entries.next)
+      } else {
+        setFsObjectZapInfo(null)
+        setFsObjectZapEntries([])
+        setFsObjectZapNext(null)
+      }
+      setFsObjectZapError(null)
+    } catch (err) {
+      if (fsObjectRequestKey.current === key) {
+        setFsObjectInfo(null)
+        setFsObjectBlkptrs(null)
+        setFsObjectZapInfo(null)
+        setFsObjectZapEntries([])
+        setFsObjectZapNext(null)
+        setFsObjectZapError(null)
+        setFsObjectError((err as Error).message)
+      }
+    } finally {
+      if (fsObjectRequestKey.current === key) {
+        setFsObjectLoading(false)
+      }
+    }
+  }
+
+  const fetchFsObjectZapEntries = async (
+    objsetId: number,
+    objid: number,
+    cursor: number,
+    append: boolean
+  ) => {
+    if (!selectedPool) return
+    const key = `${objsetId}:${objid}`
+    fsObjectZapRequestKey.current = key
+    setFsObjectZapLoading(true)
+    setFsObjectZapError(null)
+    try {
+      const data = await fetchJson<ZapResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${objsetId}/obj/${objid}/zap?cursor=${cursor}&limit=${MOS_PAGE_LIMIT}`
+      )
+      if (fsObjectZapRequestKey.current !== key) return
+      setFsObjectZapEntries(prev => (append ? [...prev, ...data.entries] : data.entries))
+      setFsObjectZapNext(data.next)
+    } catch (err) {
+      if (fsObjectZapRequestKey.current === key) {
+        setFsObjectZapError((err as Error).message)
+      }
+    } finally {
+      if (fsObjectZapRequestKey.current === key) {
+        setFsObjectZapLoading(false)
       }
     }
   }
@@ -2120,6 +2546,13 @@ function App() {
       await Promise.all(workers)
       if (!cancelled) {
         setFsEntryStats(stats)
+        setObjsetSizeHints(prev => {
+          const next = { ...prev }
+          Object.entries(stats).forEach(([objid, stat]) => {
+            next[`${objsetId}:${objid}`] = stat.size
+          })
+          return next
+        })
       }
     } catch (err) {
       if (!cancelled) {
@@ -2187,7 +2620,14 @@ function App() {
           await fetchFsDir(fsState.objsetId, objid, segments)
         }
       } else {
+        clearFsObjectInspector()
         setFsSelected({ name: resolved, objid, type_name: typeName })
+        setObjsetNameHints(prev => {
+          const parts = resolved.split('/').filter(Boolean)
+          const leaf = parts[parts.length - 1] ?? resolved
+          if (!leaf) return prev
+          return { ...prev, [`${fsState.objsetId}:${objid}`]: leaf }
+        })
         setFsPathInput(resolved.startsWith('/') ? resolved : `/${resolved}`)
         fetchFsStat(fsState.objsetId, objid)
       }
@@ -2210,15 +2650,46 @@ function App() {
       const nextPath = [...fsState.path, { name: entry.name, objid: entry.objid }]
       fetchFsDir(fsState.objsetId, entry.objid, nextPath)
     } else {
+      clearFsObjectInspector()
       setFsSelected(entry)
       fetchFsStat(fsState.objsetId, entry.objid)
     }
   }
 
-  const openFsSelectionAsObject = () => {
-    if (!fsSelected) return
-    setLeftPaneTab('mos')
-    navigateTo(fsSelected.objid, { reset: true })
+  const buildObjectScopeFromFsState = (state: FsLocation): ObjectScope => {
+    const atIndex = state.datasetName.indexOf('@')
+    if (atIndex > 0 && state.headDatasetObj !== null && state.headDatasetObj > 0) {
+      const datasetName = state.datasetName.slice(0, atIndex)
+      const snapshotName = state.datasetName.slice(atIndex + 1)
+      return {
+        kind: 'snapshot',
+        key: `snapshot:${state.headDatasetObj}`,
+        dslDirObj: state.dslDirObj,
+        dsobj: state.headDatasetObj,
+        datasetName,
+        snapshotName,
+        objsetId: state.objsetId,
+        label: `${datasetName}@${snapshotName} (objset ${state.objsetId})`,
+      }
+    }
+    return {
+      kind: 'dataset',
+      key: `dataset:${state.dslDirObj}`,
+      dslDirObj: state.dslDirObj,
+      headDatasetObj: Number(state.headDatasetObj ?? 0),
+      datasetName: state.datasetName,
+      objsetId: state.objsetId,
+      label: `${state.datasetName} (objset ${state.objsetId})`,
+    }
+  }
+
+  const openFsSelectionInDmuView = async () => {
+    if (!fsState || !fsSelected) return
+    const scope = buildObjectScopeFromFsState(fsState)
+    setLeftPaneTabWithHistory('mos')
+    await activateObjectScope(scope)
+    setInspectorTab('summary')
+    navigateTo(fsSelected.objid, { reset: true, scope })
   }
 
   async function fetchFsDir(
@@ -2244,9 +2715,23 @@ function App() {
         )}/objset/${objsetId}/dir/${dirObj}/entries?${params.toString()}`
       )
       setFsEntries(data.entries ?? [])
+      setObjsetNameHints(prev => {
+        const next = { ...prev }
+        const currentName = path[path.length - 1]?.name
+        if (currentName) {
+          next[`${objsetId}:${dirObj}`] = currentName
+        }
+        ;(data.entries ?? []).forEach(entry => {
+          if (entry?.name) {
+            next[`${objsetId}:${entry.objid}`] = entry.name
+          }
+        })
+        return next
+      })
       setFsEntryStats({})
       setFsEntryStatsError(null)
       const currentName = path[path.length - 1]?.name ?? 'dir'
+      clearFsObjectInspector()
       setFsSelected({ name: currentName, objid: dirObj, type_name: 'dir' })
       fetchFsStat(objsetId, dirObj)
       if (path.length > 1) {
@@ -2368,6 +2853,7 @@ function App() {
     setFsLoading(true)
     setFsError(null)
     setFsSelected(null)
+    clearFsObjectInspector()
     setFsStat(null)
     setFsStatError(null)
     setFsPathInput('/')
@@ -2443,11 +2929,24 @@ function App() {
 
   const openPoolErrorAsObject = useCallback(
     (entry: PoolErrorEntry) => {
+      if (entry.dataset_obj !== 0) {
+        setPoolErrorsError(
+          `Object #${entry.object} is objset-local (dataset ${entry.dataset_obj}); use FS action instead.`
+        )
+        return
+      }
       setLeftPaneTab('mos')
+      if (objectScope.kind !== 'mos') {
+        setObjectScope(MOS_OBJECT_SCOPE)
+        setObjsetObjects([])
+        setObjsetNext(null)
+        setObjsetError(null)
+        void fetchMosObjects(0, false)
+      }
       setInspectorTab('summary')
-      navigateTo(entry.object, { reset: true })
+      navigateTo(entry.object, { reset: true, scope: MOS_OBJECT_SCOPE })
     },
-    [navigateTo]
+    [navigateTo, objectScope.kind]
   )
 
   const openPoolErrorInFs = useCallback(
@@ -2473,6 +2972,7 @@ function App() {
           ? entry.path!.trim()
           : `object #${entry.object}`
 
+        clearFsObjectInspector()
         setFsSelected({
           name: selectedName,
           objid: entry.object,
@@ -2518,6 +3018,185 @@ function App() {
     }
   }
 
+  const fetchObjsetObjects = async (objsetId: number, start: number, append: boolean) => {
+    if (!selectedPool) return
+    setObjsetLoading(true)
+    setObjsetError(null)
+
+    const params = new URLSearchParams()
+    params.set('start', String(start))
+    params.set('limit', String(MOS_PAGE_LIMIT))
+    if (typeFilter !== null) {
+      params.set('type', String(typeFilter))
+    }
+
+    try {
+      const data = await fetchJson<ObjsetListResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${objsetId}/objects?${params.toString()}`
+      )
+      setObjsetObjects(prev => (append ? [...prev, ...data.objects] : data.objects))
+      setObjsetNext(data.next)
+    } catch (err) {
+      setObjsetError((err as Error).message)
+    } finally {
+      setObjsetLoading(false)
+    }
+  }
+
+  const activateObjectScope = async (scope: ObjectScope) => {
+    if (!selectedPool) return
+
+    setObjectScope(scope)
+    setSelectedObject(null)
+    resetInspector()
+    setNavStack([])
+    setNavIndex(-1)
+    setGraphSearch('')
+    setGraphExpandError(null)
+
+    if (scope.kind === 'mos') {
+      setObjsetObjects([])
+      setObjsetNext(null)
+      setObjsetError(null)
+      await fetchMosObjects(0, false)
+    } else {
+      await fetchObjsetObjects(scope.objsetId, 0, false)
+    }
+
+    commitBrowserState({ mode: 'mos', pool: selectedPool, objid: null }, 'replace')
+  }
+
+  const openDatasetObjsetScope = async (node: DatasetTreeNode) => {
+    if (!selectedPool || !isBrowsableDatasetNode(node)) return
+    const cached = datasetObjsetByDir[node.dsl_dir_obj]
+    const datasetName =
+      datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
+
+    if (cached) {
+      await activateObjectScope({
+        kind: 'dataset',
+        key: `dataset:${node.dsl_dir_obj}`,
+        dslDirObj: node.dsl_dir_obj,
+        headDatasetObj: cached.headDatasetObj,
+        datasetName,
+        objsetId: cached.objsetId,
+        label: `${datasetName} (objset ${cached.objsetId})`,
+      })
+      return
+    }
+
+    try {
+      const data = await fetchJson<{ head_dataset_obj?: number; objset_id?: number }>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/dataset/${node.dsl_dir_obj}/head`
+      )
+      const objsetId = Number(data.objset_id)
+      const headDatasetObj = Number(data.head_dataset_obj)
+      if (!objsetId || !headDatasetObj) {
+        throw new Error('Missing objset_id/head_dataset_obj')
+      }
+      setDatasetObjsetByDir(prev => ({
+        ...prev,
+        [node.dsl_dir_obj]: { objsetId, headDatasetObj },
+      }))
+      await activateObjectScope({
+        kind: 'dataset',
+        key: `dataset:${node.dsl_dir_obj}`,
+        dslDirObj: node.dsl_dir_obj,
+        headDatasetObj,
+        datasetName,
+        objsetId,
+        label: `${datasetName} (objset ${objsetId})`,
+      })
+    } catch (err) {
+      setObjsetError((err as Error).message)
+    }
+  }
+
+  const toggleObjsetSnapshots = async (node: DatasetTreeNode) => {
+    if (!selectedPool || !isBrowsableDatasetNode(node)) return
+    const dirObj = node.dsl_dir_obj
+    const currentlyExpanded = objsetSnapshotsExpandedByDir[dirObj] ?? false
+    const nextExpanded = !currentlyExpanded
+    setObjsetSnapshotsExpandedByDir(prev => ({ ...prev, [dirObj]: nextExpanded }))
+    if (!nextExpanded) return
+
+    if (objsetSnapshotsByDir[dirObj] || objsetSnapshotsLoadingByDir[dirObj]) {
+      return
+    }
+
+    setObjsetSnapshotsLoadingByDir(prev => ({ ...prev, [dirObj]: true }))
+    setObjsetSnapshotsErrorByDir(prev => ({ ...prev, [dirObj]: null }))
+
+    try {
+      const data = await fetchJson<DatasetSnapshotsResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/dataset/${dirObj}/snapshots`
+      )
+      setObjsetSnapshotsByDir(prev => ({ ...prev, [dirObj]: data.entries ?? [] }))
+    } catch (err) {
+      setObjsetSnapshotsErrorByDir(prev => ({
+        ...prev,
+        [dirObj]: (err as Error).message,
+      }))
+    } finally {
+      setObjsetSnapshotsLoadingByDir(prev => {
+        const next = { ...prev }
+        delete next[dirObj]
+        return next
+      })
+    }
+  }
+
+  const openSnapshotObjsetScope = async (node: DatasetTreeNode, snapshot: DatasetSnapshotRef) => {
+    if (!selectedPool || !isBrowsableDatasetNode(node)) return
+    const datasetName =
+      datasetIndex.fullNameById.get(node.dsl_dir_obj) ?? node.name
+    const cachedObjsetId = snapshotObjsetByDsobj[snapshot.dsobj]
+    if (cachedObjsetId) {
+      await activateObjectScope({
+        kind: 'snapshot',
+        key: `snapshot:${snapshot.dsobj}`,
+        dslDirObj: node.dsl_dir_obj,
+        dsobj: snapshot.dsobj,
+        datasetName,
+        snapshotName: snapshot.name,
+        objsetId: cachedObjsetId,
+        label: `${datasetName}@${snapshot.name} (objset ${cachedObjsetId})`,
+      })
+      return
+    }
+
+    try {
+      const data = await fetchJson<{ objset_id?: number }>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/snapshot/${snapshot.dsobj}/objset`
+      )
+      const objsetId = Number(data.objset_id)
+      if (!objsetId) {
+        throw new Error('Missing objset_id for snapshot')
+      }
+      setSnapshotObjsetByDsobj(prev => ({ ...prev, [snapshot.dsobj]: objsetId }))
+      await activateObjectScope({
+        kind: 'snapshot',
+        key: `snapshot:${snapshot.dsobj}`,
+        dslDirObj: node.dsl_dir_obj,
+        dsobj: snapshot.dsobj,
+        datasetName,
+        snapshotName: snapshot.name,
+        objsetId,
+        label: `${datasetName}@${snapshot.name} (objset ${objsetId})`,
+      })
+    } catch (err) {
+      setObjsetError((err as Error).message)
+    }
+  }
+
   const switchPoolMode = async (nextMode: 'live' | 'offline') => {
     if (modeSwitching || nextMode === poolMode) return
 
@@ -2548,6 +3227,7 @@ function App() {
 
       if (!activePool) {
         setSelectedPool(null)
+        setObjectScope(MOS_OBJECT_SCOPE)
         setPoolSummary(null)
         setPoolSummaryError(null)
         setPoolErrors(null)
@@ -2559,12 +3239,22 @@ function App() {
         setDatasetExpanded({})
         setMosObjects([])
         setMosNext(null)
+        setObjsetObjects([])
+        setObjsetNext(null)
+        setObjsetError(null)
+        setDatasetObjsetByDir({})
+        setSnapshotObjsetByDsobj({})
+        setObjsetSnapshotsByDir({})
+        setObjsetSnapshotsExpandedByDir({})
+        setObjsetSnapshotsLoadingByDir({})
+        setObjsetSnapshotsErrorByDir({})
         setFsHistory([])
         setFsHistoryIndex(-1)
         setFsState(null)
         setFsEntries([])
         setFsError(null)
         setFsSelected(null)
+        clearFsObjectInspector()
         setFsStat(null)
         setLeftPaneTab('pool')
         commitBrowserState({ mode: 'pool', pool: null }, 'replace')
@@ -2573,6 +3263,16 @@ function App() {
 
       const shouldReplacePool = activePool !== selectedPool
       if (shouldReplacePool) {
+        setObjectScope(MOS_OBJECT_SCOPE)
+        setObjsetObjects([])
+        setObjsetNext(null)
+        setObjsetError(null)
+        setDatasetObjsetByDir({})
+        setSnapshotObjsetByDsobj({})
+        setObjsetSnapshotsByDir({})
+        setObjsetSnapshotsExpandedByDir({})
+        setObjsetSnapshotsLoadingByDir({})
+        setObjsetSnapshotsErrorByDir({})
         setSelectedPool(activePool)
         if (leftPaneTab === 'pool') {
           commitBrowserState({ mode: 'pool', pool: activePool }, 'replace')
@@ -2591,6 +3291,7 @@ function App() {
         setFsEntries([])
         setFsError(null)
         setFsSelected(null)
+        clearFsObjectInspector()
         setFsStat(null)
         setPoolDetailsOpen(false)
 
@@ -2626,6 +3327,7 @@ function App() {
 
   useEffect(() => {
     if (!selectedPool) {
+      setObjectScope(MOS_OBJECT_SCOPE)
       setPoolSummary(null)
       setPoolSummaryLoading(false)
       setPoolSummaryError(null)
@@ -2636,6 +3338,15 @@ function App() {
       setPoolDetailsOpen(false)
       setMosObjects([])
       setMosNext(null)
+      setObjsetObjects([])
+      setObjsetNext(null)
+      setObjsetError(null)
+      setDatasetObjsetByDir({})
+      setSnapshotObjsetByDsobj({})
+      setObjsetSnapshotsByDir({})
+      setObjsetSnapshotsExpandedByDir({})
+      setObjsetSnapshotsLoadingByDir({})
+      setObjsetSnapshotsErrorByDir({})
       setDatasetTree(null)
       setDatasetCatalog({})
       setDatasetExpanded({})
@@ -2646,6 +3357,7 @@ function App() {
       setFsLoading(false)
       setFsError(null)
       setFsSelected(null)
+      clearFsObjectInspector()
       setFsStat(null)
       setFsStatLoading(false)
       setFsStatError(null)
@@ -2697,7 +3409,11 @@ function App() {
     setFsHistory([])
     setFsHistoryIndex(-1)
     setShowBlkptrDetails(false)
-    fetchMosObjects(0, false)
+    if (objectScope.kind === 'mos') {
+      fetchMosObjects(0, false)
+    } else {
+      fetchObjsetObjects(objectScope.objsetId, 0, false)
+    }
   }, [selectedPool, typeFilter])
 
   useEffect(() => {
@@ -2827,7 +3543,7 @@ function App() {
     }
   }
 
-  async function fetchInspector(objid: number) {
+  async function fetchInspector(objid: number, scope: ObjectScope = objectScope) {
     if (!selectedPool) return
     setInspectorLoading(true)
     setInspectorError(null)
@@ -2856,27 +3572,60 @@ function App() {
     setSpacemapMinLengthInput('')
     setSpacemapTxgMinInput('')
     setSpacemapTxgMaxInput('')
+    centerHexRequestKey.current = null
+    setCenterHexDump(null)
+    setCenterHexLoading(false)
+    setCenterHexError(null)
+    setCenterHexOffsetInput('0')
+    setCenterHexLimitInput(String(OBJSET_DATA_DEFAULT_LIMIT))
+    setCenterHexNonce(0)
+    setCenterHexDownloadLoading(false)
+    setCenterHexDownloadError(null)
     try {
-      const [infoData, blkData] = await Promise.all([
-        fetchJson<DnodeInfo>(
-          `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}`
-        ),
-        fetchJson<BlkptrResponse>(
-          `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/blkptrs`
-        ),
-      ])
-      setObjectInfo(infoData)
-      setBlkptrs(blkData)
-      if (isSpacemapDnode(infoData)) {
-        setCenterView('spacemap')
-      }
-      if (!isSpacemapDnode(infoData) && inspectorTab === 'spacemap') {
-        setInspectorTab('summary')
-      }
+      if (scope.kind === 'mos') {
+        const [infoData, blkData] = await Promise.all([
+          fetchJson<DnodeInfo>(
+            `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}`
+          ),
+          fetchJson<BlkptrResponse>(
+            `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/blkptrs`
+          ),
+        ])
+        setObjectInfo(infoData)
+        setBlkptrs(blkData)
+        if (isSpacemapDnode(infoData)) {
+          setCenterView('spacemap')
+        }
+        if (!isSpacemapDnode(infoData) && inspectorTab === 'spacemap') {
+          setInspectorTab('summary')
+        }
 
-      if (infoData.is_zap) {
-        await fetchZapInfo(objid)
-        await fetchZapEntries(objid, 0, false)
+        if (infoData.is_zap) {
+          await fetchZapInfo(objid)
+          await fetchZapEntries(objid, 0, false)
+        }
+      } else {
+        const data = await fetchJson<ObjsetObjectFullResponse>(
+          `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/objset/${scope.objsetId}/obj/${objid}/full`
+        )
+        const infoData = data.object
+        setObjectInfo(infoData)
+        setBlkptrs(data.blkptrs)
+
+        if (isSpacemapDnode(infoData)) {
+          setCenterView('spacemap')
+        }
+        if (!isSpacemapDnode(infoData) && inspectorTab === 'spacemap') {
+          setInspectorTab('summary')
+        }
+
+        if (infoData.is_zap) {
+          setZapInfo(data.zap_info)
+          setZapEntries(data.zap_entries?.entries ?? [])
+          setZapNext(data.zap_entries?.next ?? null)
+        }
       }
     } catch (err) {
       setInspectorError((err as Error).message)
@@ -2897,7 +3646,7 @@ function App() {
         return prev
       }
       const typeName =
-        objectInfo?.type?.name ?? mosObjectMap.get(selectedObject)?.type_name ?? undefined
+        objectInfo?.type?.name ?? activeObjectMap.get(selectedObject)?.type_name ?? undefined
       const updated = [{ objid: selectedObject, typeName }, ...current]
       return { ...prev, [selectedPool]: updated }
     })
@@ -2998,6 +3747,9 @@ function App() {
     if (centerView === 'spacemap') {
       return 'spacemap'
     }
+    if (centerView === 'hex') {
+      return 'hex'
+    }
     if (centerView === 'explore') {
       return objectInfo?.is_zap ? 'map' : 'graph'
     }
@@ -3020,6 +3772,10 @@ function App() {
   }, [blkptrs])
 
   const isSpacemapObject = useMemo(() => isSpacemapDnode(objectInfo), [objectInfo])
+  const isObjsetPlainFile = useMemo(() => {
+    if (!objectInfo || objectScope.kind === 'mos') return false
+    return objectInfo.type.name.toLowerCase().includes('plain file')
+  }, [objectInfo, objectScope.kind])
 
   const spacemapHistogramMax = useMemo(() => {
     if (!spacemapSummary || spacemapSummary.histogram.length === 0) return 0
@@ -3081,6 +3837,211 @@ function App() {
     if (!hexDump) return ''
     return formatHexDump(hexDump.data_hex, hexDump.offset)
   }, [hexDump])
+
+  const formattedCenterHexDump = useMemo(() => {
+    if (!centerHexDump) return ''
+    return formatHexDump(centerHexDump.data_hex, centerHexDump.offset)
+  }, [centerHexDump])
+
+  const centerHexDownloadFilename = useMemo(() => {
+    if (selectedObject === null || objectScope.kind === 'mos') {
+      return selectedObject === null
+        ? 'object.bin'
+        : `objset-unknown-obj-${selectedObject}.bin`
+    }
+
+    const fallback = `objset-${objectScope.objsetId}-obj-${selectedObject}.bin`
+    const hintKey = `${objectScope.objsetId}:${selectedObject}`
+    const hintFromMap = objsetNameHints[hintKey]
+    const hintFromFsSelection =
+      fsSelected &&
+      fsState &&
+      fsSelected.objid === selectedObject &&
+      fsState.objsetId === objectScope.objsetId
+        ? fsSelected.name
+        : null
+
+    const hinted = hintFromMap ?? hintFromFsSelection
+    const safeHint = hinted ? sanitizeDownloadFilename(hinted) : null
+    return safeHint ?? fallback
+  }, [fsSelected, fsState, objectScope, objsetNameHints, selectedObject])
+
+  const fetchObjsetDataChunk = useCallback(
+    async (scope: ObjectScope, objid: number, offset: number, limit: number) => {
+      if (!selectedPool) throw new Error('No pool selected')
+      if (scope.kind === 'mos') throw new Error('MOS objects do not expose objset data endpoint')
+      const params = new URLSearchParams()
+      params.set('offset', String(offset))
+      params.set('limit', String(limit))
+      return fetchJson<ObjsetDataResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(
+          selectedPool
+        )}/objset/${scope.objsetId}/obj/${objid}/data?${params.toString()}`
+      )
+    },
+    [selectedPool]
+  )
+
+  useEffect(() => {
+    if (centerView === 'hex' && !isObjsetPlainFile) {
+      setCenterView('explore')
+    }
+  }, [centerView, isObjsetPlainFile])
+
+  useEffect(() => {
+    if (
+      !selectedPool ||
+      selectedObject === null ||
+      objectScope.kind === 'mos' ||
+      !isObjsetPlainFile ||
+      effectiveCenterView !== 'hex'
+    ) {
+      return
+    }
+
+    const parsedOffset = parseNumericInput(centerHexOffsetInput)
+    if (parsedOffset === null) {
+      setCenterHexError('Offset must be a valid non-negative number (decimal or 0x hex).')
+      return
+    }
+    const parsedLimit = parseNumericInput(centerHexLimitInput)
+    if (parsedLimit === null || parsedLimit <= 0) {
+      setCenterHexError('Limit must be a positive number (decimal or 0x hex).')
+      return
+    }
+    const limit = Math.min(parsedLimit, OBJSET_DATA_MAX_LIMIT)
+    const key = `${selectedPool}:${objectScope.key}:${selectedObject}:${parsedOffset}:${limit}`
+    if (centerHexRequestKey.current === key) {
+      return
+    }
+    centerHexRequestKey.current = key
+    setCenterHexLoading(true)
+    setCenterHexError(null)
+
+    fetchObjsetDataChunk(objectScope, selectedObject, parsedOffset, limit)
+      .then(data => {
+        setCenterHexDump(data)
+      })
+      .catch(err => {
+        setCenterHexDump(null)
+        setCenterHexError((err as Error).message)
+      })
+      .finally(() => {
+        setCenterHexLoading(false)
+      })
+  }, [
+    centerHexLimitInput,
+    centerHexNonce,
+    centerHexOffsetInput,
+    effectiveCenterView,
+    fetchObjsetDataChunk,
+    isObjsetPlainFile,
+    objectScope,
+    selectedObject,
+    selectedPool,
+  ])
+
+  const refreshCenterHex = () => {
+    centerHexRequestKey.current = null
+    setCenterHexError(null)
+    setCenterHexDump(null)
+    setCenterHexNonce(prev => prev + 1)
+  }
+
+  const resetCenterHexOffset = () => {
+    setCenterHexOffsetInput('0')
+    centerHexRequestKey.current = null
+  }
+
+  const downloadCenterHexObject = async () => {
+    if (!selectedPool || selectedObject === null || objectScope.kind === 'mos' || !isObjsetPlainFile)
+      return
+    setCenterHexDownloadLoading(true)
+    setCenterHexDownloadError(null)
+    try {
+      const hintKey = `${objectScope.objsetId}:${selectedObject}`
+      let logicalSize: number | null = objsetSizeHints[hintKey] ?? null
+      if (logicalSize === null && fsStat && fsState && fsSelected) {
+        if (
+          fsState.objsetId === objectScope.objsetId &&
+          fsSelected.objid === selectedObject &&
+          Number.isFinite(fsStat.size) &&
+          fsStat.size >= 0
+        ) {
+          logicalSize = fsStat.size
+        }
+      }
+      if (logicalSize === null) {
+        try {
+          const stat = await fetchJson<FsStat>(
+            `${API_BASE}/api/pools/${encodeURIComponent(
+              selectedPool
+            )}/objset/${objectScope.objsetId}/stat/${selectedObject}`
+          )
+          if (Number.isFinite(stat.size) && stat.size >= 0) {
+            logicalSize = stat.size
+            setObjsetSizeHints(prev => ({ ...prev, [hintKey]: stat.size }))
+          }
+        } catch {
+          // Best-effort size discovery; fall back to endpoint EOF behavior.
+        }
+      }
+
+      const chunks: BlobPart[] = []
+      let offset = 0
+      let total = 0
+      while (true) {
+        if (logicalSize !== null && total >= logicalSize) break
+        const requestSize =
+          logicalSize === null
+            ? OBJSET_DOWNLOAD_CHUNK
+            : Math.max(0, Math.min(OBJSET_DOWNLOAD_CHUNK, logicalSize - total))
+        if (requestSize <= 0) break
+
+        const data = await fetchObjsetDataChunk(
+          objectScope,
+          selectedObject,
+          offset,
+          requestSize
+        )
+        const bytesRead = data.size ?? 0
+        if (bytesRead === 0) break
+        const bytes = hexToBytes(data.data_hex)
+        const useLen =
+          logicalSize === null
+            ? bytes.byteLength
+            : Math.min(bytes.byteLength, Math.max(0, logicalSize - total))
+        const copy = new Uint8Array(useLen)
+        copy.set(bytes.subarray(0, useLen))
+        chunks.push(copy.buffer)
+        total += useLen
+        if (total > OBJSET_DOWNLOAD_MAX_TOTAL) {
+          throw new Error(
+            `Download exceeds ${formatBytes(
+              OBJSET_DOWNLOAD_MAX_TOTAL
+            )}. Use smaller files or add export streaming support.`
+          )
+        }
+        if (logicalSize !== null && total >= logicalSize) break
+        if (data.eof || bytesRead < requestSize) break
+        offset += useLen
+      }
+
+      const blob = new Blob(chunks, { type: 'application/octet-stream' })
+      const downloadUrl = window.URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = downloadUrl
+      anchor.download = centerHexDownloadFilename
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      window.URL.revokeObjectURL(downloadUrl)
+    } catch (err) {
+      setCenterHexDownloadError((err as Error).message)
+    } finally {
+      setCenterHexDownloadLoading(false)
+    }
+  }
 
   useEffect(() => {
     if (!selectedPool || selectedObject === null || rawView !== 'hex') {
@@ -3173,6 +4134,10 @@ function App() {
 
   const expandGraph = async () => {
     if (!selectedPool || selectedObject === null || graphExpanding) return
+    if (!isMosScope) {
+      setGraphExpandError('Graph expansion currently supports MOS scope only.')
+      return
+    }
 
     const knownNodes = new Set<number>([selectedObject, ...baseNeighborIds, ...graphExtraNodes])
     graphExtraEdges.forEach(edge => {
@@ -3238,6 +4203,87 @@ function App() {
     setGraphExpandedFrom([])
     setGraphExpandError(null)
   }
+
+  const renderObjsetHexPanel = () => (
+    <div className="hex-center">
+      <div className="hex-center-header">
+        <h3>Object Data (Hex)</h3>
+        <span className="muted">Logical objset read (dmu_read)</span>
+      </div>
+
+      <div className="hex-toolbar">
+        <label>
+          Offset
+          <input
+            className="spacemap-input"
+            type="text"
+            placeholder="0 or 0x1000"
+            value={centerHexOffsetInput}
+            onChange={event => setCenterHexOffsetInput(event.target.value)}
+          />
+        </label>
+        <label>
+          Limit
+          <input
+            className="spacemap-input"
+            type="text"
+            placeholder="65536"
+            value={centerHexLimitInput}
+            onChange={event => setCenterHexLimitInput(event.target.value)}
+          />
+        </label>
+        <div className="hex-toolbar-actions">
+          <button type="button" className="fs-action-btn" onClick={refreshCenterHex}>
+            Refresh
+          </button>
+          <button type="button" className="fs-action-btn" onClick={resetCenterHexOffset}>
+            Reset
+          </button>
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={downloadCenterHexObject}
+            disabled={centerHexDownloadLoading}
+          >
+            {centerHexDownloadLoading ? 'Downloading…' : 'Download file'}
+          </button>
+        </div>
+      </div>
+
+      {centerHexError && (
+        <div className="error">
+          <strong>Error:</strong> {centerHexError}
+        </div>
+      )}
+      {centerHexDownloadError && (
+        <div className="error">
+          <strong>Download:</strong> {centerHexDownloadError}
+        </div>
+      )}
+
+      <div className="raw-preview raw-hex-container hex-center-preview">
+        {centerHexLoading && <p className="muted">Loading object data…</p>}
+        {!centerHexLoading && !centerHexError && centerHexDump && (
+          <div className="raw-hex">
+            <div className="raw-hex-meta">
+              <span>objset {centerHexDump.objset_id}</span>
+              <span>object {centerHexDump.id}</span>
+              <span>off {formatAddr(centerHexDump.offset)}</span>
+              <span>
+                read {formatAddr(centerHexDump.size)} / {formatAddr(centerHexDump.requested)} B
+              </span>
+              <span>max {formatAddr(centerHexDump.max_offset)} B</span>
+              {centerHexDump.eof && <span>EOF</span>}
+            </div>
+            <pre className="raw-hex-dump">{formattedCenterHexDump}</pre>
+          </div>
+        )}
+        {!centerHexLoading && !centerHexError && !centerHexDump && (
+          <p className="muted">No logical data available.</p>
+        )}
+      </div>
+    </div>
+  )
 
   const renderSpacemapPanel = (mode: 'center' | 'inspector') => (
     <div className={mode === 'center' ? 'spacemap-center' : 'inspector-section spacemap-section'}>
@@ -3513,14 +4559,24 @@ function App() {
   }
 
   const handleCopyZdbCommand = () => {
-    if (selectedPool && selectedObject !== null) {
-      const cmd = `sudo zdb -dddd ${selectedPool} ${selectedObject}`
-      navigator.clipboard.writeText(cmd).then(() => {
-        setZdbCopied(true)
-        setTimeout(() => setZdbCopied(false), 2000)
-      })
-    }
+    if (!zdbCommand) return
+    navigator.clipboard.writeText(zdbCommand).then(() => {
+      setZdbCopied(true)
+      setTimeout(() => setZdbCopied(false), 2000)
+    })
   }
+
+  const zdbCommand = useMemo(() => {
+    if (!isMosMode || !selectedPool || selectedObject === null) return null
+
+    if (objectScope.kind === 'mos') {
+      return `sudo zdb -dddd ${selectedPool} ${selectedObject}`
+    }
+    if (objectScope.kind === 'dataset') {
+      return `sudo zdb -dddd ${objectScope.datasetName} ${selectedObject}`
+    }
+    return `sudo zdb -dddd ${objectScope.datasetName}@${objectScope.snapshotName} ${selectedObject}`
+  }, [isMosMode, objectScope, selectedObject, selectedPool])
 
   const handleCopyDebugInfo = async () => {
     setDebugCopyError(null)
@@ -3908,10 +4964,12 @@ function App() {
                 setNavIndex(-1)
                 setLeftPaneTabWithHistory('mos')
               }}
-              title="MOS object list"
+              title="Objset object list"
             >
-              MOS
+              Objsets
             </button>
+            <span className="crumb-sep">→</span>
+            <span className="crumb active">{objectScope.label}</span>
             {navStack.slice(0, navIndex + 1).map((objid, idx) => (
               <span key={`${objid}-${idx}`} className="crumb-group">
                 <span className="crumb-sep">→</span>
@@ -3924,11 +4982,11 @@ function App() {
                       fetchInspector(objid)
                     }
                   }}
-                  title={`Object ${objid}${mosObjectMap.get(objid)?.type_name ? ` · ${mosObjectMap.get(objid)?.type_name}` : ''}`}
+                  title={`Object ${objid}${activeObjectMap.get(objid)?.type_name ? ` · ${activeObjectMap.get(objid)?.type_name}` : ''}`}
                 >
                   Object {objid}
-                  {mosObjectMap.get(objid)?.type_name
-                    ? ` (${mosObjectMap.get(objid)?.type_name})`
+                  {activeObjectMap.get(objid)?.type_name
+                    ? ` (${activeObjectMap.get(objid)?.type_name})`
                     : ''}
                 </button>
               </span>
@@ -3958,13 +5016,13 @@ function App() {
               className={`tab ${isDatasetsTab || isFsTab ? 'active' : ''}`}
               onClick={() => setLeftPaneTabWithHistory('datasets')}
             >
-              Datasets
+              ZPL View
             </button>
             <button
               className={`tab ${isMosMode ? 'active' : ''}`}
               onClick={() => setLeftPaneTabWithHistory('mos')}
             >
-              MOS
+              DMU View
             </button>
           </div>
 
@@ -4135,20 +5193,54 @@ function App() {
                     )}
                   </div>
 
+                  <div className="dataset-tree mos-objset-tree">
+                    <h3>DSL Hierarchy</h3>
+                    <div className="mos-objset-tree-body">
+                      <div className="dsl-item dsl-root">
+                        <div className="dsl-node">
+                          <button
+                            className="dsl-toggle leaf"
+                            disabled
+                            aria-label="MOS root"
+                          >
+                            <span className="tree-toggle-leaf" aria-hidden>
+                              •
+                            </span>
+                          </button>
+                          <button
+                            className={`dsl-name ${isMosScope ? 'active' : ''}`}
+                            onClick={() => {
+                              void activateObjectScope(MOS_OBJECT_SCOPE)
+                            }}
+                            title="Open MOS object namespace"
+                          >
+                            MOS
+                          </button>
+                          <span className="dsl-id">objset 0</span>
+                        </div>
+                      </div>
+
+                      {datasetLoading && <p className="muted">Loading dataset tree...</p>}
+                      {datasetError && <p className="muted">Error: {datasetError}</p>}
+                      {datasetTree && renderObjsetNavigatorNode(datasetTree.root, 0)}
+                    </div>
+                  </div>
+
                   <div className="mos-objects-section">
-                    <h3>MOS Objects</h3>
-                    {mosLoading && <p className="muted">Loading MOS objects...</p>}
-                    {mosError && (
+                    <h3>Objects in Scope</h3>
+                    <p className="muted scope-label">{objectScope.label}</p>
+                    {scopedLoading && <p className="muted">Loading objects...</p>}
+                    {scopedError && (
                       <div className="error">
-                        <strong>Error:</strong> {mosError}
+                        <strong>Error:</strong> {scopedError}
                       </div>
                     )}
 
-                    <div className="pane-scroll mos-objects-scroll">
+                    <div className="mos-objects-body">
                       <ul className="object-list">
-                        {mosObjects.map(obj => (
+                        {scopedObjects.map(obj => (
                           <li
-                            key={obj.id}
+                            key={`${objectScope.key}-${obj.id}`}
                             className={`object-item ${selectedObject === obj.id ? 'active' : ''}`}
                             onClick={() => handleSelectObject(obj.id)}
                           >
@@ -4161,10 +5253,16 @@ function App() {
                         ))}
                       </ul>
 
-                      {mosNext !== null && !mosLoading && (
+                      {scopedNext !== null && !scopedLoading && (
                         <button
                           className="load-more"
-                          onClick={() => fetchMosObjects(mosNext, true)}
+                          onClick={() => {
+                            if (isMosScope) {
+                              void fetchMosObjects(scopedNext, true)
+                            } else {
+                              void fetchObjsetObjects(objectScope.objsetId, scopedNext, true)
+                            }
+                          }}
                         >
                           Load more
                         </button>
@@ -4439,7 +5537,12 @@ function App() {
                                     className="pool-errors-action-btn"
                                     type="button"
                                     onClick={() => openPoolErrorAsObject(entry)}
-                                    title="Open object in MOS view"
+                                    disabled={entry.dataset_obj !== 0}
+                                    title={
+                                      entry.dataset_obj === 0
+                                        ? 'Open object in MOS view'
+                                        : 'Objset-local object; open with FS action'
+                                    }
                                   >
                                     MOS
                                   </button>
@@ -5086,7 +6189,19 @@ function App() {
                             >
                               <div className="fs-name">{entry.name}</div>
                               <div className="fs-type">{entry.type_name}</div>
-                              <div className="fs-obj">#{entry.objid}</div>
+                              <div className="fs-obj">
+                                <button
+                                  type="button"
+                                  className="fs-obj-btn"
+                                  title="Inspect object dnode + blkptrs"
+                                  onClick={event => {
+                                    event.stopPropagation()
+                                    inspectFsObject(entry)
+                                  }}
+                                >
+                                  #{entry.objid}
+                                </button>
+                              </div>
                               <div className="fs-size">
                                 {stat ? formatBytes(stat.size) : '—'}
                               </div>
@@ -5145,6 +6260,15 @@ function App() {
                         Spacemap
                       </button>
                     )}
+                    {isObjsetPlainFile && (
+                      <button
+                        className={`graph-btn ${centerView === 'hex' ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setCenterView('hex')}
+                      >
+                        Hex
+                      </button>
+                    )}
                   </div>
                   {effectiveCenterView === 'map' ? (
                     <>
@@ -5166,6 +6290,8 @@ function App() {
                     </>
                   ) : effectiveCenterView === 'spacemap' ? (
                     <span className="muted">Address-range activity and distribution</span>
+                  ) : effectiveCenterView === 'hex' ? (
+                    <span className="muted">Logical object data view</span>
                   ) : (
                     <>
                       <input
@@ -5184,14 +6310,16 @@ function App() {
                       </button>
                     </>
                   )}
-                  {effectiveCenterView !== 'map' && effectiveCenterView !== 'spacemap' && (
+                  {effectiveCenterView !== 'map' &&
+                    effectiveCenterView !== 'spacemap' &&
+                    effectiveCenterView !== 'hex' && (
                     <>
                       {effectiveCenterView !== 'physical' && (
                         <button
                           className="graph-btn"
                           type="button"
                           onClick={expandGraph}
-                          disabled={graphExpanding || selectedObject === null}
+                          disabled={graphExpanding || selectedObject === null || !isMosScope}
                         >
                           {graphExpanding ? 'Expanding…' : 'Expand +1 hop'}
                         </button>
@@ -5226,12 +6354,14 @@ function App() {
                 {effectiveCenterView === 'map' ? (
                   <ZapMapView
                     entries={zapEntries}
-                    mosObjectMap={mosObjectMap}
+                    mosObjectMap={activeObjectMap}
                     filter={zapMapFilter}
                     onNavigate={navigateTo}
                   />
                 ) : effectiveCenterView === 'spacemap' ? (
                   renderSpacemapPanel('center')
+                ) : effectiveCenterView === 'hex' ? (
+                  renderObjsetHexPanel()
                 ) : (
                   <ObjectGraph
                     selectedObject={selectedObject}
@@ -5246,7 +6376,7 @@ function App() {
                     showPhysical={showPhysicalEdgesActive}
                     showBlkptrDetails={showBlkptrDetails}
                     onNavigate={navigateTo}
-                    objTypeMap={mosTypeMap}
+                    objTypeMap={activeTypeMap}
                   />
                 )}
                 {graphExpandError && <div className="graph-error">{graphExpandError}</div>}
@@ -5275,7 +6405,7 @@ function App() {
               >
                 {debugCopied ? 'Debug copied' : 'Copy debug'}
               </button>
-              {isMosMode && selectedObject !== null && (
+              {isMosMode && isMosScope && selectedObject !== null && (
                 <button
                   type="button"
                   className={`pin-btn ${isPinned ? 'active' : ''}`}
@@ -5411,16 +6541,7 @@ function App() {
                     </div>
                     <div>
                       <dt>Object</dt>
-                      <dd>
-                        <button
-                          type="button"
-                          className="fs-object-link"
-                          onClick={openFsSelectionAsObject}
-                          title="Open as MOS object"
-                        >
-                          #{fsSelected.objid}
-                        </button>
-                      </dd>
+                      <dd className="fs-object-local">#{fsSelected.objid} (objset-local)</dd>
                     </div>
                     <div>
                       <dt>Type</dt>
@@ -5431,9 +6552,23 @@ function App() {
                     <button
                       type="button"
                       className="fs-action-btn"
-                      onClick={openFsSelectionAsObject}
+                      onClick={() => {
+                        if (!fsState) return
+                        clearFsObjectInspector()
+                        fetchFsObjectInspector(fsState.objsetId, fsSelected.objid)
+                      }}
+                      disabled={fsObjectLoading}
                     >
-                      Open as object
+                      {fsObjectLoading ? 'Inspecting…' : 'Inspect object'}
+                    </button>
+                    <button
+                      type="button"
+                      className="fs-action-btn"
+                      onClick={() => {
+                        void openFsSelectionInDmuView()
+                      }}
+                    >
+                      Open in DMU view
                     </button>
                   </div>
                 </div>
@@ -5442,6 +6577,233 @@ function App() {
               {fsStatError && (
                 <div className="error">
                   <strong>Error:</strong> {fsStatError}
+                </div>
+              )}
+
+              {fsSelected && (
+                <div className="inspector-section">
+                  <h3>Objset Object</h3>
+                  {fsObjectError && (
+                    <div className="error">
+                      <strong>Error:</strong> {fsObjectError}
+                    </div>
+                  )}
+
+                  {fsObjectLoading && <p className="muted">Loading object inspector…</p>}
+
+                  {fsObjectInfo && (
+                    <>
+                      <div className="raw-tabs">
+                        <button
+                          type="button"
+                          className={`tab ${fsObjectInspectorTab === 'summary' ? 'active' : ''}`}
+                          onClick={() => setFsObjectInspectorTab('summary')}
+                        >
+                          Summary
+                        </button>
+                        {fsObjectInfo.is_zap && (
+                          <button
+                            type="button"
+                            className={`tab ${fsObjectInspectorTab === 'zap' ? 'active' : ''}`}
+                            onClick={() => setFsObjectInspectorTab('zap')}
+                          >
+                            ZAP {fsObjectZapInfo ? `(${fsObjectZapInfo.num_entries})` : ''}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className={`tab ${fsObjectInspectorTab === 'blkptr' ? 'active' : ''}`}
+                          onClick={() => setFsObjectInspectorTab('blkptr')}
+                        >
+                          Blkptr {fsObjectBlkptrs ? `(${fsObjectBlkptrs.blkptrs.length})` : ''}
+                        </button>
+                      </div>
+
+                      {fsObjectInspectorTab === 'summary' && (
+                        <dl className="info-grid">
+                          <div>
+                            <dt>Object</dt>
+                            <dd>#{fsObjectInfo.id}</dd>
+                          </div>
+                          <div>
+                            <dt>Objset</dt>
+                            <dd>{fsObjectInfo.objset_id}</dd>
+                          </div>
+                          <div>
+                            <dt>Type</dt>
+                            <dd>{fsObjectInfo.type.name}</dd>
+                          </div>
+                          <div>
+                            <dt>Bonus Type</dt>
+                            <dd>{fsObjectInfo.bonus_type.name}</dd>
+                          </div>
+                          <div>
+                            <dt>Levels</dt>
+                            <dd>{fsObjectInfo.nlevels}</dd>
+                          </div>
+                          <div>
+                            <dt>Blkptrs</dt>
+                            <dd>{fsObjectInfo.nblkptr}</dd>
+                          </div>
+                          <div>
+                            <dt>Data Block</dt>
+                            <dd>{fsObjectInfo.data_block_size} B</dd>
+                          </div>
+                          <div>
+                            <dt>Meta Block</dt>
+                            <dd>{fsObjectInfo.metadata_block_size} B</dd>
+                          </div>
+                          <div>
+                            <dt>Bonus Len</dt>
+                            <dd>{fsObjectInfo.bonus_len} B</dd>
+                          </div>
+                          <div>
+                            <dt>Used Bytes</dt>
+                            <dd>{fsObjectInfo.used_bytes}</dd>
+                          </div>
+                          <div>
+                            <dt>Checksum</dt>
+                            <dd>{fsObjectInfo.checksum}</dd>
+                          </div>
+                          <div>
+                            <dt>Compress</dt>
+                            <dd>{fsObjectInfo.compress}</dd>
+                          </div>
+                        </dl>
+                      )}
+
+                      {fsObjectInspectorTab === 'blkptr' && fsObjectBlkptrs && (
+                        <div className="blkptr-list">
+                          {fsObjectBlkptrs.blkptrs.map(bp => (
+                            <div key={`${bp.index}-${bp.is_spill}`} className="blkptr-card">
+                              <div className="blkptr-header">
+                                <strong>{bp.is_spill ? 'Spill' : `Index ${bp.index}`}</strong>
+                                <span className="muted">
+                                  {bp.is_hole ? 'hole' : `${formatAddr(bp.psize)} B`}
+                                </span>
+                              </div>
+                              <div className="blkptr-meta">
+                                <span>Level {bp.level}</span>
+                                <span>Type {bp.type}</span>
+                                <span>Birth {bp.birth_txg}</span>
+                                <span>NDVAs {bp.ndvas}</span>
+                              </div>
+                              {bp.dvas.length > 0 && (
+                                <ul className="dva-list">
+                                  {bp.dvas.map((dva, idx) => (
+                                    <li key={idx}>
+                                      vdev {dva.vdev} · off {formatAddr(dva.offset)} · asize{' '}
+                                      {formatAddr(dva.asize)}
+                                      {formatMode === 'hex' && (
+                                        <span className="dva-zdb">
+                                          {' '}
+                                          DVA[{idx}]={formatDvaZdb(dva)}
+                                        </span>
+                                      )}
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {fsObjectInspectorTab === 'zap' && fsObjectInfo.is_zap && (
+                        <div>
+                          {fsObjectZapInfo && (
+                            <div className="zap-info">
+                              <div>
+                                <dt>Kind</dt>
+                                <dd>{fsObjectZapInfo.kind}</dd>
+                              </div>
+                              <div>
+                                <dt>Entries</dt>
+                                <dd>{fsObjectZapInfo.num_entries}</dd>
+                              </div>
+                              <div>
+                                <dt>Blocks</dt>
+                                <dd>{fsObjectZapInfo.num_blocks}</dd>
+                              </div>
+                              <div>
+                                <dt>Leafs</dt>
+                                <dd>{fsObjectZapInfo.num_leafs}</dd>
+                              </div>
+                            </div>
+                          )}
+
+                          {fsObjectZapError && (
+                            <div className="error">
+                              <strong>Error:</strong> {fsObjectZapError}
+                            </div>
+                          )}
+
+                          {fsObjectZapLoading && <p className="muted">Loading ZAP entries...</p>}
+
+                          {!fsObjectZapLoading && fsObjectZapEntries.length === 0 && (
+                            <p className="muted">No ZAP entries found.</p>
+                          )}
+
+                          {fsObjectZapEntries.length > 0 && (
+                            <div className="zap-table">
+                              <div className="zap-row zap-header">
+                                <div>Key</div>
+                                <div>Value</div>
+                              </div>
+                              {fsObjectZapEntries.map(entry => {
+                                const isObjectKey = isZapObjectKey(entry)
+                                const refObject = entry.target_obj ?? 0
+                                return (
+                                  <div key={`${entry.name}-${entry.key_u64 ?? 'k'}`} className="zap-row">
+                                    <div className="zap-key">{entry.name}</div>
+                                    <div className="zap-value">
+                                      {isObjectKey ? (
+                                        <button
+                                          className="zap-entry-link"
+                                          onClick={() => inspectFsObjectById(refObject)}
+                                        >
+                                          Object {refObject}
+                                        </button>
+                                      ) : entry.maybe_object_ref && entry.target_obj !== null ? (
+                                        <button
+                                          className="zap-entry-link"
+                                          onClick={() => inspectFsObjectById(entry.target_obj!)}
+                                        >
+                                          Object {entry.target_obj}
+                                        </button>
+                                      ) : (
+                                        <code>{entry.value_preview || '(empty)'}</code>
+                                      )}
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )}
+
+                          {fsObjectZapNext !== null && !fsObjectZapLoading && fsState && (
+                            <button
+                              className="load-more"
+                              onClick={() =>
+                                fetchFsObjectZapEntries(
+                                  fsState.objsetId,
+                                  fsObjectInfo.id,
+                                  fsObjectZapNext,
+                                  true
+                                )
+                              }
+                            >
+                              Load more ZAP entries
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {!fsObjectInfo && !fsObjectLoading && !fsObjectError && (
+                    <p className="muted">Click "Inspect object" to load dnode and blkptr details.</p>
+                  )}
                 </div>
               )}
 
@@ -5588,9 +6950,9 @@ function App() {
             <p className="muted">Select a pool to view summary metadata.</p>
           )}
 
-          {isMosMode && selectedPool && selectedObject !== null && (
+          {isMosMode && zdbCommand && (
             <div className="zdb-hint">
-              <code>sudo zdb -dddd {selectedPool} {selectedObject}</code>
+              <code>{zdbCommand}</code>
               <button
                 type="button"
                 className={`zdb-copy-btn ${zdbCopied ? 'copied' : ''}`}
@@ -5609,7 +6971,7 @@ function App() {
           )}
 
           {isMosMode && !selectedObject && !inspectorLoading && (
-            <p className="muted">Select a MOS object to inspect its dnode.</p>
+            <p className="muted">Select an object from {objectScope.label} to inspect its dnode.</p>
           )}
 
           {isMosMode && selectedObject !== null && objectInfo && (
@@ -6052,7 +7414,7 @@ function App() {
                         {zapEntries.map(entry => {
                           const isObjectKey = isZapObjectKey(entry)
                           const refObject = entry.target_obj ?? 0
-                          const hint = mosObjectMap.get(refObject)?.type_name
+                          const hint = activeObjectMap.get(refObject)?.type_name
                           return (
                             <div key={`${entry.name}-${entry.key_u64 ?? 'k'}`} className="zap-row">
                               <div className="zap-key">{entry.name}</div>
