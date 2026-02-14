@@ -14,6 +14,8 @@ import type {
 const API_BASE = 'http://localhost:9000'
 const MOS_PAGE_LIMIT = 200
 const SPACEMAP_PAGE_LIMIT = 200
+const SPACEMAP_BINS_PAGE_LIMIT = 256
+const SPACEMAP_BIN_SIZE_DEFAULT = 1 << 20
 const OBJSET_DATA_DEFAULT_LIMIT = 64 * 1024
 const OBJSET_DATA_MAX_LIMIT = 1 << 20
 const OBJSET_DOWNLOAD_CHUNK = 256 * 1024
@@ -350,6 +352,42 @@ type SpacemapRangesResponse = {
   next: number | null
   filters?: SpacemapRangesFilters
   ranges: SpacemapRange[]
+}
+
+type SpacemapBin = {
+  index: number
+  offset_start: number
+  offset_end: number
+  alloc_bytes: number
+  free_bytes: number
+  net_bytes: number
+  alloc_ops: number
+  free_ops: number
+  ops_total: number
+  txg_min: number | null
+  txg_max: number | null
+  largest_range: number
+  avg_range: number
+}
+
+type SpacemapBinsResponse = {
+  object: number
+  start: number
+  size: number
+  shift: number
+  bin_size: number
+  cursor: number
+  limit: number
+  count: number
+  next: number | null
+  total_bins: number | null
+  filters?: SpacemapRangesFilters
+  bins: SpacemapBin[]
+}
+
+type SpacemapSelection = {
+  startIndex: number
+  endIndex: number
 }
 
 type SpacemapTopWindow = {
@@ -878,6 +916,22 @@ function App() {
   const [spacemapRangesNext, setSpacemapRangesNext] = useState<number | null>(null)
   const [spacemapRangesLoading, setSpacemapRangesLoading] = useState(false)
   const [spacemapRangesError, setSpacemapRangesError] = useState<string | null>(null)
+  const [spacemapBins, setSpacemapBins] = useState<SpacemapBin[]>([])
+  const [spacemapBinsNext, setSpacemapBinsNext] = useState<number | null>(null)
+  const [spacemapBinsTotal, setSpacemapBinsTotal] = useState<number | null>(null)
+  const [spacemapBinsLoading, setSpacemapBinsLoading] = useState(false)
+  const [spacemapBinsError, setSpacemapBinsError] = useState<string | null>(null)
+  const [spacemapBinSizeInput, setSpacemapBinSizeInput] = useState(
+    String(SPACEMAP_BIN_SIZE_DEFAULT)
+  )
+  const [spacemapLoadedBinSize, setSpacemapLoadedBinSize] = useState(SPACEMAP_BIN_SIZE_DEFAULT)
+  const [spacemapMapMode, setSpacemapMapMode] = useState<'activity' | 'churn'>('activity')
+  const [spacemapSelection, setSpacemapSelection] = useState<SpacemapSelection | null>(null)
+  const [spacemapBrushAnchor, setSpacemapBrushAnchor] = useState<number | null>(null)
+  const [spacemapHoveredBinIndex, setSpacemapHoveredBinIndex] = useState<number | null>(null)
+  const [spacemapHoveredRangeBinIndex, setSpacemapHoveredRangeBinIndex] = useState<number | null>(
+    null
+  )
   const [spacemapOpFilter, setSpacemapOpFilter] = useState<'all' | 'alloc' | 'free'>('all')
   const [spacemapMinLengthInput, setSpacemapMinLengthInput] = useState('')
   const [spacemapTxgMinInput, setSpacemapTxgMinInput] = useState('')
@@ -896,8 +950,9 @@ function App() {
   const [graphExpandedFrom, setGraphExpandedFrom] = useState<number[]>([])
   const [graphExpanding, setGraphExpanding] = useState(false)
   const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
+  const [performanceTab, setPerformanceTab] = useState<'forensics' | 'runtime'>('forensics')
   const [centerView, setCenterView] = useState<
-    'explore' | 'graph' | 'physical' | 'spacemap' | 'hex'
+    'explore' | 'graph' | 'physical' | 'spacemap' | 'hex' | 'performance'
   >(
     'explore'
   )
@@ -1265,6 +1320,18 @@ function App() {
     setSpacemapRangesNext(null)
     setSpacemapRangesLoading(false)
     setSpacemapRangesError(null)
+    setSpacemapBins([])
+    setSpacemapBinsNext(null)
+    setSpacemapBinsTotal(null)
+    setSpacemapBinsLoading(false)
+    setSpacemapBinsError(null)
+    setSpacemapBinSizeInput(String(SPACEMAP_BIN_SIZE_DEFAULT))
+    setSpacemapLoadedBinSize(SPACEMAP_BIN_SIZE_DEFAULT)
+    setSpacemapMapMode('activity')
+    setSpacemapSelection(null)
+    setSpacemapBrushAnchor(null)
+    setSpacemapHoveredBinIndex(null)
+    setSpacemapHoveredRangeBinIndex(null)
     setSpacemapOpFilter('all')
     setSpacemapMinLengthInput('')
     setSpacemapTxgMinInput('')
@@ -3543,6 +3610,81 @@ function App() {
     }
   }
 
+  const fetchSpacemapBins = async (
+    objid: number,
+    cursor: number,
+    append: boolean,
+    overrides?: {
+      op?: 'all' | 'alloc' | 'free'
+      minLengthInput?: string
+      txgMinInput?: string
+      txgMaxInput?: string
+      binSizeInput?: string
+    }
+  ) => {
+    if (!selectedPool) return
+
+    const op = overrides?.op ?? spacemapOpFilter
+    const minLengthRaw = overrides?.minLengthInput ?? spacemapMinLengthInput
+    const txgMinRaw = overrides?.txgMinInput ?? spacemapTxgMinInput
+    const txgMaxRaw = overrides?.txgMaxInput ?? spacemapTxgMaxInput
+    const binSizeRaw = overrides?.binSizeInput ?? spacemapBinSizeInput
+
+    let minLength = 0
+    let txgMin: number | null = null
+    let txgMax: number | null = null
+    let binSize = SPACEMAP_BIN_SIZE_DEFAULT
+    try {
+      minLength = parseOptionalUnsigned(minLengthRaw, 'min_length') ?? 0
+      txgMin = parseOptionalUnsigned(txgMinRaw, 'txg_min')
+      txgMax = parseOptionalUnsigned(txgMaxRaw, 'txg_max')
+      binSize = parseOptionalUnsigned(binSizeRaw, 'bin_size') ?? SPACEMAP_BIN_SIZE_DEFAULT
+      if (txgMin !== null && txgMax !== null && txgMin > txgMax) {
+        throw new Error('txg_min must be <= txg_max')
+      }
+      if (binSize < 512) {
+        throw new Error('bin_size must be >= 512 bytes')
+      }
+    } catch (err) {
+      setSpacemapBinsError((err as Error).message)
+      return
+    }
+
+    setSpacemapBinsLoading(true)
+    setSpacemapBinsError(null)
+    try {
+      const params = new URLSearchParams()
+      params.set('cursor', String(cursor))
+      params.set('limit', String(SPACEMAP_BINS_PAGE_LIMIT))
+      params.set('bin_size', String(binSize))
+      params.set('op', op)
+      if (minLength > 0) params.set('min_length', String(minLength))
+      if (txgMin !== null) params.set('txg_min', String(txgMin))
+      if (txgMax !== null) params.set('txg_max', String(txgMax))
+
+      const data = await fetchJson<SpacemapBinsResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/spacemap/${objid}/bins?${params.toString()}`
+      )
+      setSpacemapBins(prev => (append ? [...prev, ...data.bins] : data.bins))
+      setSpacemapBinsNext(data.next)
+      setSpacemapBinsTotal(data.total_bins ?? (data.bins.length === 0 ? 0 : null))
+      setSpacemapLoadedBinSize(data.bin_size)
+      if (!append) {
+        setSpacemapSelection(null)
+        setSpacemapBrushAnchor(null)
+      }
+    } catch (err) {
+      setSpacemapBinsError((err as Error).message)
+      if (!append) {
+        setSpacemapBins([])
+        setSpacemapBinsNext(null)
+        setSpacemapBinsTotal(null)
+      }
+    } finally {
+      setSpacemapBinsLoading(false)
+    }
+  }
+
   async function fetchInspector(objid: number, scope: ObjectScope = objectScope) {
     if (!selectedPool) return
     setInspectorLoading(true)
@@ -3568,6 +3710,18 @@ function App() {
     setSpacemapRangesNext(null)
     setSpacemapRangesLoading(false)
     setSpacemapRangesError(null)
+    setSpacemapBins([])
+    setSpacemapBinsNext(null)
+    setSpacemapBinsTotal(null)
+    setSpacemapBinsLoading(false)
+    setSpacemapBinsError(null)
+    setSpacemapBinSizeInput(String(SPACEMAP_BIN_SIZE_DEFAULT))
+    setSpacemapLoadedBinSize(SPACEMAP_BIN_SIZE_DEFAULT)
+    setSpacemapMapMode('activity')
+    setSpacemapSelection(null)
+    setSpacemapBrushAnchor(null)
+    setSpacemapHoveredBinIndex(null)
+    setSpacemapHoveredRangeBinIndex(null)
     setSpacemapOpFilter('all')
     setSpacemapMinLengthInput('')
     setSpacemapTxgMinInput('')
@@ -3671,7 +3825,10 @@ function App() {
 
   const applySpacemapFilters = () => {
     if (selectedObject === null) return
+    setSpacemapSelection(null)
+    setSpacemapBrushAnchor(null)
     fetchSpacemapRanges(selectedObject, 0, false)
+    fetchSpacemapBins(selectedObject, 0, false)
   }
 
   const clearSpacemapFilters = () => {
@@ -3679,6 +3836,9 @@ function App() {
     setSpacemapMinLengthInput('')
     setSpacemapTxgMinInput('')
     setSpacemapTxgMaxInput('')
+    setSpacemapBinSizeInput(String(SPACEMAP_BIN_SIZE_DEFAULT))
+    setSpacemapSelection(null)
+    setSpacemapBrushAnchor(null)
     if (selectedObject === null) return
     fetchSpacemapRanges(selectedObject, 0, false, {
       op: 'all',
@@ -3686,12 +3846,74 @@ function App() {
       txgMinInput: '',
       txgMaxInput: '',
     })
+    fetchSpacemapBins(selectedObject, 0, false, {
+      op: 'all',
+      minLengthInput: '',
+      txgMinInput: '',
+      txgMaxInput: '',
+      binSizeInput: String(SPACEMAP_BIN_SIZE_DEFAULT),
+    })
   }
 
   const refreshSpacemap = () => {
     if (selectedObject === null) return
     fetchSpacemapSummary(selectedObject)
     fetchSpacemapRanges(selectedObject, 0, false)
+    fetchSpacemapBins(selectedObject, 0, false)
+  }
+
+  const handleSpacemapBinSelect = (index: number, extend: boolean) => {
+    if (extend && spacemapBrushAnchor !== null) {
+      setSpacemapSelection({
+        startIndex: Math.min(spacemapBrushAnchor, index),
+        endIndex: Math.max(spacemapBrushAnchor, index),
+      })
+      return
+    }
+    setSpacemapBrushAnchor(index)
+    setSpacemapSelection({ startIndex: index, endIndex: index })
+  }
+
+  const clearSpacemapSelection = () => {
+    setSpacemapSelection(null)
+    setSpacemapBrushAnchor(null)
+    setSpacemapHoveredBinIndex(null)
+    setSpacemapHoveredRangeBinIndex(null)
+  }
+
+  const exportSelectedSpacemapWindow = () => {
+    if (!spacemapSelectedWindow || !selectedPool || selectedObject === null) return
+    const payload = {
+      pool: selectedPool,
+      object: selectedObject,
+      mode: spacemapMapMode,
+      bin_size: spacemapLoadedBinSize,
+      window: {
+        start_index: spacemapSelectedWindow.startIndex,
+        end_index: spacemapSelectedWindow.endIndex,
+        offset_start: spacemapSelectedWindow.offset_start,
+        offset_end: spacemapSelectedWindow.offset_end,
+      },
+      filters: {
+        op: spacemapOpFilter,
+        min_length: spacemapMinLengthInput || null,
+        txg_min: spacemapTxgMinInput || null,
+        txg_max: spacemapTxgMaxInput || null,
+      },
+      bins: spacemapSelectedWindow.bins,
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json',
+    })
+    const url = window.URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `spacemap-window-${selectedPool}-${selectedObject}.json`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.URL.revokeObjectURL(url)
   }
 
   useEffect(() => {
@@ -3750,6 +3972,9 @@ function App() {
     if (centerView === 'hex') {
       return 'hex'
     }
+    if (centerView === 'performance') {
+      return 'performance'
+    }
     if (centerView === 'explore') {
       return objectInfo?.is_zap ? 'map' : 'graph'
     }
@@ -3785,27 +4010,64 @@ function App() {
     )
   }, [spacemapSummary])
 
+  const spacemapRangeBinIndex = useCallback(
+    (range: SpacemapRange): number | null => {
+      if (!spacemapSummary || !Number.isFinite(spacemapLoadedBinSize) || spacemapLoadedBinSize <= 0) {
+        return null
+      }
+      const relative = Math.max(0, range.offset - spacemapSummary.start)
+      return Math.floor(relative / spacemapLoadedBinSize)
+    },
+    [spacemapLoadedBinSize, spacemapSummary]
+  )
+
+  const spacemapSelectedWindow = useMemo(() => {
+    if (!spacemapSelection || spacemapBins.length === 0) return null
+    const lo = Math.min(spacemapSelection.startIndex, spacemapSelection.endIndex)
+    const hi = Math.max(spacemapSelection.startIndex, spacemapSelection.endIndex)
+    const selectedBins = spacemapBins.filter(bin => bin.index >= lo && bin.index <= hi)
+    if (selectedBins.length === 0) return null
+    return {
+      startIndex: lo,
+      endIndex: hi,
+      offset_start: selectedBins[0].offset_start,
+      offset_end: selectedBins[selectedBins.length - 1].offset_end,
+      bins: selectedBins,
+    }
+  }, [spacemapBins, spacemapSelection])
+
+  const spacemapVisibleRanges = useMemo(() => {
+    if (!spacemapSelectedWindow) return spacemapRanges
+    return spacemapRanges.filter(range => {
+      const rangeEnd = range.offset + Math.max(1, range.length) - 1
+      return (
+        range.offset <= spacemapSelectedWindow.offset_end &&
+        rangeEnd >= spacemapSelectedWindow.offset_start
+      )
+    })
+  }, [spacemapRanges, spacemapSelectedWindow])
+
   const spacemapLargestRanges = useMemo(() => {
-    return [...spacemapRanges]
+    return [...spacemapVisibleRanges]
       .sort((a, b) => b.length - a.length)
       .slice(0, 8)
-  }, [spacemapRanges])
+  }, [spacemapVisibleRanges])
 
   const spacemapSmallestRanges = useMemo(() => {
-    return [...spacemapRanges]
+    return [...spacemapVisibleRanges]
       .filter(range => range.length > 0)
       .sort((a, b) => a.length - b.length)
       .slice(0, 8)
-  }, [spacemapRanges])
+  }, [spacemapVisibleRanges])
 
   const spacemapTopWindows = useMemo<SpacemapTopWindow[]>(() => {
-    if (!spacemapSummary || spacemapRanges.length === 0) return []
+    if (!spacemapSummary || spacemapVisibleRanges.length === 0) return []
     const binCount = 64
     const size = Math.max(1, spacemapSummary.size)
     const windowSize = Math.max(1, Math.floor(size / binCount))
     const windows = new Map<number, SpacemapTopWindow>()
 
-    spacemapRanges.forEach(range => {
+    spacemapVisibleRanges.forEach(range => {
       const relative = Math.max(0, range.offset - spacemapSummary.start)
       const bucket = Math.min(binCount - 1, Math.floor(relative / windowSize))
       const existing = windows.get(bucket)
@@ -3831,7 +4093,50 @@ function App() {
     return Array.from(windows.values())
       .sort((a, b) => b.ops - a.ops)
       .slice(0, 8)
-  }, [spacemapRanges, spacemapSummary])
+  }, [spacemapSummary, spacemapVisibleRanges])
+
+  const spacemapMapMaxMagnitude = useMemo(() => {
+    if (spacemapBins.length === 0) return 0
+    if (spacemapMapMode === 'activity') {
+      return Math.max(...spacemapBins.map(bin => Math.abs(bin.net_bytes)), 0)
+    }
+    return Math.max(...spacemapBins.map(bin => bin.ops_total), 0)
+  }, [spacemapBins, spacemapMapMode])
+
+  const spacemapSelectedWindowMetrics = useMemo(() => {
+    if (!spacemapSelectedWindow) return null
+    return spacemapSelectedWindow.bins.reduce(
+      (acc, bin) => {
+        acc.alloc_bytes += bin.alloc_bytes
+        acc.free_bytes += bin.free_bytes
+        acc.net_bytes += bin.net_bytes
+        acc.alloc_ops += bin.alloc_ops
+        acc.free_ops += bin.free_ops
+        acc.ops_total += bin.ops_total
+        return acc
+      },
+      {
+        alloc_bytes: 0,
+        free_bytes: 0,
+        net_bytes: 0,
+        alloc_ops: 0,
+        free_ops: 0,
+        ops_total: 0,
+      }
+    )
+  }, [spacemapSelectedWindow])
+
+  const spacemapChurnPeakBin = useMemo(() => {
+    if (spacemapBins.length === 0) return null
+    return spacemapBins.reduce((peak, bin) => (bin.ops_total > peak.ops_total ? bin : peak))
+  }, [spacemapBins])
+
+  const spacemapAllocImbalancePct = useMemo(() => {
+    if (!spacemapSummary) return null
+    const total = spacemapSummary.alloc_bytes + spacemapSummary.free_bytes
+    if (total <= 0) return 0
+    return Math.round((Math.abs(spacemapSummary.net_bytes) / total) * 100)
+  }, [spacemapSummary])
 
   const formattedHexDump = useMemo(() => {
     if (!hexDump) return ''
@@ -4094,7 +4399,11 @@ function App() {
     }
 
     const spacemapRequested =
-      inspectorTab === 'spacemap' || effectiveCenterView === 'spacemap'
+      inspectorTab === 'spacemap' ||
+      effectiveCenterView === 'spacemap' ||
+      (effectiveCenterView === 'performance' &&
+        performanceTab === 'forensics' &&
+        isSpacemapObject)
     if (!spacemapRequested) {
       return
     }
@@ -4111,10 +4420,26 @@ function App() {
     ) {
       fetchSpacemapRanges(selectedObject, 0, false)
     }
+
+    if (
+      spacemapBins.length === 0 &&
+      !spacemapBinsLoading &&
+      !spacemapBinsError &&
+      spacemapBinsNext === null &&
+      spacemapBinsTotal === null
+    ) {
+      fetchSpacemapBins(selectedObject, 0, false)
+    }
   }, [
     effectiveCenterView,
     inspectorTab,
     isSpacemapObject,
+    performanceTab,
+    spacemapBins.length,
+    spacemapBinsError,
+    spacemapBinsLoading,
+    spacemapBinsNext,
+    spacemapBinsTotal,
     selectedObject,
     selectedPool,
     spacemapRanges.length,
@@ -4202,6 +4527,119 @@ function App() {
     setGraphExtraNodes([])
     setGraphExpandedFrom([])
     setGraphExpandError(null)
+  }
+
+  const renderPerformancePanel = () => {
+    const runtimeDisabled = poolMode === 'offline'
+
+    return (
+      <div className="performance-center">
+        <div className="performance-header">
+          <h3>Performance</h3>
+          <span className="muted">
+            Split view: forensic evidence vs currently observed runtime data
+          </span>
+        </div>
+
+        <div className="raw-tabs performance-tabs">
+          <button
+            type="button"
+            className={`tab ${performanceTab === 'forensics' ? 'active' : ''}`}
+            onClick={() => setPerformanceTab('forensics')}
+          >
+            Forensics
+          </button>
+          <button
+            type="button"
+            className={`tab ${performanceTab === 'runtime' ? 'active' : ''}`}
+            onClick={() => setPerformanceTab('runtime')}
+            disabled={runtimeDisabled}
+            title={
+              runtimeDisabled
+                ? 'Runtime telemetry is disabled in offline mode'
+                : 'Runtime telemetry (live mode)'
+            }
+          >
+            Runtime
+          </button>
+        </div>
+
+        {performanceTab === 'forensics' && (
+          <div className="performance-panel">
+            <p className="muted">
+              Evidence suggests potential behavior from on-disk structures. This is not live I/O.
+            </p>
+            {isSpacemapObject && spacemapSummary ? (
+              <>
+                <dl className="info-grid">
+                  <div>
+                    <dt>Object</dt>
+                    <dd>{spacemapSummary.object}</dd>
+                  </div>
+                  <div>
+                    <dt>Range Entries</dt>
+                    <dd>{spacemapSummary.range_entries}</dd>
+                  </div>
+                  <div>
+                    <dt>Net Delta</dt>
+                    <dd>{formatAddr(spacemapSummary.net_bytes)} B</dd>
+                  </div>
+                  <div>
+                    <dt>Alloc/Free Imbalance</dt>
+                    <dd>
+                      {spacemapAllocImbalancePct === null ? '—' : `${spacemapAllocImbalancePct}%`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>TXG Span</dt>
+                    <dd>
+                      {spacemapSummary.txg_min !== null && spacemapSummary.txg_max !== null
+                        ? `${spacemapSummary.txg_min} - ${spacemapSummary.txg_max}`
+                        : '—'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Peak Churn Bin</dt>
+                    <dd>
+                      {spacemapChurnPeakBin
+                        ? `#${spacemapChurnPeakBin.index} (${spacemapChurnPeakBin.ops_total} ops)`
+                        : '—'}
+                    </dd>
+                  </div>
+                </dl>
+                <div className="hint">
+                  <strong>Evidence suggests:</strong> higher churn windows and large net deltas can
+                  correlate with allocator pressure and fragmentation risk.
+                </div>
+              </>
+            ) : (
+              <div className="hint">
+                Select a spacemap object to see forensic indicators derived from its transaction log.
+              </div>
+            )}
+          </div>
+        )}
+
+        {performanceTab === 'runtime' && (
+          <div className="performance-panel">
+            <p className="muted">
+              Currently observed runtime telemetry is sampled from the live system.
+            </p>
+            {runtimeDisabled ? (
+              <div className="hint">
+                Runtime telemetry is unavailable in offline mode. Switch to live mode to enable ARC
+                and vdev runtime sampling.
+              </div>
+            ) : (
+              <div className="hint">
+                Runtime endpoints are planned next (`/api/perf/arc`, `/api/perf/vdev_iostat`,
+                `/api/perf/txg`). This panel is now in place so we can wire those in directly.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
   }
 
   const renderObjsetHexPanel = () => (
@@ -4350,6 +4788,16 @@ function App() {
             onChange={event => setSpacemapTxgMaxInput(event.target.value)}
           />
         </label>
+        <label>
+          Bin size
+          <input
+            className="spacemap-input"
+            type="text"
+            placeholder="bytes (e.g. 1048576)"
+            value={spacemapBinSizeInput}
+            onChange={event => setSpacemapBinSizeInput(event.target.value)}
+          />
+        </label>
         <div className="spacemap-filter-actions">
           <button type="button" className="fs-action-btn" onClick={applySpacemapFilters}>
             Apply
@@ -4368,6 +4816,11 @@ function App() {
       {spacemapRangesError && (
         <div className="error">
           <strong>Ranges:</strong> {spacemapRangesError}
+        </div>
+      )}
+      {spacemapBinsError && (
+        <div className="error">
+          <strong>Bins:</strong> {spacemapBinsError}
         </div>
       )}
 
@@ -4460,6 +4913,128 @@ function App() {
         </>
       )}
 
+      {mode === 'center' && (
+        <div className="spacemap-map-panel">
+          <div className="spacemap-map-header">
+            <h3>Map</h3>
+            <div className="seg-toggle spacemap-mode-toggle">
+              <button
+                type="button"
+                className={`seg-toggle-btn ${spacemapMapMode === 'activity' ? 'active' : ''}`}
+                onClick={() => setSpacemapMapMode('activity')}
+              >
+                Activity
+              </button>
+              <button
+                type="button"
+                className={`seg-toggle-btn ${spacemapMapMode === 'churn' ? 'active' : ''}`}
+                onClick={() => setSpacemapMapMode('churn')}
+              >
+                Churn
+              </button>
+            </div>
+          </div>
+
+          <div className="spacemap-map-hint muted">
+            Click start bin, then Shift-click end bin to select an address range.
+          </div>
+
+          <div className="spacemap-strip-wrap">
+            <div className="spacemap-strip">
+              {spacemapBins.map(bin => {
+                const magnitude =
+                  spacemapMapMode === 'activity' ? Math.abs(bin.net_bytes) : bin.ops_total
+                const ratio =
+                  spacemapMapMaxMagnitude > 0 ? magnitude / spacemapMapMaxMagnitude : 0
+                const alpha = Math.min(1, 0.14 + ratio * 0.86)
+                const color =
+                  spacemapMapMode === 'activity'
+                    ? bin.net_bytes > 0
+                      ? `rgba(255, 140, 66, ${alpha})`
+                      : bin.net_bytes < 0
+                        ? `rgba(77, 208, 225, ${alpha})`
+                        : `rgba(166, 180, 204, ${Math.max(0.12, alpha * 0.35)})`
+                    : `rgba(120, 220, 200, ${alpha})`
+                const selected =
+                  !!spacemapSelection &&
+                  bin.index >= Math.min(spacemapSelection.startIndex, spacemapSelection.endIndex) &&
+                  bin.index <= Math.max(spacemapSelection.startIndex, spacemapSelection.endIndex)
+                const highlighted =
+                  bin.index === spacemapHoveredBinIndex || bin.index === spacemapHoveredRangeBinIndex
+                return (
+                  <button
+                    type="button"
+                    key={`bin-${bin.index}`}
+                    className={`spacemap-bin${selected ? ' selected' : ''}${highlighted ? ' highlighted' : ''}`}
+                    style={{ background: color }}
+                    onClick={event => handleSpacemapBinSelect(bin.index, event.shiftKey)}
+                    onMouseEnter={() => setSpacemapHoveredBinIndex(bin.index)}
+                    onMouseLeave={() => setSpacemapHoveredBinIndex(null)}
+                    title={`#${bin.index} ${formatAddr(bin.offset_start)} - ${formatAddr(
+                      bin.offset_end
+                    )} | alloc ${formatAddr(bin.alloc_bytes)} | free ${formatAddr(
+                      bin.free_bytes
+                    )} | ops ${bin.ops_total}`}
+                  />
+                )
+              })}
+            </div>
+          </div>
+
+          <div className="spacemap-map-meta">
+            <span>
+              bins loaded: {spacemapBins.length}
+              {spacemapBinsTotal !== null ? ` / ${spacemapBinsTotal}` : ''}
+            </span>
+            <span>bin size: {formatAddr(spacemapLoadedBinSize)}</span>
+            {spacemapSelectedWindow && (
+              <span>
+                selected: {formatAddr(spacemapSelectedWindow.offset_start)} -{' '}
+                {formatAddr(spacemapSelectedWindow.offset_end)}
+              </span>
+            )}
+          </div>
+
+          {spacemapSelectedWindowMetrics && (
+            <div className="spacemap-selection-summary">
+              <span>ops {spacemapSelectedWindowMetrics.ops_total}</span>
+              <span>alloc {formatAddr(spacemapSelectedWindowMetrics.alloc_bytes)}</span>
+              <span>free {formatAddr(spacemapSelectedWindowMetrics.free_bytes)}</span>
+              <span>net {formatAddr(spacemapSelectedWindowMetrics.net_bytes)}</span>
+            </div>
+          )}
+
+          <div className="spacemap-map-actions">
+            <button
+              type="button"
+              className="fs-action-btn"
+              onClick={clearSpacemapSelection}
+              disabled={!spacemapSelection}
+            >
+              Clear selection
+            </button>
+            <button
+              type="button"
+              className="fs-action-btn"
+              onClick={exportSelectedSpacemapWindow}
+              disabled={!spacemapSelectedWindow}
+            >
+              Export window JSON
+            </button>
+          </div>
+
+          {spacemapBinsLoading && <p className="muted">Loading bins…</p>}
+          {spacemapBinsNext !== null && !spacemapBinsLoading && selectedObject !== null && (
+            <button
+              className="load-more"
+              onClick={() => fetchSpacemapBins(selectedObject, spacemapBinsNext, true)}
+            >
+              Load more bins
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="spacemap-top-grid">
         <div className="spacemap-top-card">
           <h3>Largest ranges</h3>
@@ -4515,19 +5090,30 @@ function App() {
           <span>TXG</span>
           <span>VDEV</span>
         </div>
-        {spacemapRanges.length === 0 && !spacemapRangesLoading ? (
+        {spacemapVisibleRanges.length === 0 && !spacemapRangesLoading ? (
           <div className="spacemap-ranges-empty">No ranges for current filter.</div>
         ) : (
-          spacemapRanges.map(range => (
-            <div className="spacemap-ranges-row" key={`range-${range.index}`}>
+          spacemapVisibleRanges.map(range => {
+            const rangeBin = spacemapRangeBinIndex(range)
+            const rowHighlighted =
+              (rangeBin !== null && rangeBin === spacemapHoveredBinIndex) ||
+              (rangeBin !== null && rangeBin === spacemapHoveredRangeBinIndex)
+            return (
+              <div
+                className={`spacemap-ranges-row${rowHighlighted ? ' active' : ''}`}
+                key={`range-${range.index}`}
+                onMouseEnter={() => setSpacemapHoveredRangeBinIndex(rangeBin)}
+                onMouseLeave={() => setSpacemapHoveredRangeBinIndex(null)}
+              >
               <span>{range.index}</span>
               <span>{range.op}</span>
               <span>{formatAddr(range.offset)}</span>
               <span>{formatAddr(range.length)}</span>
               <span>{range.txg ?? '—'}</span>
               <span>{range.vdev ?? '—'}</span>
-            </div>
-          ))
+              </div>
+            )
+          })
         )}
       </div>
 
@@ -6251,6 +6837,13 @@ function App() {
                     >
                       Physical
                     </button>
+                    <button
+                      className={`graph-btn ${centerView === 'performance' ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => setCenterView('performance')}
+                    >
+                      Perf
+                    </button>
                     {isSpacemapObject && (
                       <button
                         className={`graph-btn ${centerView === 'spacemap' ? 'active' : ''}`}
@@ -6290,6 +6883,10 @@ function App() {
                     </>
                   ) : effectiveCenterView === 'spacemap' ? (
                     <span className="muted">Address-range activity and distribution</span>
+                  ) : effectiveCenterView === 'performance' ? (
+                    <span className="muted">
+                      Forensics = evidence suggests, Runtime = currently observed
+                    </span>
                   ) : effectiveCenterView === 'hex' ? (
                     <span className="muted">Logical object data view</span>
                   ) : (
@@ -6312,6 +6909,7 @@ function App() {
                   )}
                   {effectiveCenterView !== 'map' &&
                     effectiveCenterView !== 'spacemap' &&
+                    effectiveCenterView !== 'performance' &&
                     effectiveCenterView !== 'hex' && (
                     <>
                       {effectiveCenterView !== 'physical' && (
@@ -6360,6 +6958,8 @@ function App() {
                   />
                 ) : effectiveCenterView === 'spacemap' ? (
                   renderSpacemapPanel('center')
+                ) : effectiveCenterView === 'performance' ? (
+                  renderPerformancePanel()
                 ) : effectiveCenterView === 'hex' ? (
                   renderObjsetHexPanel()
                 ) : (

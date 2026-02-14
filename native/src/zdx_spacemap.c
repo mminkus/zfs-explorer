@@ -34,6 +34,53 @@ typedef struct zdx_spacemap_page_ctx {
     int ranges_count;
 } zdx_spacemap_page_ctx_t;
 
+typedef struct zdx_spacemap_bin_accum {
+    uint64_t alloc_bytes;
+    uint64_t free_bytes;
+    uint64_t alloc_ops;
+    uint64_t free_ops;
+    uint64_t largest_range;
+    uint64_t range_bytes_sum;
+    uint64_t range_segments;
+    uint64_t txg_min;
+    uint64_t txg_max;
+    boolean_t has_txg;
+} zdx_spacemap_bin_accum_t;
+
+typedef struct zdx_spacemap_bins_ctx {
+    uint64_t sm_start;
+    uint64_t sm_size;
+    uint64_t bin_size;
+    uint64_t start_bin;
+    uint64_t end_bin;
+    int op_filter;
+    uint64_t min_length;
+    uint64_t txg_min;
+    uint64_t txg_max;
+    boolean_t use_txg_min;
+    boolean_t use_txg_max;
+    zdx_spacemap_bin_accum_t *bins;
+    boolean_t has_more;
+} zdx_spacemap_bins_ctx_t;
+
+static uint64_t
+zdx_u64_add_sat(uint64_t a, uint64_t b)
+{
+    if (UINT64_MAX - a < b)
+        return UINT64_MAX;
+    return a + b;
+}
+
+static uint64_t
+zdx_u64_mul_sat(uint64_t a, uint64_t b)
+{
+    if (a == 0 || b == 0)
+        return 0;
+    if (a > UINT64_MAX / b)
+        return UINT64_MAX;
+    return a * b;
+}
+
 static unsigned
 zdx_u64_log2_bucket(uint64_t value)
 {
@@ -142,26 +189,27 @@ zdx_spacemap_summary_cb(space_map_entry_t *sme, void *arg)
 }
 
 static int
-zdx_spacemap_entry_matches(const space_map_entry_t *sme,
-    const zdx_spacemap_page_ctx_t *ctx)
+zdx_spacemap_entry_matches_filter(const space_map_entry_t *sme,
+    int op_filter, uint64_t min_length, boolean_t use_txg_min, uint64_t txg_min,
+    boolean_t use_txg_max, uint64_t txg_max)
 {
-    if (!sme || !ctx)
+    if (!sme)
         return 0;
 
-    if (ctx->op_filter == ZDX_SPACEMAP_OP_ALLOC && sme->sme_type != SM_ALLOC)
+    if (op_filter == ZDX_SPACEMAP_OP_ALLOC && sme->sme_type != SM_ALLOC)
         return 0;
-    if (ctx->op_filter == ZDX_SPACEMAP_OP_FREE && sme->sme_type != SM_FREE)
+    if (op_filter == ZDX_SPACEMAP_OP_FREE && sme->sme_type != SM_FREE)
         return 0;
-    if (sme->sme_run < ctx->min_length)
+    if (sme->sme_run < min_length)
         return 0;
 
-    if (ctx->use_txg_min) {
-        if (sme->sme_txg == 0 || sme->sme_txg < ctx->txg_min)
+    if (use_txg_min) {
+        if (sme->sme_txg == 0 || sme->sme_txg < txg_min)
             return 0;
     }
 
-    if (ctx->use_txg_max) {
-        if (sme->sme_txg == 0 || sme->sme_txg > ctx->txg_max)
+    if (use_txg_max) {
+        if (sme->sme_txg == 0 || sme->sme_txg > txg_max)
             return 0;
     }
 
@@ -185,7 +233,9 @@ zdx_spacemap_page_cb(space_map_entry_t *sme, void *arg)
     if (!sme || !ctx)
         return EINVAL;
 
-    if (!zdx_spacemap_entry_matches(sme, ctx))
+    if (!zdx_spacemap_entry_matches_filter(sme, ctx->op_filter,
+        ctx->min_length, ctx->use_txg_min, ctx->txg_min,
+        ctx->use_txg_max, ctx->txg_max))
         return 0;
 
     if (ctx->seen < ctx->cursor) {
@@ -606,5 +656,414 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
 
     if (!result)
         return make_error(ENOMEM, "failed to encode spacemap ranges");
+    return make_success(result);
+}
+
+static int
+zdx_spacemap_bins_cb(space_map_entry_t *sme, void *arg)
+{
+    zdx_spacemap_bins_ctx_t *ctx = arg;
+    uint64_t abs_start = 0;
+    uint64_t abs_end = 0;
+    uint64_t rel_start = 0;
+    uint64_t rel_end = 0;
+    uint64_t first_bin = 0;
+    uint64_t last_bin = 0;
+    uint64_t bin_lo = 0;
+    uint64_t bin_hi = 0;
+
+    if (!sme || !ctx)
+        return EINVAL;
+
+    if (!zdx_spacemap_entry_matches_filter(sme, ctx->op_filter,
+        ctx->min_length, ctx->use_txg_min, ctx->txg_min,
+        ctx->use_txg_max, ctx->txg_max))
+        return 0;
+
+    abs_start = sme->sme_offset;
+    abs_end = zdx_u64_add_sat(sme->sme_offset, sme->sme_run);
+    if (abs_end <= ctx->sm_start)
+        return 0;
+
+    if (abs_start < ctx->sm_start)
+        abs_start = ctx->sm_start;
+    if (abs_end < ctx->sm_start)
+        abs_end = ctx->sm_start;
+
+    rel_start = abs_start - ctx->sm_start;
+    rel_end = abs_end - ctx->sm_start;
+    if (rel_end <= rel_start)
+        return 0;
+
+    first_bin = rel_start / ctx->bin_size;
+    last_bin = (rel_end - 1) / ctx->bin_size;
+
+    if (first_bin >= ctx->end_bin) {
+        ctx->has_more = B_TRUE;
+        return 0;
+    }
+    if (last_bin < ctx->start_bin)
+        return 0;
+
+    bin_lo = (first_bin > ctx->start_bin) ? first_bin : ctx->start_bin;
+    bin_hi = (last_bin < (ctx->end_bin - 1)) ? last_bin : (ctx->end_bin - 1);
+
+    for (uint64_t bin = bin_lo; bin <= bin_hi; bin++) {
+        uint64_t idx = bin - ctx->start_bin;
+        uint64_t bin_rel_start = zdx_u64_mul_sat(bin, ctx->bin_size);
+        uint64_t bin_rel_end = zdx_u64_add_sat(bin_rel_start, ctx->bin_size);
+        uint64_t overlap_start = (rel_start > bin_rel_start) ?
+            rel_start : bin_rel_start;
+        uint64_t overlap_end = (rel_end < bin_rel_end) ? rel_end : bin_rel_end;
+        uint64_t seg_len = 0;
+        zdx_spacemap_bin_accum_t *acc = NULL;
+
+        if (overlap_end <= overlap_start)
+            continue;
+
+        seg_len = overlap_end - overlap_start;
+        if (idx >= (ctx->end_bin - ctx->start_bin))
+            continue;
+
+        acc = &ctx->bins[idx];
+        if (sme->sme_type == SM_ALLOC) {
+            acc->alloc_bytes += seg_len;
+            acc->alloc_ops++;
+        } else {
+            acc->free_bytes += seg_len;
+            acc->free_ops++;
+        }
+
+        if (seg_len > acc->largest_range)
+            acc->largest_range = seg_len;
+        acc->range_bytes_sum += seg_len;
+        acc->range_segments++;
+
+        if (sme->sme_txg != 0) {
+            if (!acc->has_txg) {
+                acc->txg_min = sme->sme_txg;
+                acc->txg_max = sme->sme_txg;
+                acc->has_txg = B_TRUE;
+            } else {
+                if (sme->sme_txg < acc->txg_min)
+                    acc->txg_min = sme->sme_txg;
+                if (sme->sme_txg > acc->txg_max)
+                    acc->txg_max = sme->sme_txg;
+            }
+        }
+    }
+
+    return 0;
+}
+
+zdx_result_t
+zdx_spacemap_bins(zdx_pool_t *pool, uint64_t objid, uint64_t bin_size,
+    uint64_t cursor, uint64_t limit, int op_filter, uint64_t min_length,
+    uint64_t txg_min, uint64_t txg_max)
+{
+    space_map_t *sm = NULL;
+    dmu_object_info_t doi;
+    zdx_spacemap_bins_ctx_t bins = {0};
+    zdx_spacemap_bin_accum_t *accum = NULL;
+    char *bins_json = NULL;
+    char *bins_final = NULL;
+    char *result = NULL;
+    uint64_t page_bins = 0;
+    uint64_t total_bins = 0;
+    boolean_t total_known = B_TRUE;
+    uint64_t next_cursor = 0;
+    boolean_t has_next = B_FALSE;
+    char next_buf[32];
+    char total_bins_buf[32];
+    char txg_min_buf[32];
+    char txg_max_buf[32];
+    const char *next_json = "null";
+    const char *total_bins_json = "null";
+    const char *txg_min_json = "null";
+    const char *txg_max_json = "null";
+    const char *op_filter_json = "all";
+    int bins_count = 0;
+    int err;
+
+    if (bin_size == 0)
+        bin_size = 1ULL << 20;
+    if (bin_size < 512)
+        bin_size = 512;
+    if (limit == 0)
+        limit = 256;
+    if (limit > 2048)
+        limit = 2048;
+
+    if (op_filter != ZDX_SPACEMAP_OP_ANY &&
+        op_filter != ZDX_SPACEMAP_OP_ALLOC &&
+        op_filter != ZDX_SPACEMAP_OP_FREE) {
+        return make_error(EINVAL, "invalid spacemap op_filter=%d", op_filter);
+    }
+
+    if (op_filter == ZDX_SPACEMAP_OP_ALLOC)
+        op_filter_json = "alloc";
+    else if (op_filter == ZDX_SPACEMAP_OP_FREE)
+        op_filter_json = "free";
+
+    if (txg_min != 0 && txg_max != 0 && txg_min > txg_max) {
+        return make_error(EINVAL,
+            "txg_min (%llu) must be <= txg_max (%llu)",
+            (unsigned long long)txg_min, (unsigned long long)txg_max);
+    }
+
+    err = zdx_spacemap_doi(pool, objid, &doi);
+    if (err != 0) {
+        return make_error(err, "failed to inspect spacemap object %llu: %s",
+            (unsigned long long)objid, strerror(err));
+    }
+
+    if (doi.doi_type != DMU_OT_SPACE_MAP) {
+        return make_error(EINVAL,
+            "object %llu is type \"%s\" (%u); expected \"space map\"",
+            (unsigned long long)objid,
+            dmu_ot_name_safe(doi.doi_type),
+            doi.doi_type);
+    }
+
+    if (doi.doi_bonus_size < SPACE_MAP_SIZE_V0) {
+        return make_error(EINVAL,
+            "object %llu bonus is too small for space map payload "
+            "(bonus=%u, need>=%u)",
+            (unsigned long long)objid,
+            doi.doi_bonus_size,
+            SPACE_MAP_SIZE_V0);
+    }
+
+    err = zdx_open_spacemap(pool, objid, &sm);
+    if (err != 0)
+        return make_error(err, "failed to open spacemap object %llu: %s",
+            (unsigned long long)objid, strerror(err));
+
+    if (sm->sm_size == UINT64_MAX) {
+        total_known = B_FALSE;
+    } else {
+        total_bins = sm->sm_size / bin_size;
+        if ((sm->sm_size % bin_size) != 0)
+            total_bins++;
+        if (total_bins == 0)
+            total_bins = 1;
+    }
+
+    if (total_known) {
+        if (cursor >= total_bins) {
+            page_bins = 0;
+        } else {
+            page_bins = total_bins - cursor;
+            if (page_bins > limit)
+                page_bins = limit;
+        }
+    } else {
+        page_bins = limit;
+    }
+
+    bins_json = json_array_start();
+    if (!bins_json) {
+        space_map_close(sm);
+        return make_error(ENOMEM, "failed to allocate bins JSON");
+    }
+
+    if (page_bins > 0) {
+        accum = calloc(page_bins, sizeof (zdx_spacemap_bin_accum_t));
+        if (!accum) {
+            free(bins_json);
+            space_map_close(sm);
+            return make_error(ENOMEM, "failed to allocate bins state");
+        }
+
+        bins.sm_start = sm->sm_start;
+        bins.sm_size = sm->sm_size;
+        bins.bin_size = bin_size;
+        bins.start_bin = cursor;
+        bins.end_bin = zdx_u64_add_sat(cursor, page_bins);
+        bins.op_filter = op_filter;
+        bins.min_length = min_length;
+        bins.txg_min = txg_min;
+        bins.txg_max = txg_max;
+        bins.use_txg_min = (txg_min != 0) ? B_TRUE : B_FALSE;
+        bins.use_txg_max = (txg_max != 0) ? B_TRUE : B_FALSE;
+        bins.bins = accum;
+
+        err = space_map_iterate(sm, space_map_length(sm), zdx_spacemap_bins_cb,
+            &bins);
+        if (err != 0) {
+            free(accum);
+            free(bins_json);
+            space_map_close(sm);
+            return make_error(err, "failed to iterate spacemap object %llu",
+                (unsigned long long)objid);
+        }
+    }
+
+    for (uint64_t i = 0; i < page_bins; i++) {
+        uint64_t bin_index = cursor + i;
+        uint64_t rel_start = zdx_u64_mul_sat(bin_index, bin_size);
+        uint64_t abs_start = zdx_u64_add_sat(sm->sm_start, rel_start);
+        uint64_t abs_end = zdx_u64_add_sat(abs_start, bin_size - 1);
+        zdx_spacemap_bin_accum_t *acc = &accum[i];
+        uint64_t ops_total = acc->alloc_ops + acc->free_ops;
+        uint64_t avg_range = (acc->range_segments == 0) ? 0 :
+            (acc->range_bytes_sum / acc->range_segments);
+        char txg_min_local_buf[32];
+        char txg_max_local_buf[32];
+        char net_bytes_buf[32];
+        const char *bin_txg_min_json = "null";
+        const char *bin_txg_max_json = "null";
+        char *item = NULL;
+        char *next = NULL;
+
+        if (acc->has_txg) {
+            (void) snprintf(txg_min_local_buf, sizeof (txg_min_local_buf), "%llu",
+                (unsigned long long)acc->txg_min);
+            (void) snprintf(txg_max_local_buf, sizeof (txg_max_local_buf), "%llu",
+                (unsigned long long)acc->txg_max);
+            bin_txg_min_json = txg_min_local_buf;
+            bin_txg_max_json = txg_max_local_buf;
+        }
+
+        if (acc->alloc_bytes >= acc->free_bytes) {
+            (void) snprintf(net_bytes_buf, sizeof (net_bytes_buf), "%lld",
+                (long long)(acc->alloc_bytes - acc->free_bytes));
+        } else {
+            (void) snprintf(net_bytes_buf, sizeof (net_bytes_buf), "%lld",
+                -(long long)(acc->free_bytes - acc->alloc_bytes));
+        }
+
+        item = json_format(
+            "{"
+            "\"index\":%llu,"
+            "\"offset_start\":%llu,"
+            "\"offset_end\":%llu,"
+            "\"alloc_bytes\":%llu,"
+            "\"free_bytes\":%llu,"
+            "\"net_bytes\":%s,"
+            "\"alloc_ops\":%llu,"
+            "\"free_ops\":%llu,"
+            "\"ops_total\":%llu,"
+            "\"txg_min\":%s,"
+            "\"txg_max\":%s,"
+            "\"largest_range\":%llu,"
+            "\"avg_range\":%llu"
+            "}",
+            (unsigned long long)bin_index,
+            (unsigned long long)abs_start,
+            (unsigned long long)abs_end,
+            (unsigned long long)acc->alloc_bytes,
+            (unsigned long long)acc->free_bytes,
+            net_bytes_buf,
+            (unsigned long long)acc->alloc_ops,
+            (unsigned long long)acc->free_ops,
+            (unsigned long long)ops_total,
+            bin_txg_min_json,
+            bin_txg_max_json,
+            (unsigned long long)acc->largest_range,
+            (unsigned long long)avg_range);
+        if (!item) {
+            free(accum);
+            free(bins_json);
+            space_map_close(sm);
+            return make_error(ENOMEM, "failed to encode bins row");
+        }
+
+        next = json_array_append(bins_json, item);
+        free(item);
+        if (!next) {
+            free(accum);
+            free(bins_json);
+            space_map_close(sm);
+            return make_error(ENOMEM, "failed to append bins row");
+        }
+
+        free(bins_json);
+        bins_json = next;
+        bins_count++;
+    }
+
+    bins_final = json_array_end(bins_json, bins_count > 0);
+    free(bins_json);
+    if (!bins_final) {
+        free(accum);
+        space_map_close(sm);
+        return make_error(ENOMEM, "failed to finalize bins JSON");
+    }
+
+    if (total_known) {
+        (void) snprintf(total_bins_buf, sizeof (total_bins_buf), "%llu",
+            (unsigned long long)total_bins);
+        total_bins_json = total_bins_buf;
+
+        if ((cursor < total_bins) && (page_bins > 0) &&
+            (cursor + page_bins < total_bins)) {
+            has_next = B_TRUE;
+            next_cursor = cursor + page_bins;
+        }
+    } else if (bins.has_more && page_bins > 0) {
+        has_next = B_TRUE;
+        next_cursor = cursor + page_bins;
+    }
+
+    if (has_next) {
+        (void) snprintf(next_buf, sizeof (next_buf), "%llu",
+            (unsigned long long)next_cursor);
+        next_json = next_buf;
+    }
+
+    if (txg_min != 0) {
+        (void) snprintf(txg_min_buf, sizeof (txg_min_buf), "%llu",
+            (unsigned long long)txg_min);
+        txg_min_json = txg_min_buf;
+    }
+    if (txg_max != 0) {
+        (void) snprintf(txg_max_buf, sizeof (txg_max_buf), "%llu",
+            (unsigned long long)txg_max);
+        txg_max_json = txg_max_buf;
+    }
+
+    result = json_format(
+        "{"
+        "\"object\":%llu,"
+        "\"start\":%llu,"
+        "\"size\":%llu,"
+        "\"shift\":%u,"
+        "\"bin_size\":%llu,"
+        "\"cursor\":%llu,"
+        "\"limit\":%llu,"
+        "\"count\":%llu,"
+        "\"next\":%s,"
+        "\"total_bins\":%s,"
+        "\"filters\":{"
+        "\"op\":\"%s\","
+        "\"min_length\":%llu,"
+        "\"txg_min\":%s,"
+        "\"txg_max\":%s"
+        "},"
+        "\"bins\":%s"
+        "}",
+        (unsigned long long)objid,
+        (unsigned long long)sm->sm_start,
+        (unsigned long long)sm->sm_size,
+        sm->sm_shift,
+        (unsigned long long)bin_size,
+        (unsigned long long)cursor,
+        (unsigned long long)limit,
+        (unsigned long long)page_bins,
+        next_json,
+        total_bins_json,
+        op_filter_json,
+        (unsigned long long)min_length,
+        txg_min_json,
+        txg_max_json,
+        bins_final);
+
+    free(accum);
+    free(bins_final);
+    space_map_close(sm);
+
+    if (!result)
+        return make_error(ENOMEM, "failed to encode spacemap bins");
     return make_success(result);
 }

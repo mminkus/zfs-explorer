@@ -211,6 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/pools/{pool}/spacemap/{objid}/ranges",
             get(api::spacemap_ranges),
         )
+        .route(
+            "/api/pools/{pool}/spacemap/{objid}/bins",
+            get(api::spacemap_bins),
+        )
         .route("/api/pools/{pool}/block", get(api::read_block))
         .route("/api/pools/{pool}/graph/from/{objid}", get(api::graph_from))
         .route("/api/mos/types", get(api::list_dmu_types))

@@ -99,6 +99,11 @@ zdx_result_t zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid,
                                  uint64_t cursor, uint64_t limit,
                                  int op_filter, uint64_t min_length,
                                  uint64_t txg_min, uint64_t txg_max);
+zdx_result_t zdx_spacemap_bins(zdx_pool_t *pool, uint64_t objid,
+                               uint64_t bin_size, uint64_t cursor,
+                               uint64_t limit, int op_filter,
+                               uint64_t min_length, uint64_t txg_min,
+                               uint64_t txg_max);
 
 /* === Version info === */
 const char *zdx_version(void); /* returns OpenZFS commit hash (injected at build time) */

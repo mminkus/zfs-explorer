@@ -417,6 +417,27 @@ pub fn spacemap_ranges(
     ZdxResult::from_raw(raw)
 }
 
+/// Paginated space-map bins for address-strip visualizations
+pub fn spacemap_bins(
+    pool: *mut zdx_pool_t,
+    objid: u64,
+    bin_size: u64,
+    cursor: u64,
+    limit: u64,
+    op_filter: i32,
+    min_length: u64,
+    txg_min: u64,
+    txg_max: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe {
+        zdx_spacemap_bins(
+            pool, objid, bin_size, cursor, limit, op_filter, min_length, txg_min, txg_max,
+        )
+    };
+    ZdxResult::from_raw(raw)
+}
+
 /// Read raw block by vdev + offset
 pub fn read_block(pool: *mut zdx_pool_t, vdev: u64, offset: u64, size: u64) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();

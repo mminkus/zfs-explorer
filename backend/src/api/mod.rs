@@ -13,6 +13,11 @@ const DEFAULT_PAGE_LIMIT: u64 = 200;
 const MAX_PAGE_LIMIT: u64 = 10_000;
 const SPACEMAP_DEFAULT_LIMIT: u64 = 200;
 const SPACEMAP_MAX_LIMIT: u64 = 2_000;
+const SPACEMAP_BINS_DEFAULT_LIMIT: u64 = 256;
+const SPACEMAP_BINS_MAX_LIMIT: u64 = 2_048;
+const SPACEMAP_BINS_DEFAULT_SIZE: u64 = 1 << 20; // 1 MiB
+const SPACEMAP_BINS_MIN_SIZE: u64 = 512;
+const SPACEMAP_BINS_MAX_SIZE: u64 = 1 << 32; // 4 GiB
 const OBJSET_DATA_DEFAULT_LIMIT: u64 = 64 * 1024;
 const OBJSET_DATA_MAX_LIMIT: u64 = 1 << 20;
 const BACKEND_NAME: &str = env!("CARGO_PKG_NAME");
@@ -260,6 +265,22 @@ fn normalize_spacemap_limit(limit: Option<u64>) -> u64 {
 
 fn normalize_spacemap_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (u64, u64) {
     (cursor.unwrap_or(0), normalize_spacemap_limit(limit))
+}
+
+fn normalize_spacemap_bins_limit(limit: Option<u64>) -> u64 {
+    limit
+        .unwrap_or(SPACEMAP_BINS_DEFAULT_LIMIT)
+        .clamp(1, SPACEMAP_BINS_MAX_LIMIT)
+}
+
+fn normalize_spacemap_bin_size(bin_size: Option<u64>) -> u64 {
+    bin_size
+        .unwrap_or(SPACEMAP_BINS_DEFAULT_SIZE)
+        .clamp(SPACEMAP_BINS_MIN_SIZE, SPACEMAP_BINS_MAX_SIZE)
+}
+
+fn normalize_spacemap_bins_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (u64, u64) {
+    (cursor.unwrap_or(0), normalize_spacemap_bins_limit(limit))
 }
 
 fn normalize_objset_data_limit(limit: Option<u64>) -> u64 {
@@ -1194,6 +1215,17 @@ pub struct SpacemapRangesQuery {
     pub txg_max: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SpacemapBinsQuery {
+    pub bin_size: Option<u64>,
+    pub cursor: Option<u64>,
+    pub limit: Option<u64>,
+    pub op: Option<String>,
+    pub min_length: Option<u64>,
+    pub txg_min: Option<u64>,
+    pub txg_max: Option<u64>,
+}
+
 /// GET /api/pools/:pool/spacemap/:objid/summary
 pub async fn spacemap_summary(
     State(state): State<AppState>,
@@ -1240,6 +1272,47 @@ pub async fn spacemap_ranges(
 
     let result = crate::ffi::spacemap_ranges(
         pool_ptr, objid, cursor, limit, op_filter, min_length, txg_min, txg_max,
+    );
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_spacemap_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            tracing::error!("FFI error: {}", err_msg);
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    Ok(Json(value))
+}
+
+/// GET /api/pools/:pool/spacemap/:objid/bins?bin_size=&cursor=&limit=&op=&min_length=&txg_min=&txg_max=
+pub async fn spacemap_bins(
+    State(state): State<AppState>,
+    Path((pool, objid)): Path<(String, u64)>,
+    Query(params): Query<SpacemapBinsQuery>,
+) -> ApiResult {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let bin_size = normalize_spacemap_bin_size(params.bin_size);
+    let (cursor, limit) = normalize_spacemap_bins_cursor_limit(params.cursor, params.limit);
+    let op_filter = parse_spacemap_op_filter(params.op.as_deref())?;
+    let min_length = params.min_length.unwrap_or(0);
+    let txg_min = params.txg_min.unwrap_or(0);
+    let txg_max = params.txg_max.unwrap_or(0);
+    if txg_min != 0 && txg_max != 0 && txg_min > txg_max {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "txg_min must be <= txg_max",
+        ));
+    }
+
+    let result = crate::ffi::spacemap_bins(
+        pool_ptr, objid, bin_size, cursor, limit, op_filter, min_length, txg_min, txg_max,
     );
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
@@ -1398,6 +1471,37 @@ mod tests {
         assert_eq!(
             normalize_spacemap_limit(Some(SPACEMAP_MAX_LIMIT + 1)),
             SPACEMAP_MAX_LIMIT
+        );
+    }
+
+    #[test]
+    fn normalize_spacemap_bins_limit_uses_default_and_bounds() {
+        assert_eq!(
+            normalize_spacemap_bins_limit(None),
+            SPACEMAP_BINS_DEFAULT_LIMIT
+        );
+        assert_eq!(normalize_spacemap_bins_limit(Some(0)), 1);
+        assert_eq!(normalize_spacemap_bins_limit(Some(64)), 64);
+        assert_eq!(
+            normalize_spacemap_bins_limit(Some(SPACEMAP_BINS_MAX_LIMIT + 1)),
+            SPACEMAP_BINS_MAX_LIMIT
+        );
+    }
+
+    #[test]
+    fn normalize_spacemap_bin_size_uses_default_and_bounds() {
+        assert_eq!(
+            normalize_spacemap_bin_size(None),
+            SPACEMAP_BINS_DEFAULT_SIZE
+        );
+        assert_eq!(
+            normalize_spacemap_bin_size(Some(1)),
+            SPACEMAP_BINS_MIN_SIZE
+        );
+        assert_eq!(normalize_spacemap_bin_size(Some(4096)), 4096);
+        assert_eq!(
+            normalize_spacemap_bin_size(Some(SPACEMAP_BINS_MAX_SIZE + 1)),
+            SPACEMAP_BINS_MAX_SIZE
         );
     }
 
