@@ -45,6 +45,8 @@ zdx_result_t zdx_mos_list_objects(zdx_pool_t *pool, int type_filter,
 zdx_result_t zdx_mos_get_object(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_mos_get_blkptrs(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_obj_get(zdx_pool_t *pool, uint64_t objid);
+zdx_result_t zdx_mos_block_tree(zdx_pool_t *pool, uint64_t objid,
+                                uint64_t max_depth, uint64_t max_nodes);
 
 /* === DMU type catalog === */
 zdx_result_t zdx_list_dmu_types(void);
@@ -84,6 +86,9 @@ zdx_result_t zdx_objset_get_object(zdx_pool_t *pool, uint64_t objset_id,
                                    uint64_t objid);
 zdx_result_t zdx_objset_get_blkptrs(zdx_pool_t *pool, uint64_t objset_id,
                                     uint64_t objid);
+zdx_result_t zdx_objset_block_tree(zdx_pool_t *pool, uint64_t objset_id,
+                                   uint64_t objid, uint64_t max_depth,
+                                   uint64_t max_nodes);
 zdx_result_t zdx_objset_zap_info(zdx_pool_t *pool, uint64_t objset_id,
                                  uint64_t objid);
 zdx_result_t zdx_objset_zap_entries(zdx_pool_t *pool, uint64_t objset_id,

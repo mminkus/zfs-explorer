@@ -112,6 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/api/version", get(api::api_version))
         .route("/api/mode", get(api::get_mode).put(api::set_mode))
+        .route("/api/perf/arc", get(api::perf_arc))
+        .route("/api/perf/vdev_iostat", get(api::perf_vdev_iostat))
+        .route("/api/perf/txg", get(api::perf_txg))
+        .route("/api/pools/{pool}/dedup", get(api::pool_dedup_summary))
+        .route(
+            "/api/pools/{pool}/space-amplification",
+            get(api::pool_space_amplification),
+        )
         .route("/api/pools", get(api::list_pools))
         .route("/api/pools/{pool}/summary", get(api::pool_summary))
         .route("/api/pools/{pool}/errors", get(api::pool_errors))
@@ -119,6 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/pools/{pool}/mos/objects", get(api::mos_list_objects))
         .route("/api/pools/{pool}/obj/{objid}", get(api::mos_get_object))
         .route("/api/pools/{pool}/obj/{objid}/full", get(api::obj_get_full))
+        .route(
+            "/api/pools/{pool}/obj/{objid}/block-tree",
+            get(api::mos_block_tree),
+        )
         .route(
             "/api/pools/{pool}/obj/{objid}/blkptrs",
             get(api::mos_get_blkptrs),
@@ -186,6 +198,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/blkptrs",
             get(api::objset_get_blkptrs),
+        )
+        .route(
+            "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/block-tree",
+            get(api::objset_block_tree),
         )
         .route(
             "/api/pools/{pool}/objset/{objset_id}/obj/{objid}/zap/info",
