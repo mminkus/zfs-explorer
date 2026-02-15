@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
+import { useEffect, useMemo, useState, useCallback, useRef, type ReactNode } from 'react'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
 import './App.css'
 import { ObjectGraph } from './components/ObjectGraph'
@@ -20,6 +20,10 @@ const OBJSET_DATA_DEFAULT_LIMIT = 64 * 1024
 const OBJSET_DATA_MAX_LIMIT = 1 << 20
 const OBJSET_DOWNLOAD_CHUNK = 256 * 1024
 const OBJSET_DOWNLOAD_MAX_TOTAL = 512 * 1024 * 1024
+const RUNTIME_POLL_SECONDS = 5
+const RUNTIME_CHART_MAX_POINTS = 180
+const BLOCK_TREE_DEFAULT_DEPTH = 4
+const BLOCK_TREE_DEFAULT_NODES = 2000
 
 type ApiErrorPayload = {
   error?: string
@@ -232,6 +236,138 @@ type PoolModeResponse = {
   offline_pools?: string[]
 }
 
+type PerfArcSection = {
+  size_bytes: number
+  target_size_bytes: number
+  target_min_bytes: number
+  target_max_bytes: number
+  mru_size_bytes: number
+  mfu_size_bytes: number
+  hits: number
+  misses: number
+  demand_data_hits: number
+  demand_data_misses: number
+  demand_metadata_hits: number
+  demand_metadata_misses: number
+  prefetch_data_hits: number
+  prefetch_data_misses: number
+  prefetch_metadata_hits: number
+  prefetch_metadata_misses: number
+  evict_skip: number
+  memory_throttle_count: number
+}
+
+type PerfL2ArcSection = {
+  size_bytes: number
+  asize_bytes: number
+  hits: number
+  misses: number
+  read_bytes: number
+  write_bytes: number
+  feeds: number
+}
+
+type PerfArcRatios = {
+  arc_hit_ratio: number | null
+  demand_hit_ratio: number | null
+  prefetch_hit_ratio: number | null
+  l2arc_hit_ratio: number | null
+}
+
+type PerfArcResponse = {
+  source: string
+  sampled_at_unix_sec: number
+  arc: PerfArcSection
+  l2arc: PerfL2ArcSection
+  ratios: PerfArcRatios
+  raw_counter_count: number
+}
+
+type PerfVdevIostatRow = {
+  name: string
+  depth: number
+  alloc: number | null
+  free: number | null
+  read_ops: number | null
+  write_ops: number | null
+  read_bytes: number | null
+  write_bytes: number | null
+}
+
+type PerfVdevIostatResponse = {
+  pool: string
+  sampled_at_unix_sec: number
+  rows: PerfVdevIostatRow[]
+}
+
+type PerfTxgRow = Record<string, string | number | null>
+
+type PerfTxgResponse = {
+  source: string
+  sampled_at_unix_sec: number
+  columns: string[]
+  count: number
+  latest: PerfTxgRow | null
+  rows: PerfTxgRow[]
+}
+
+type RuntimeSamplePoint = {
+  ts: number
+  value: number
+}
+
+type BlockTreeDva = {
+  vdev: number
+  offset: number
+  asize: number
+  is_gang: boolean
+}
+
+type BlockTreeNode = {
+  id: number
+  kind: 'dnode' | 'blkptr'
+  parent_id: number | null
+  edge_index: number | null
+  object?: number
+  nlevels?: number
+  nblkptr?: number
+  indblkshift?: number
+  datablksz?: number
+  maxblkid?: number
+  has_spill?: boolean
+  is_spill?: boolean
+  blkid?: number
+  level?: number
+  type?: number
+  lsize?: number
+  psize?: number
+  asize?: number
+  birth_txg?: number
+  logical_birth?: number
+  physical_birth?: number
+  fill?: number
+  checksum?: number
+  compression?: number
+  dedup?: boolean
+  ndvas?: number
+  is_hole?: boolean
+  is_embedded?: boolean
+  is_gang?: boolean
+  child_slots?: number
+  dvas?: BlockTreeDva[]
+}
+
+type BlockTreeResponse = {
+  scope: 'mos' | 'objset'
+  objset_id: number | null
+  object: number
+  max_depth: number
+  max_nodes: number
+  count: number
+  truncated: boolean
+  nodes: BlockTreeNode[]
+}
+
 type PoolSummaryPool = {
   name: string
   guid: number
@@ -294,6 +430,70 @@ type PoolErrorsResponse = {
   count: number
   next: number | null
   entries: PoolErrorEntry[]
+}
+
+type DdtClassRow = {
+  refcount: number
+  blocks: number
+  lsize: number
+  psize: number
+  dsize: number
+  referenced_blocks: number
+  referenced_lsize: number
+  referenced_psize: number
+  referenced_dsize: number
+}
+
+type PoolDedupResponse = {
+  pool: string
+  sampled_at_unix_sec: number
+  ddt: {
+    entries: number | null
+    size_on_disk: number | null
+    size_in_core: number | null
+    classes: DdtClassRow[]
+    totals: DdtClassRow | null
+  }
+  raw: string
+}
+
+type SpaceAmplificationPoolSummary = {
+  size_bytes: number | null
+  allocated_bytes: number | null
+  free_bytes: number | null
+  frag_percent: number | null
+  dedup_ratio: number | null
+  logical_used_bytes: number | null
+  logical_vs_physical_ratio: number | null
+  physical_vs_logical_ratio: number | null
+  physical_minus_logical_bytes: number | null
+}
+
+type SpaceAmplificationDatasetRow = {
+  name: string
+  kind: string
+  used_bytes: number | null
+  logical_used_bytes: number | null
+  referenced_bytes: number | null
+  logical_referenced_bytes: number | null
+  compress_ratio: number | null
+  logical_vs_physical_ratio: number | null
+  physical_vs_logical_ratio: number | null
+  physical_minus_logical_bytes: number | null
+}
+
+type PoolSpaceAmplificationResponse = {
+  pool: string
+  sampled_at_unix_sec: number
+  pool_summary: SpaceAmplificationPoolSummary
+  totals: {
+    dataset_count: number
+    used_bytes: number
+    logical_used_bytes: number
+    referenced_bytes: number
+    logical_referenced_bytes: number
+  }
+  datasets: SpaceAmplificationDatasetRow[]
 }
 
 type SpacemapHistogramBucket = {
@@ -396,6 +596,16 @@ type SpacemapTopWindow = {
   ops: number
   alloc_bytes: number
   free_bytes: number
+}
+
+type SpacemapHeatCell = {
+  startIndex: number
+  endIndex: number
+  offsetStart: number
+  offsetEnd: number
+  opsTotal: number
+  avgRange: number
+  score: number
 }
 
 type DatasetTreeNode = {
@@ -750,6 +960,32 @@ const poolSummaryToZdb = (summary: PoolSummaryResponse): string => {
   return lines.join('\n')
 }
 
+const appendRuntimeSample = (
+  previous: RuntimeSamplePoint[],
+  sample: RuntimeSamplePoint
+): RuntimeSamplePoint[] => {
+  if (!Number.isFinite(sample.value)) return previous
+  if (previous.length > 0 && previous[previous.length - 1].ts === sample.ts) {
+    const next = [...previous]
+    next[next.length - 1] = sample
+    return next
+  }
+  const next = [...previous, sample]
+  if (next.length > RUNTIME_CHART_MAX_POINTS) {
+    next.splice(0, next.length - RUNTIME_CHART_MAX_POINTS)
+  }
+  return next
+}
+
+const toFiniteNumber = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
 const MOS_OBJECT_SCOPE: ObjectScope = {
   kind: 'mos',
   key: 'mos',
@@ -865,11 +1101,19 @@ function App() {
     dir: 'asc' | 'desc'
   }>({ key: 'name', dir: 'asc' })
   const [snapshotOpeningDsobj, setSnapshotOpeningDsobj] = useState<number | null>(null)
-  const [snapshotViewMode, setSnapshotViewMode] = useState<'table' | 'lineage'>('table')
+  const [snapshotViewMode, setSnapshotViewMode] = useState<'table' | 'lineage' | 'divergence'>(
+    'table'
+  )
   const [snapshotLineageDsobj, setSnapshotLineageDsobj] = useState<number | null>(null)
   const [snapshotLineage, setSnapshotLineage] = useState<SnapshotLineageResponse | null>(null)
   const [snapshotLineageLoading, setSnapshotLineageLoading] = useState(false)
   const [snapshotLineageError, setSnapshotLineageError] = useState<string | null>(null)
+  const [snapshotDivergenceLeftDsobj, setSnapshotDivergenceLeftDsobj] = useState<number | null>(
+    null
+  )
+  const [snapshotDivergenceRightDsobj, setSnapshotDivergenceRightDsobj] = useState<number | null>(
+    null
+  )
   const [snapshotCountsByDir, setSnapshotCountsByDir] = useState<Record<number, number | null>>(
     {}
   )
@@ -909,6 +1153,13 @@ function App() {
   const [poolErrorsResolvePaths, setPoolErrorsResolvePaths] = useState(true)
   const [poolErrorsCursorInput, setPoolErrorsCursorInput] = useState('0')
   const [poolErrorsLimit, setPoolErrorsLimit] = useState(200)
+  const [poolDedup, setPoolDedup] = useState<PoolDedupResponse | null>(null)
+  const [poolDedupLoading, setPoolDedupLoading] = useState(false)
+  const [poolDedupError, setPoolDedupError] = useState<string | null>(null)
+  const [poolSpaceAmplification, setPoolSpaceAmplification] =
+    useState<PoolSpaceAmplificationResponse | null>(null)
+  const [poolSpaceAmplificationLoading, setPoolSpaceAmplificationLoading] = useState(false)
+  const [poolSpaceAmplificationError, setPoolSpaceAmplificationError] = useState<string | null>(null)
   const [spacemapSummary, setSpacemapSummary] = useState<SpacemapSummaryResponse | null>(null)
   const [spacemapSummaryLoading, setSpacemapSummaryLoading] = useState(false)
   const [spacemapSummaryError, setSpacemapSummaryError] = useState<string | null>(null)
@@ -950,7 +1201,29 @@ function App() {
   const [graphExpandedFrom, setGraphExpandedFrom] = useState<number[]>([])
   const [graphExpanding, setGraphExpanding] = useState(false)
   const [graphExpandError, setGraphExpandError] = useState<string | null>(null)
+  const [showPerformanceGuide, setShowPerformanceGuide] = useState(false)
+  const [showSpacemapGuide, setShowSpacemapGuide] = useState(false)
   const [performanceTab, setPerformanceTab] = useState<'forensics' | 'runtime'>('forensics')
+  const [perfArc, setPerfArc] = useState<PerfArcResponse | null>(null)
+  const [perfArcLoading, setPerfArcLoading] = useState(false)
+  const [perfArcError, setPerfArcError] = useState<string | null>(null)
+  const [perfVdevIostat, setPerfVdevIostat] = useState<PerfVdevIostatResponse | null>(null)
+  const [perfVdevLoading, setPerfVdevLoading] = useState(false)
+  const [perfVdevError, setPerfVdevError] = useState<string | null>(null)
+  const [perfTxg, setPerfTxg] = useState<PerfTxgResponse | null>(null)
+  const [perfTxgLoading, setPerfTxgLoading] = useState(false)
+  const [perfTxgError, setPerfTxgError] = useState<string | null>(null)
+  const [runtimeArcHitSamples, setRuntimeArcHitSamples] = useState<RuntimeSamplePoint[]>([])
+  const [runtimeArcSizeSamples, setRuntimeArcSizeSamples] = useState<RuntimeSamplePoint[]>([])
+  const [runtimeVdevOpsSamples, setRuntimeVdevOpsSamples] = useState<RuntimeSamplePoint[]>([])
+  const [runtimeTxgDirtySamples, setRuntimeTxgDirtySamples] = useState<RuntimeSamplePoint[]>([])
+  const [runtimeWindowMinutes, setRuntimeWindowMinutes] = useState<1 | 5 | 15>(5)
+  const [blockTree, setBlockTree] = useState<BlockTreeResponse | null>(null)
+  const [blockTreeLoading, setBlockTreeLoading] = useState(false)
+  const [blockTreeError, setBlockTreeError] = useState<string | null>(null)
+  const [blockTreeDepthInput, setBlockTreeDepthInput] = useState(String(BLOCK_TREE_DEFAULT_DEPTH))
+  const [blockTreeNodesInput, setBlockTreeNodesInput] = useState(String(BLOCK_TREE_DEFAULT_NODES))
+  const [blockTreeExpanded, setBlockTreeExpanded] = useState<Record<number, boolean>>({})
   const [centerView, setCenterView] = useState<
     'explore' | 'graph' | 'physical' | 'spacemap' | 'hex' | 'performance'
   >(
@@ -965,6 +1238,10 @@ function App() {
   const fsFilterRef = useRef<HTMLInputElement | null>(null)
   const fsAutoMetaKey = useRef<string | null>(null)
   const snapshotRequestKey = useRef<string | null>(null)
+  const mosListRequestKey = useRef<string | null>(null)
+  const objsetListRequestKey = useRef<string | null>(null)
+  const inspectorRequestKey = useRef<string | null>(null)
+  const blockTreeRequestKey = useRef<string | null>(null)
   const suppressBrowserHistory = useRef(false)
   const historyInitialized = useRef(false)
   const initialHistoryApplied = useRef(false)
@@ -1213,6 +1490,54 @@ function App() {
     return candidates
   }, [snapshotRows, snapshotView])
 
+  const snapshotRowsByDsobj = useMemo(() => {
+    const map = new Map<number, SnapshotRecord>()
+    snapshotRows.forEach(row => map.set(row.dsobj, row))
+    return map
+  }, [snapshotRows])
+
+  const snapshotDivergence = useMemo(() => {
+    const left = snapshotDivergenceLeftDsobj
+      ? snapshotRowsByDsobj.get(snapshotDivergenceLeftDsobj) ?? null
+      : null
+    const right = snapshotDivergenceRightDsobj
+      ? snapshotRowsByDsobj.get(snapshotDivergenceRightDsobj) ?? null
+      : null
+    if (!left || !right) {
+      return null
+    }
+
+    const deltaReferenced =
+      left.referenced_bytes !== null && right.referenced_bytes !== null
+        ? left.referenced_bytes - right.referenced_bytes
+        : null
+    const deltaUnique =
+      left.unique_bytes !== null && right.unique_bytes !== null
+        ? left.unique_bytes - right.unique_bytes
+        : null
+    const deltaCreationTxg =
+      left.creation_txg !== null && right.creation_txg !== null
+        ? left.creation_txg - right.creation_txg
+        : null
+    const deltaCreationTimeSec =
+      left.creation_time !== null && right.creation_time !== null
+        ? left.creation_time - right.creation_time
+        : null
+
+    return {
+      left,
+      right,
+      deltaReferenced,
+      deltaUnique,
+      deltaCreationTxg,
+      deltaCreationTimeSec,
+    }
+  }, [
+    snapshotDivergenceLeftDsobj,
+    snapshotDivergenceRightDsobj,
+    snapshotRowsByDsobj,
+  ])
+
   const fsDisplayPath = useMemo(() => {
     if (!fsState) return '/'
 
@@ -1297,6 +1622,8 @@ function App() {
   }
 
   const resetInspector = () => {
+    inspectorRequestKey.current = null
+    blockTreeRequestKey.current = null
     setSelectedObject(null)
     setObjectInfo(null)
     setBlkptrs(null)
@@ -1381,6 +1708,31 @@ function App() {
       unitIndex += 1
     }
     return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`
+  }
+
+  const formatRatioPercent = (ratio: number | null | undefined) => {
+    if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return '—'
+    return `${(ratio * 100).toFixed(1)}%`
+  }
+
+  const formatSignedBytes = (value: number | null | undefined) => {
+    if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+    const abs = Math.abs(value)
+    const sign = value > 0 ? '+' : value < 0 ? '-' : ''
+    return `${sign}${formatBytes(abs)}`
+  }
+
+  const parsePositiveIntInput = (
+    raw: string,
+    fallback: number,
+    min: number,
+    max: number
+  ): number => {
+    const trimmed = raw.trim()
+    if (!trimmed) return fallback
+    const parsed = Number.parseInt(trimmed, 10)
+    if (!Number.isFinite(parsed)) return fallback
+    return Math.max(min, Math.min(max, parsed))
   }
 
   useEffect(() => {
@@ -1589,11 +1941,41 @@ function App() {
   const poolModeLabel = poolMode === 'offline' ? 'Offline' : 'Live'
   const offlinePoolNames = apiVersionInfo?.pool_open?.offline_pools ?? []
   const modeToggleDisabled = modeSwitching || !apiVersionInfo
+  const runtimeWindowPoints = Math.max(
+    1,
+    Math.floor((runtimeWindowMinutes * 60) / RUNTIME_POLL_SECONDS)
+  )
+  const runtimeArcHitWindow = useMemo(
+    () => runtimeArcHitSamples.slice(-runtimeWindowPoints),
+    [runtimeArcHitSamples, runtimeWindowPoints]
+  )
+  const runtimeArcSizeWindow = useMemo(
+    () => runtimeArcSizeSamples.slice(-runtimeWindowPoints),
+    [runtimeArcSizeSamples, runtimeWindowPoints]
+  )
+  const runtimeVdevOpsWindow = useMemo(
+    () => runtimeVdevOpsSamples.slice(-runtimeWindowPoints),
+    [runtimeVdevOpsSamples, runtimeWindowPoints]
+  )
+  const runtimeTxgDirtyWindow = useMemo(
+    () => runtimeTxgDirtySamples.slice(-runtimeWindowPoints),
+    [runtimeTxgDirtySamples, runtimeWindowPoints]
+  )
   const canGoBack =
     (isMosMode && navIndex > 0) || (isFsTab && fsHistoryIndex > 0)
   const canGoForward =
     (isMosMode && navIndex < navStack.length - 1) ||
     (isFsTab && fsHistoryIndex >= 0 && fsHistoryIndex < fsHistory.length - 1)
+
+  useEffect(() => {
+    setRuntimeArcHitSamples([])
+    setRuntimeArcSizeSamples([])
+    setRuntimeVdevOpsSamples([])
+    setRuntimeTxgDirtySamples([])
+    setPerfArc(null)
+    setPerfVdevIostat(null)
+    setPerfTxg(null)
+  }, [poolMode, selectedPool])
 
   const applyModePayload = useCallback((modeData: PoolModeResponse) => {
     setApiVersionInfo(prev => {
@@ -1630,6 +2012,174 @@ function App() {
         setApiVersionInfo(null)
       })
   }, [])
+
+  useEffect(() => {
+    const runtimeActive = centerView === 'performance' && performanceTab === 'runtime'
+    if (!runtimeActive || poolMode !== 'live') {
+      setPerfArcLoading(false)
+      setPerfArcError(null)
+      return
+    }
+
+    let cancelled = false
+    let intervalId: number | null = null
+
+    const loadArc = async (showLoading: boolean) => {
+      if (showLoading) {
+        setPerfArcLoading(true)
+      }
+      try {
+        const data = await fetchJson<PerfArcResponse>(`${API_BASE}/api/perf/arc`)
+        if (cancelled) return
+        setPerfArc(data)
+        setPerfArcError(null)
+        const arcHitRatio = data.ratios.arc_hit_ratio
+        if (arcHitRatio !== null && arcHitRatio !== undefined) {
+          setRuntimeArcHitSamples(prev =>
+            appendRuntimeSample(prev, {
+              ts: data.sampled_at_unix_sec,
+              value: arcHitRatio,
+            })
+          )
+        }
+        setRuntimeArcSizeSamples(prev =>
+          appendRuntimeSample(prev, {
+            ts: data.sampled_at_unix_sec,
+            value: data.arc.size_bytes,
+          })
+        )
+      } catch (err) {
+        if (cancelled) return
+        setPerfArcError((err as Error).message)
+      } finally {
+        if (!cancelled && showLoading) {
+          setPerfArcLoading(false)
+        }
+      }
+    }
+
+    void loadArc(true)
+    intervalId = window.setInterval(() => {
+      void loadArc(false)
+    }, RUNTIME_POLL_SECONDS * 1000)
+
+    return () => {
+      cancelled = true
+      if (intervalId !== null) {
+        window.clearInterval(intervalId)
+      }
+    }
+  }, [centerView, performanceTab, poolMode])
+
+  useEffect(() => {
+    const runtimeActive = centerView === 'performance' && performanceTab === 'runtime'
+    if (!runtimeActive || poolMode !== 'live' || !selectedPool) {
+      setPerfVdevLoading(false)
+      setPerfVdevError(null)
+      return
+    }
+
+    let cancelled = false
+    let intervalId: number | null = null
+
+    const loadVdev = async (showLoading: boolean) => {
+      if (showLoading) {
+        setPerfVdevLoading(true)
+      }
+      try {
+        const data = await fetchJson<PerfVdevIostatResponse>(
+          `${API_BASE}/api/perf/vdev_iostat?pool=${encodeURIComponent(selectedPool)}`
+        )
+        if (cancelled) return
+        setPerfVdevIostat(data)
+        setPerfVdevError(null)
+        const poolRow =
+          data.rows.find(row => row.depth === 0 && row.name === data.pool) ??
+          data.rows.find(row => row.depth === 0) ??
+          null
+        if (poolRow) {
+          const ops = (poolRow.read_ops ?? 0) + (poolRow.write_ops ?? 0)
+          setRuntimeVdevOpsSamples(prev =>
+            appendRuntimeSample(prev, {
+              ts: data.sampled_at_unix_sec,
+              value: ops,
+            })
+          )
+        }
+      } catch (err) {
+        if (cancelled) return
+        setPerfVdevError((err as Error).message)
+      } finally {
+        if (!cancelled && showLoading) {
+          setPerfVdevLoading(false)
+        }
+      }
+    }
+
+    void loadVdev(true)
+    intervalId = window.setInterval(() => {
+      void loadVdev(false)
+    }, RUNTIME_POLL_SECONDS * 1000)
+
+    return () => {
+      cancelled = true
+      if (intervalId !== null) {
+        window.clearInterval(intervalId)
+      }
+    }
+  }, [centerView, performanceTab, poolMode, selectedPool])
+
+  useEffect(() => {
+    const runtimeActive = centerView === 'performance' && performanceTab === 'runtime'
+    if (!runtimeActive || poolMode !== 'live') {
+      setPerfTxgLoading(false)
+      setPerfTxgError(null)
+      return
+    }
+
+    let cancelled = false
+    let intervalId: number | null = null
+
+    const loadTxg = async (showLoading: boolean) => {
+      if (showLoading) {
+        setPerfTxgLoading(true)
+      }
+      try {
+        const data = await fetchJson<PerfTxgResponse>(`${API_BASE}/api/perf/txg`)
+        if (cancelled) return
+        setPerfTxg(data)
+        setPerfTxgError(null)
+        const dirty = toFiniteNumber(data.latest?.ndirty)
+        if (dirty !== null) {
+          setRuntimeTxgDirtySamples(prev =>
+            appendRuntimeSample(prev, {
+              ts: data.sampled_at_unix_sec,
+              value: dirty,
+            })
+          )
+        }
+      } catch (err) {
+        if (cancelled) return
+        setPerfTxgError((err as Error).message)
+      } finally {
+        if (!cancelled && showLoading) {
+          setPerfTxgLoading(false)
+        }
+      }
+    }
+
+    void loadTxg(true)
+    intervalId = window.setInterval(() => {
+      void loadTxg(false)
+    }, RUNTIME_POLL_SECONDS * 1000)
+
+    return () => {
+      cancelled = true
+      if (intervalId !== null) {
+        window.clearInterval(intervalId)
+      }
+    }
+  }, [centerView, performanceTab, poolMode])
 
   useEffect(() => {
     if (initialHistoryApplied.current) return
@@ -1707,6 +2257,12 @@ function App() {
     if (!selectedPool && pools.length > 0) {
       setSelectedPool(pools[0])
     }
+  }, [pools, selectedPool])
+
+  useEffect(() => {
+    if (!selectedPool || pools.length === 0) return
+    if (pools.includes(selectedPool)) return
+    setSelectedPool(pools[0])
   }, [pools, selectedPool])
 
   const fetchDatasetTree = async (pool: string) => {
@@ -1884,6 +2440,85 @@ function App() {
     }
   }
 
+  const fetchPoolDedup = async (pool: string) => {
+    setPoolDedupLoading(true)
+    setPoolDedupError(null)
+    try {
+      const data = await fetchJson<PoolDedupResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/dedup`
+      )
+      setPoolDedup(data)
+    } catch (err) {
+      setPoolDedup(null)
+      setPoolDedupError((err as Error).message)
+    } finally {
+      setPoolDedupLoading(false)
+    }
+  }
+
+  const fetchPoolSpaceAmplification = async (pool: string) => {
+    setPoolSpaceAmplificationLoading(true)
+    setPoolSpaceAmplificationError(null)
+    try {
+      const data = await fetchJson<PoolSpaceAmplificationResponse>(
+        `${API_BASE}/api/pools/${encodeURIComponent(pool)}/space-amplification`
+      )
+      setPoolSpaceAmplification(data)
+    } catch (err) {
+      setPoolSpaceAmplification(null)
+      setPoolSpaceAmplificationError((err as Error).message)
+    } finally {
+      setPoolSpaceAmplificationLoading(false)
+    }
+  }
+
+  const fetchBlockTree = async (targetObjid: number) => {
+    if (!selectedPool) return
+    const scope = objectScope
+    const depth = parsePositiveIntInput(
+      blockTreeDepthInput,
+      BLOCK_TREE_DEFAULT_DEPTH,
+      0,
+      16
+    )
+    const maxNodes = parsePositiveIntInput(
+      blockTreeNodesInput,
+      BLOCK_TREE_DEFAULT_NODES,
+      1,
+      50000
+    )
+
+    const params = new URLSearchParams()
+    params.set('max_depth', String(depth))
+    params.set('max_nodes', String(maxNodes))
+
+    const endpoint =
+      scope.kind === 'mos'
+        ? `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${targetObjid}/block-tree`
+        : `${API_BASE}/api/pools/${encodeURIComponent(
+            selectedPool
+          )}/objset/${scope.objsetId}/obj/${targetObjid}/block-tree`
+
+    const requestKey = `${selectedPool}:${scope.key}:${targetObjid}:${depth}:${maxNodes}:${Date.now()}`
+    blockTreeRequestKey.current = requestKey
+
+    setBlockTreeLoading(true)
+    setBlockTreeError(null)
+    try {
+      const data = await fetchJson<BlockTreeResponse>(`${endpoint}?${params.toString()}`)
+      if (blockTreeRequestKey.current !== requestKey) return
+      setBlockTree(data)
+      setBlockTreeExpanded({ 0: true })
+    } catch (err) {
+      if (blockTreeRequestKey.current !== requestKey) return
+      setBlockTree(null)
+      setBlockTreeError((err as Error).message)
+    } finally {
+      if (blockTreeRequestKey.current !== requestKey) return
+      setBlockTreeLoading(false)
+    }
+  }
+
   const toggleDatasetNode = (dirObj: number) => {
     setDatasetExpanded(prev => ({ ...prev, [dirObj]: !prev[dirObj] }))
   }
@@ -1900,6 +2535,10 @@ function App() {
 
   const handlePoolSelect = (pool: string) => {
     if (!pool) return
+    mosListRequestKey.current = null
+    objsetListRequestKey.current = null
+    inspectorRequestKey.current = null
+    blockTreeRequestKey.current = null
     setSelectedPool(pool)
     setObjectScope(MOS_OBJECT_SCOPE)
     setObjsetObjects([])
@@ -2313,6 +2952,36 @@ function App() {
     },
     [selectedPool, snapshotView]
   )
+
+  useEffect(() => {
+    if (snapshotRows.length === 0) {
+      setSnapshotDivergenceLeftDsobj(null)
+      setSnapshotDivergenceRightDsobj(null)
+      return
+    }
+
+    const ordered = [...snapshotRows].sort((a, b) => {
+      const txgA = a.creation_txg ?? -1
+      const txgB = b.creation_txg ?? -1
+      if (txgA !== txgB) return txgB - txgA
+      const timeA = a.creation_time ?? -1
+      const timeB = b.creation_time ?? -1
+      if (timeA !== timeB) return timeB - timeA
+      return b.dsobj - a.dsobj
+    })
+
+    const defaultLeft = ordered[0]?.dsobj ?? null
+    const defaultRight = ordered[1]?.dsobj ?? ordered[0]?.dsobj ?? null
+
+    setSnapshotDivergenceLeftDsobj(prev => {
+      if (prev && snapshotRowsByDsobj.has(prev)) return prev
+      return defaultLeft
+    })
+    setSnapshotDivergenceRightDsobj(prev => {
+      if (prev && snapshotRowsByDsobj.has(prev)) return prev
+      return defaultRight
+    })
+  }, [snapshotRows, snapshotRowsByDsobj])
 
   const openSnapshotAsObject = useCallback(
     (row: SnapshotRecord) => {
@@ -3062,6 +3731,8 @@ function App() {
 
   const fetchMosObjects = async (start: number, append: boolean) => {
     if (!selectedPool) return
+    const requestKey = `${selectedPool}:${start}:${append ? 1 : 0}:${typeFilter ?? 'all'}:${Date.now()}`
+    mosListRequestKey.current = requestKey
     setMosLoading(true)
     setMosError(null)
 
@@ -3076,17 +3747,22 @@ function App() {
       const data = await fetchJson<MosListResponse>(
         `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/mos/objects?${params.toString()}`
       )
+      if (mosListRequestKey.current !== requestKey) return
       setMosObjects(prev => (append ? [...prev, ...data.objects] : data.objects))
       setMosNext(data.next)
     } catch (err) {
+      if (mosListRequestKey.current !== requestKey) return
       setMosError((err as Error).message)
     } finally {
+      if (mosListRequestKey.current !== requestKey) return
       setMosLoading(false)
     }
   }
 
   const fetchObjsetObjects = async (objsetId: number, start: number, append: boolean) => {
     if (!selectedPool) return
+    const requestKey = `${selectedPool}:${objsetId}:${start}:${append ? 1 : 0}:${typeFilter ?? 'all'}:${Date.now()}`
+    objsetListRequestKey.current = requestKey
     setObjsetLoading(true)
     setObjsetError(null)
 
@@ -3103,11 +3779,14 @@ function App() {
           selectedPool
         )}/objset/${objsetId}/objects?${params.toString()}`
       )
+      if (objsetListRequestKey.current !== requestKey) return
       setObjsetObjects(prev => (append ? [...prev, ...data.objects] : data.objects))
       setObjsetNext(data.next)
     } catch (err) {
+      if (objsetListRequestKey.current !== requestKey) return
       setObjsetError((err as Error).message)
     } finally {
+      if (objsetListRequestKey.current !== requestKey) return
       setObjsetLoading(false)
     }
   }
@@ -3115,6 +3794,10 @@ function App() {
   const activateObjectScope = async (scope: ObjectScope) => {
     if (!selectedPool) return
 
+    mosListRequestKey.current = null
+    objsetListRequestKey.current = null
+    inspectorRequestKey.current = null
+    blockTreeRequestKey.current = null
     setObjectScope(scope)
     setSelectedObject(null)
     resetInspector()
@@ -3499,13 +4182,44 @@ function App() {
     fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths, poolErrorsLimit)
   }, [selectedPool, poolErrorsResolvePaths, poolErrorsLimit])
 
-  const fetchZapInfo = async (objid: number) => {
+  useEffect(() => {
     if (!selectedPool) return
-    const data = await fetchJson<ZapInfo>(
-      `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/zap/info`
-    )
-    setZapInfo(data)
-  }
+    if (poolMode === 'offline') {
+      setPoolDedup(null)
+      setPoolDedupError('Dedup analysis is unavailable in offline mode.')
+      setPoolDedupLoading(false)
+      return
+    }
+    fetchPoolDedup(selectedPool)
+  }, [selectedPool, poolMode])
+
+  useEffect(() => {
+    if (!selectedPool) return
+    if (poolMode === 'offline') {
+      setPoolSpaceAmplification(null)
+      setPoolSpaceAmplificationError('Space amplification is unavailable in offline mode.')
+      setPoolSpaceAmplificationLoading(false)
+      return
+    }
+    fetchPoolSpaceAmplification(selectedPool)
+  }, [selectedPool, poolMode])
+
+  useEffect(() => {
+    if (centerView !== 'physical' || selectedObject === null || !selectedPool) {
+      blockTreeRequestKey.current = null
+      setBlockTree(null)
+      setBlockTreeLoading(false)
+      setBlockTreeError(null)
+      return
+    }
+    setBlockTreeExpanded({})
+    void fetchBlockTree(selectedObject)
+  }, [
+    centerView,
+    selectedObject,
+    selectedPool,
+    objectScope.key,
+  ])
 
   const fetchZapEntries = async (objid: number, cursor: number, append: boolean) => {
     if (!selectedPool) return
@@ -3687,6 +4401,8 @@ function App() {
 
   async function fetchInspector(objid: number, scope: ObjectScope = objectScope) {
     if (!selectedPool) return
+    const requestKey = `${selectedPool}:${scope.key}:${objid}:${Date.now()}`
+    inspectorRequestKey.current = requestKey
     setInspectorLoading(true)
     setInspectorError(null)
     setShowBlkptrDetails(false)
@@ -3745,6 +4461,7 @@ function App() {
             `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/blkptrs`
           ),
         ])
+        if (inspectorRequestKey.current !== requestKey) return
         setObjectInfo(infoData)
         setBlkptrs(blkData)
         if (isSpacemapDnode(infoData)) {
@@ -3755,8 +4472,20 @@ function App() {
         }
 
         if (infoData.is_zap) {
-          await fetchZapInfo(objid)
-          await fetchZapEntries(objid, 0, false)
+          const [zapInfoData, zapEntriesData] = await Promise.all([
+            fetchJson<ZapInfo>(
+              `${API_BASE}/api/pools/${encodeURIComponent(selectedPool)}/obj/${objid}/zap/info`
+            ),
+            fetchJson<ZapResponse>(
+              `${API_BASE}/api/pools/${encodeURIComponent(
+                selectedPool
+              )}/obj/${objid}/zap?cursor=0&limit=200`
+            ),
+          ])
+          if (inspectorRequestKey.current !== requestKey) return
+          setZapInfo(zapInfoData)
+          setZapEntries(zapEntriesData.entries ?? [])
+          setZapNext(zapEntriesData.next ?? null)
         }
       } else {
         const data = await fetchJson<ObjsetObjectFullResponse>(
@@ -3764,6 +4493,7 @@ function App() {
             selectedPool
           )}/objset/${scope.objsetId}/obj/${objid}/full`
         )
+        if (inspectorRequestKey.current !== requestKey) return
         const infoData = data.object
         setObjectInfo(infoData)
         setBlkptrs(data.blkptrs)
@@ -3782,8 +4512,10 @@ function App() {
         }
       }
     } catch (err) {
+      if (inspectorRequestKey.current !== requestKey) return
       setInspectorError((err as Error).message)
     } finally {
+      if (inspectorRequestKey.current !== requestKey) return
       setInspectorLoading(false)
     }
   }
@@ -4138,6 +4870,60 @@ function App() {
     return Math.round((Math.abs(spacemapSummary.net_bytes) / total) * 100)
   }, [spacemapSummary])
 
+  const spacemapHeatmap = useMemo(() => {
+    if (spacemapBins.length === 0) {
+      return {
+        columns: 0,
+        maxScore: 0,
+        cells: [] as SpacemapHeatCell[],
+      }
+    }
+
+    const columns = 24
+    const maxCells = 480
+    const chunkSize = Math.max(1, Math.ceil(spacemapBins.length / maxCells))
+    const cells: SpacemapHeatCell[] = []
+
+    for (let idx = 0; idx < spacemapBins.length; idx += chunkSize) {
+      const chunk = spacemapBins.slice(idx, idx + chunkSize)
+      if (chunk.length === 0) continue
+      const startIndex = chunk[0].index
+      const endIndex = chunk[chunk.length - 1].index
+      const offsetStart = chunk[0].offset_start
+      const offsetEnd = chunk[chunk.length - 1].offset_end
+      const opsTotal = chunk.reduce((sum, bin) => sum + bin.ops_total, 0)
+      const weightedRangeNumerator = chunk.reduce(
+        (sum, bin) => sum + (bin.avg_range || 0) * Math.max(1, bin.ops_total),
+        0
+      )
+      const weightedRangeDenominator = chunk.reduce((sum, bin) => sum + Math.max(1, bin.ops_total), 0)
+      const avgRange =
+        weightedRangeDenominator > 0
+          ? weightedRangeNumerator / weightedRangeDenominator
+          : 0
+      const smallRangeWeight =
+        avgRange > 0 ? Math.min(4, 4096 / avgRange) : 0
+      const score = opsTotal * (1 + smallRangeWeight)
+      cells.push({
+        startIndex,
+        endIndex,
+        offsetStart,
+        offsetEnd,
+        opsTotal,
+        avgRange,
+        score,
+      })
+    }
+
+    const maxScore = cells.reduce((peak, cell) => Math.max(peak, cell.score), 0)
+
+    return {
+      columns,
+      maxScore,
+      cells,
+    }
+  }, [spacemapBins])
+
   const formattedHexDump = useMemo(() => {
     if (!hexDump) return ''
     return formatHexDump(hexDump.data_hex, hexDump.offset)
@@ -4147,6 +4933,119 @@ function App() {
     if (!centerHexDump) return ''
     return formatHexDump(centerHexDump.data_hex, centerHexDump.offset)
   }, [centerHexDump])
+
+  const objectSpaceAmplification = useMemo(() => {
+    if (!objectInfo) return null
+    const logicalBytes = objectInfo.max_offset > 0 ? objectInfo.max_offset : null
+    const physicalBytes = objectInfo.used_bytes
+    const amplification = logicalBytes && logicalBytes > 0 ? physicalBytes / logicalBytes : null
+    const overheadBytes =
+      logicalBytes && logicalBytes > 0 ? physicalBytes - logicalBytes : null
+    return {
+      logicalBytes,
+      physicalBytes,
+      amplification,
+      overheadBytes,
+    }
+  }, [objectInfo])
+
+  const objectCompressionRatio = useMemo(() => {
+    if (!blkptrs || blkptrs.blkptrs.length === 0) return null
+    let logical = 0
+    let physical = 0
+    for (const bp of blkptrs.blkptrs) {
+      if (bp.is_hole) continue
+      logical += bp.lsize
+      physical += bp.psize > 0 ? bp.psize : bp.lsize
+    }
+    if (logical <= 0 || physical <= 0) return null
+    return logical / physical
+  }, [blkptrs])
+
+  const indirectBlockProfile = useMemo(() => {
+    if (!objectInfo) return null
+    const levels = Math.max(1, objectInfo.nlevels || 1)
+    const fanout =
+      objectInfo.indirect_block_size > 0
+        ? Math.max(1, Math.floor(objectInfo.indirect_block_size / 128))
+        : 0
+    const chain = Array.from({ length: levels }, (_, idx) => `L${levels - idx - 1}`)
+    return {
+      levels,
+      fanout,
+      chain,
+    }
+  }, [objectInfo])
+
+  const dedupInsights = useMemo(() => {
+    if (!poolDedup) return null
+    const classes = poolDedup.ddt.classes
+    const totals = poolDedup.ddt.totals
+    const totalClassBlocks = classes.reduce((sum, row) => sum + row.blocks, 0)
+    const duplicateClassBlocks = classes
+      .filter(row => row.refcount > 1)
+      .reduce((sum, row) => sum + row.blocks, 0)
+    const duplicateBlockShare =
+      totalClassBlocks > 0 ? duplicateClassBlocks / totalClassBlocks : null
+    const dedupRatio =
+      totals && totals.dsize > 0 ? totals.referenced_dsize / totals.dsize : null
+    const estimatedSavingsBytes =
+      totals && totals.referenced_dsize >= totals.dsize
+        ? totals.referenced_dsize - totals.dsize
+        : null
+
+    const histogram = classes
+      .map(row => ({
+        refcount: row.refcount,
+        blocks: row.blocks,
+        referenced_blocks: row.referenced_blocks,
+        share: totalClassBlocks > 0 ? row.blocks / totalClassBlocks : 0,
+      }))
+      .sort((a, b) => a.refcount - b.refcount)
+
+    return {
+      dedupRatio,
+      estimatedSavingsBytes,
+      duplicateClassBlocks,
+      duplicateBlockShare,
+      totalClassBlocks,
+      histogram,
+    }
+  }, [poolDedup])
+
+  const poolSpaceAmplificationInsights = useMemo(() => {
+    if (!poolSpaceAmplification) return null
+    const rows = poolSpaceAmplification.datasets
+    const topCoWAmplified = [...rows]
+      .filter(row => (row.physical_vs_logical_ratio ?? 0) > 1)
+      .sort(
+        (a, b) =>
+          (b.physical_vs_logical_ratio ?? Number.NEGATIVE_INFINITY) -
+          (a.physical_vs_logical_ratio ?? Number.NEGATIVE_INFINITY)
+      )
+      .slice(0, 6)
+    const topCompressionGain = [...rows]
+      .filter(row => (row.logical_vs_physical_ratio ?? 0) > 1)
+      .sort(
+        (a, b) =>
+          (b.logical_vs_physical_ratio ?? Number.NEGATIVE_INFINITY) -
+          (a.logical_vs_physical_ratio ?? Number.NEGATIVE_INFINITY)
+      )
+      .slice(0, 6)
+    const highestPhysicalOverhead = [...rows]
+      .filter(row => (row.physical_minus_logical_bytes ?? 0) > 0)
+      .sort(
+        (a, b) =>
+          (b.physical_minus_logical_bytes ?? Number.NEGATIVE_INFINITY) -
+          (a.physical_minus_logical_bytes ?? Number.NEGATIVE_INFINITY)
+      )
+      .slice(0, 6)
+    return {
+      topCoWAmplified,
+      topCompressionGain,
+      highestPhysicalOverhead,
+    }
+  }, [poolSpaceAmplification])
 
   const centerHexDownloadFilename = useMemo(() => {
     if (selectedObject === null || objectScope.kind === 'mos') {
@@ -4170,6 +5069,76 @@ function App() {
     const safeHint = hinted ? sanitizeDownloadFilename(hinted) : null
     return safeHint ?? fallback
   }, [fsSelected, fsState, objectScope, objsetNameHints, selectedObject])
+
+  const blockTreeNodesById = useMemo(() => {
+    const map = new Map<number, BlockTreeNode>()
+    if (!blockTree) return map
+    blockTree.nodes.forEach(node => map.set(node.id, node))
+    return map
+  }, [blockTree])
+
+  const blockTreeChildrenByParent = useMemo(() => {
+    const map = new Map<number, BlockTreeNode[]>()
+    if (!blockTree) return map
+    blockTree.nodes.forEach(node => {
+      if (node.parent_id === null) return
+      const list = map.get(node.parent_id) ?? []
+      list.push(node)
+      map.set(node.parent_id, list)
+    })
+    map.forEach(list => {
+      list.sort((a, b) => {
+        const edgeA = a.edge_index ?? Number.MAX_SAFE_INTEGER
+        const edgeB = b.edge_index ?? Number.MAX_SAFE_INTEGER
+        if (edgeA !== edgeB) return edgeA - edgeB
+        return a.id - b.id
+      })
+    })
+    return map
+  }, [blockTree])
+
+  const blockTreeRootNode = useMemo(() => {
+    if (!blockTree || blockTree.nodes.length === 0) return null
+    return blockTree.nodes.find(node => node.parent_id === null) ?? blockTree.nodes[0]
+  }, [blockTree])
+
+  const blockTreeExpandedNodeCount = useMemo(() => {
+    if (!blockTree) return 0
+    return Object.values(blockTreeExpanded).filter(Boolean).length
+  }, [blockTree, blockTreeExpanded])
+
+  const blockTreeScopeLabel = useMemo(() => {
+    if (objectScope.kind === 'mos') {
+      return 'MOS'
+    }
+    if (objectScope.kind === 'dataset') {
+      return `${objectScope.datasetName} (objset ${objectScope.objsetId})`
+    }
+    return `${objectScope.datasetName}@${objectScope.snapshotName} (objset ${objectScope.objsetId})`
+  }, [objectScope])
+
+  const toggleBlockTreeNode = (nodeId: number, currentlyExpanded: boolean) => {
+    setBlockTreeExpanded(prev => ({ ...prev, [nodeId]: !currentlyExpanded }))
+  }
+
+  const expandAllBlockTree = () => {
+    if (!blockTree) return
+    const next: Record<number, boolean> = {}
+    blockTree.nodes.forEach(node => {
+      if ((blockTreeChildrenByParent.get(node.id)?.length ?? 0) > 0) {
+        next[node.id] = true
+      }
+    })
+    setBlockTreeExpanded(next)
+  }
+
+  const collapseBlockTree = () => {
+    if (!blockTreeRootNode) {
+      setBlockTreeExpanded({})
+      return
+    }
+    setBlockTreeExpanded({ [blockTreeRootNode.id]: true })
+  }
 
   const fetchObjsetDataChunk = useCallback(
     async (scope: ObjectScope, objid: number, offset: number, limit: number) => {
@@ -4529,6 +5498,75 @@ function App() {
     setGraphExpandError(null)
   }
 
+  const renderRuntimeChartCard = (
+    title: string,
+    samples: RuntimeSamplePoint[],
+    formatValue: (value: number) => string,
+    stroke: string
+  ) => {
+    const values = samples.map(sample => sample.value)
+    const latest = values.length > 0 ? values[values.length - 1] : null
+    const min = values.length > 0 ? Math.min(...values) : null
+    const max = values.length > 0 ? Math.max(...values) : null
+    const hasSeries = samples.length >= 2 && min !== null && max !== null
+    const span = max !== null && min !== null ? Math.max(max - min, 1) : 1
+    const points = hasSeries
+      ? samples
+          .map((sample, index) => {
+            const x = (index / (samples.length - 1)) * 100
+            const y = 100 - ((sample.value - (min ?? 0)) / span) * 100
+            return `${x.toFixed(2)},${y.toFixed(2)}`
+          })
+          .join(' ')
+      : ''
+
+    return (
+      <div className="runtime-chart-card">
+        <div className="runtime-chart-head">
+          <span>{title}</span>
+          <strong>{latest === null ? '—' : formatValue(latest)}</strong>
+        </div>
+        <div className="runtime-chart-plot">
+          {hasSeries ? (
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              <polyline
+                className="runtime-chart-line"
+                fill="none"
+                stroke={stroke}
+                strokeWidth="2.2"
+                points={points}
+              />
+            </svg>
+          ) : (
+            <div className="runtime-chart-empty">Collecting samples…</div>
+          )}
+        </div>
+        <div className="runtime-chart-meta">
+          <span>min {min === null ? '—' : formatValue(min)}</span>
+          <span>max {max === null ? '—' : formatValue(max)}</span>
+          <span>{samples.length} samples</span>
+        </div>
+      </div>
+    )
+  }
+
+  const renderPanelGuide = (
+    title: string,
+    items: Array<{ term: string; description: string }>
+  ) => (
+    <div className="panel-guide">
+      <h4>{title}</h4>
+      <dl className="panel-guide-list">
+        {items.map(item => (
+          <div key={item.term} className="panel-guide-row">
+            <dt>{item.term}</dt>
+            <dd>{item.description}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+
   const renderPerformancePanel = () => {
     const runtimeDisabled = poolMode === 'offline'
 
@@ -4540,6 +5578,45 @@ function App() {
             Split view: forensic evidence vs currently observed runtime data
           </span>
         </div>
+
+        <div className="panel-guide-actions">
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={() => setShowPerformanceGuide(open => !open)}
+          >
+            {showPerformanceGuide ? 'Hide help' : 'Explain this panel'}
+          </button>
+        </div>
+
+        {showPerformanceGuide &&
+          renderPanelGuide('Performance Quick Guide', [
+            {
+              term: 'Forensics',
+              description:
+                'Derived from on-disk structures. Great for historical/structural clues.',
+            },
+            {
+              term: 'Runtime',
+              description:
+                'Live sampled counters from the running host. Good for what is happening now.',
+            },
+            {
+              term: 'ARC hit ratio',
+              description:
+                'Higher is generally better cache efficiency; lower means more misses to disk.',
+            },
+            {
+              term: 'TXG dirty bytes',
+              description:
+                'How much pending write data is queued before sync; spikes can indicate pressure.',
+            },
+            {
+              term: 'Ops/sample',
+              description:
+                'Combined read/write operation counters from vdev telemetry each sample period.',
+            },
+          ])}
 
         <div className="raw-tabs performance-tabs">
           <button
@@ -4569,6 +5646,222 @@ function App() {
             <p className="muted">
               Evidence suggests potential behavior from on-disk structures. This is not live I/O.
             </p>
+
+            {selectedPool && (
+              <div className="forensics-space-card">
+                <div className="forensics-space-header">
+                  <h4>Space Amplification (Pool + Datasets)</h4>
+                  <button
+                    type="button"
+                    className="fs-action-btn"
+                    onClick={() => fetchPoolSpaceAmplification(selectedPool)}
+                    disabled={poolSpaceAmplificationLoading}
+                  >
+                    {poolSpaceAmplificationLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+                {poolSpaceAmplificationError && (
+                  <div className="error">
+                    <strong>Space amplification:</strong> {poolSpaceAmplificationError}
+                  </div>
+                )}
+                {poolSpaceAmplification && (
+                  <>
+                    <dl className="info-grid">
+                      <div>
+                        <dt>Pool alloc</dt>
+                        <dd>
+                          {poolSpaceAmplification.pool_summary.allocated_bytes === null
+                            ? '—'
+                            : formatBytes(poolSpaceAmplification.pool_summary.allocated_bytes)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Pool logical used</dt>
+                        <dd>
+                          {poolSpaceAmplification.pool_summary.logical_used_bytes === null
+                            ? '—'
+                            : formatBytes(poolSpaceAmplification.pool_summary.logical_used_bytes)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Logical/physical</dt>
+                        <dd>
+                          {poolSpaceAmplification.pool_summary.logical_vs_physical_ratio === null
+                            ? '—'
+                            : `${poolSpaceAmplification.pool_summary.logical_vs_physical_ratio.toFixed(
+                                2
+                              )}x`}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Physical/logical</dt>
+                        <dd>
+                          {poolSpaceAmplification.pool_summary.physical_vs_logical_ratio === null
+                            ? '—'
+                            : `${poolSpaceAmplification.pool_summary.physical_vs_logical_ratio.toFixed(
+                                2
+                              )}x`}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Physical minus logical</dt>
+                        <dd>
+                          {formatSignedBytes(
+                            poolSpaceAmplification.pool_summary.physical_minus_logical_bytes
+                          )}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Pool fragmentation</dt>
+                        <dd>
+                          {poolSpaceAmplification.pool_summary.frag_percent === null
+                            ? '—'
+                            : `${poolSpaceAmplification.pool_summary.frag_percent.toFixed(1)}%`}
+                        </dd>
+                      </div>
+                    </dl>
+                    {poolSpaceAmplificationInsights && (
+                      <div className="forensics-space-lists">
+                        <div className="forensics-space-list">
+                          <h5>Highest CoW amplification</h5>
+                          {poolSpaceAmplificationInsights.topCoWAmplified.length > 0 ? (
+                            <ul>
+                              {poolSpaceAmplificationInsights.topCoWAmplified.map(row => (
+                                <li key={`cow-${row.name}`}>
+                                  <span>{row.name}</span>
+                                  <strong>{row.physical_vs_logical_ratio?.toFixed(2)}x</strong>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="muted">No rows exceed 1.0x physical/logical.</p>
+                          )}
+                        </div>
+                        <div className="forensics-space-list">
+                          <h5>Best compression gain</h5>
+                          {poolSpaceAmplificationInsights.topCompressionGain.length > 0 ? (
+                            <ul>
+                              {poolSpaceAmplificationInsights.topCompressionGain.map(row => (
+                                <li key={`cmp-${row.name}`}>
+                                  <span>{row.name}</span>
+                                  <strong>{row.logical_vs_physical_ratio?.toFixed(2)}x</strong>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="muted">No rows exceed 1.0x logical/physical.</p>
+                          )}
+                        </div>
+                        <div className="forensics-space-list">
+                          <h5>Largest physical overhead</h5>
+                          {poolSpaceAmplificationInsights.highestPhysicalOverhead.length > 0 ? (
+                            <ul>
+                              {poolSpaceAmplificationInsights.highestPhysicalOverhead.map(row => (
+                                <li key={`ovh-${row.name}`}>
+                                  <span>{row.name}</span>
+                                  <strong>{formatSignedBytes(row.physical_minus_logical_bytes)}</strong>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="muted">No positive physical overhead rows.</p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    <p className="muted">
+                      Pool-level view uses <code>zpool list</code> + <code>zfs list</code> snapshots
+                      are excluded here so rankings stay dataset-focused.
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {objectSpaceAmplification && (
+              <div className="forensics-space-card">
+                <h4>Space Amplification (Selected Object)</h4>
+                <dl className="info-grid">
+                  <div>
+                    <dt>Logical bytes</dt>
+                    <dd>
+                      {objectSpaceAmplification.logicalBytes === null
+                        ? '—'
+                        : formatBytes(objectSpaceAmplification.logicalBytes)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Physical bytes</dt>
+                    <dd>{formatBytes(objectSpaceAmplification.physicalBytes)}</dd>
+                  </div>
+                  <div>
+                    <dt>Amplification</dt>
+                    <dd>
+                      {objectSpaceAmplification.amplification === null
+                        ? '—'
+                        : `${objectSpaceAmplification.amplification.toFixed(2)}x`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Compression ratio</dt>
+                    <dd>{objectCompressionRatio === null ? '—' : `${objectCompressionRatio.toFixed(2)}x`}</dd>
+                  </div>
+                  <div>
+                    <dt>CoW overhead</dt>
+                    <dd>
+                      {objectSpaceAmplification.overheadBytes === null
+                        ? '—'
+                        : `${objectSpaceAmplification.overheadBytes >= 0 ? '+' : ''}${formatBytes(
+                            Math.abs(objectSpaceAmplification.overheadBytes)
+                          )}`}
+                    </dd>
+                  </div>
+                </dl>
+                <p className="muted">
+                  Object-level estimate from dnode + blkptr data. Dataset/pool aggregation is next.
+                </p>
+              </div>
+            )}
+
+            {indirectBlockProfile && (
+              <div className="forensics-indirect-card">
+                <h4>Indirect Block Chain</h4>
+                <div className="forensics-indirect-chain">
+                  {indirectBlockProfile.chain.map((level, idx) => (
+                    <div key={`${level}-${idx}`} className="forensics-indirect-node">
+                      <span>{level}</span>
+                      {idx < indirectBlockProfile.chain.length - 1 && (
+                        <span className="forensics-indirect-arrow">→</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <dl className="info-grid">
+                  <div>
+                    <dt>Levels</dt>
+                    <dd>{indirectBlockProfile.levels}</dd>
+                  </div>
+                  <div>
+                    <dt>Indirect fanout</dt>
+                    <dd>
+                      {indirectBlockProfile.fanout > 0
+                        ? `${indirectBlockProfile.fanout} ptrs/block`
+                        : '—'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Data blk size</dt>
+                    <dd>{formatBytes(objectInfo?.data_block_size ?? 0)}</dd>
+                  </div>
+                  <div>
+                    <dt>Meta blk size</dt>
+                    <dd>{formatBytes(objectInfo?.metadata_block_size ?? 0)}</dd>
+                  </div>
+                </dl>
+              </div>
+            )}
+
             {isSpacemapObject && spacemapSummary ? (
               <>
                 <dl className="info-grid">
@@ -4617,6 +5910,363 @@ function App() {
                 Select a spacemap object to see forensic indicators derived from its transaction log.
               </div>
             )}
+
+            {isSpacemapObject && (
+              <div className="forensics-heatmap">
+                <div className="forensics-heatmap-header">
+                  <h4>Fragmentation Heatmap</h4>
+                  <span className="muted">
+                    Heat = churn weighted by smaller average range length
+                  </span>
+                </div>
+                {spacemapHeatmap.cells.length > 0 ? (
+                  <>
+                    <div
+                      className="forensics-heatmap-grid"
+                      style={{
+                        gridTemplateColumns: `repeat(${spacemapHeatmap.columns}, minmax(0, 1fr))`,
+                      }}
+                    >
+                      {spacemapHeatmap.cells.map((cell, idx) => {
+                        const intensity =
+                          spacemapHeatmap.maxScore > 0
+                            ? Math.min(1, cell.score / spacemapHeatmap.maxScore)
+                            : 0
+                        const hue = 200 - intensity * 165
+                        const lightness = 14 + intensity * 38
+                        return (
+                          <button
+                            key={`${cell.startIndex}-${cell.endIndex}-${idx}`}
+                            type="button"
+                            className="forensics-heatmap-cell"
+                            style={{
+                              background: `hsl(${hue}deg 82% ${lightness}%)`,
+                            }}
+                            title={`bin ${cell.startIndex}${
+                              cell.startIndex === cell.endIndex ? '' : `-${cell.endIndex}`
+                            } | ${formatAddr(cell.offsetStart)}-${formatAddr(
+                              cell.offsetEnd
+                            )} | ops ${cell.opsTotal} | avg ${formatAddr(Math.round(cell.avgRange))}`}
+                            onClick={() => {
+                              setSpacemapSelection({
+                                startIndex: cell.startIndex,
+                                endIndex: cell.endIndex,
+                              })
+                              setSpacemapBrushAnchor(cell.startIndex)
+                              setCenterView('spacemap')
+                            }}
+                          />
+                        )
+                      })}
+                    </div>
+                    <div className="forensics-heatmap-legend">
+                      <span>Low</span>
+                      <div className="forensics-heatmap-bar" />
+                      <span>High</span>
+                    </div>
+                    <p className="muted">
+                      Click a cell to jump into the spacemap map view for that address window.
+                    </p>
+                  </>
+                ) : (
+                  <p className="muted">Load spacemap bins to render the heatmap.</p>
+                )}
+              </div>
+            )}
+
+            {selectedPool && (
+              <div className="forensics-dedup">
+                <div className="forensics-dedup-header">
+                  <h4>Dedup Table Analysis</h4>
+                  <button
+                    type="button"
+                    className="fs-action-btn"
+                    onClick={() => fetchPoolDedup(selectedPool)}
+                    disabled={poolDedupLoading}
+                  >
+                    {poolDedupLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+                {poolDedupError && (
+                  <div className="error">
+                    <strong>Dedup:</strong> {poolDedupError}
+                  </div>
+                )}
+                {poolDedup && (
+                  <>
+                    <dl className="info-grid">
+                      <div>
+                        <dt>DDT Entries</dt>
+                        <dd>{poolDedup.ddt.entries ?? '—'}</dd>
+                      </div>
+                      <div>
+                        <dt>DDT On Disk</dt>
+                        <dd>
+                          {poolDedup.ddt.size_on_disk === null
+                            ? '—'
+                            : formatBytes(poolDedup.ddt.size_on_disk)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>DDT In Core</dt>
+                        <dd>
+                          {poolDedup.ddt.size_in_core === null
+                            ? '—'
+                            : formatBytes(poolDedup.ddt.size_in_core)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Sampled</dt>
+                        <dd>{new Date(poolDedup.sampled_at_unix_sec * 1000).toLocaleString()}</dd>
+                      </div>
+                    </dl>
+
+                    {dedupInsights && (
+                      <dl className="info-grid forensics-dedup-insights">
+                        <div>
+                          <dt>Dedup ratio</dt>
+                          <dd>
+                            {dedupInsights.dedupRatio === null
+                              ? '—'
+                              : `${dedupInsights.dedupRatio.toFixed(2)}x`}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Estimated savings</dt>
+                          <dd>
+                            {dedupInsights.estimatedSavingsBytes === null
+                              ? '—'
+                              : formatBytes(dedupInsights.estimatedSavingsBytes)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Duplicate-class blocks</dt>
+                          <dd>{dedupInsights.duplicateClassBlocks.toLocaleString()}</dd>
+                        </div>
+                        <div>
+                          <dt>Duplicate-class share</dt>
+                          <dd>
+                            {dedupInsights.duplicateBlockShare === null
+                              ? '—'
+                              : `${(dedupInsights.duplicateBlockShare * 100).toFixed(1)}%`}
+                          </dd>
+                        </div>
+                      </dl>
+                    )}
+
+                    {dedupInsights && dedupInsights.histogram.length > 0 && (
+                      <div className="forensics-dedup-histogram">
+                        <h5>Refcount distribution</h5>
+                        <div className="forensics-dedup-histogram-rows">
+                          {dedupInsights.histogram.map(row => (
+                            <div
+                              className="forensics-dedup-histogram-row"
+                              key={`dedup-hist-${row.refcount}`}
+                            >
+                              <span className="forensics-dedup-histogram-label">
+                                x{row.refcount}
+                              </span>
+                              <div className="forensics-dedup-histogram-track">
+                                <div
+                                  className="forensics-dedup-histogram-fill"
+                                  style={{
+                                    width: `${Math.max(2, Math.min(100, row.share * 100))}%`,
+                                  }}
+                                />
+                              </div>
+                              <span className="forensics-dedup-histogram-value">
+                                {row.blocks.toLocaleString()} blocks
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {poolDedup.ddt.classes.length > 0 ? (
+                      <div className="forensics-dedup-table">
+                        <div className="forensics-dedup-row forensics-dedup-head">
+                          <span>Refcnt</span>
+                          <span>Blocks</span>
+                          <span>LSIZE</span>
+                          <span>PSIZE</span>
+                          <span>DSIZE</span>
+                          <span>Ref Blocks</span>
+                        </div>
+                        {poolDedup.ddt.classes.map(row => (
+                          <div
+                            className="forensics-dedup-row"
+                            key={`ddt-${row.refcount}-${row.blocks}`}
+                          >
+                            <span>{row.refcount}</span>
+                            <span>{row.blocks}</span>
+                            <span>{formatBytes(row.lsize)}</span>
+                            <span>{formatBytes(row.psize)}</span>
+                            <span>{formatBytes(row.dsize)}</span>
+                            <span>{row.referenced_blocks}</span>
+                          </div>
+                        ))}
+                        {poolDedup.ddt.totals && (
+                          <div className="forensics-dedup-row forensics-dedup-total">
+                            <span>Total</span>
+                            <span>{poolDedup.ddt.totals.blocks}</span>
+                            <span>{formatBytes(poolDedup.ddt.totals.lsize)}</span>
+                            <span>{formatBytes(poolDedup.ddt.totals.psize)}</span>
+                            <span>{formatBytes(poolDedup.ddt.totals.dsize)}</span>
+                            <span>{poolDedup.ddt.totals.referenced_blocks}</span>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="muted">
+                        No DDT class rows returned. This usually means dedup usage is minimal or
+                        absent on this pool.
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {selectedPool && (
+              <div className="pool-errors forensics-errors">
+                <div className="pool-errors-header">
+                  <h3>Corruption Records</h3>
+                  <div className="pool-errors-actions">
+                    <label className="pool-errors-resolve">
+                      <input
+                        type="checkbox"
+                        checked={poolErrorsResolvePaths}
+                        onChange={e => setPoolErrorsResolvePaths(e.target.checked)}
+                      />
+                      Resolve paths
+                    </label>
+                    <button
+                      className="graph-btn"
+                      type="button"
+                      onClick={() =>
+                        fetchPoolErrors(selectedPool, 0, false, poolErrorsResolvePaths, poolErrorsLimit)
+                      }
+                      disabled={poolErrorsLoading}
+                    >
+                      {poolErrorsLoading ? 'Refreshing…' : 'Refresh'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="pool-errors-meta">
+                  <span>
+                    Error count: <strong>{poolErrors?.error_count.toLocaleString() ?? '—'}</strong>
+                  </span>
+                  <span>
+                    Approx entries: <strong>{poolErrors?.approx_entries.toLocaleString() ?? '—'}</strong>
+                  </span>
+                  <span>
+                    Next cursor: <strong>{poolErrors?.next ?? 'none'}</strong>
+                  </span>
+                </div>
+
+                {poolErrorsError && (
+                  <div className="error">
+                    <strong>Error:</strong> {poolErrorsError}
+                  </div>
+                )}
+
+                {poolErrors && poolErrors.entries.length > 0 ? (
+                  <div className="pool-errors-table">
+                    <div className="pool-errors-row pool-errors-head">
+                      <span>Source</span>
+                      <span>Dataset</span>
+                      <span>Object</span>
+                      <span>Level</span>
+                      <span>Blkid</span>
+                      <span>Path</span>
+                      <span>Actions</span>
+                    </div>
+                    {poolErrors.entries.map((entry, idx) => {
+                      const datasetNode = resolveErrorDatasetNode(entry)
+                      const datasetName =
+                        datasetNode &&
+                        (datasetIndex.fullNameById.get(datasetNode.dsl_dir_obj) ??
+                          datasetNode.name)
+                      return (
+                        <div
+                          key={`${entry.source}-${entry.dataset_obj}-${entry.object}-${entry.level}-${entry.blkid}-forensics-${idx}`}
+                          className="pool-errors-row"
+                        >
+                          <span>{entry.source}</span>
+                          <span
+                            title={
+                              datasetName
+                                ? `${datasetName} (objset ${entry.dataset_obj})`
+                                : `objset ${entry.dataset_obj}`
+                            }
+                          >
+                            {datasetName
+                              ? `${datasetName} #${entry.dataset_obj}`
+                              : `#${entry.dataset_obj}`}
+                          </span>
+                          <span>#{entry.object}</span>
+                          <span>{entry.level}</span>
+                          <span>{entry.blkid}</span>
+                          <span className="pool-errors-path">{entry.path ?? '(unresolved)'}</span>
+                          <span className="pool-errors-row-actions">
+                            <button
+                              className="pool-errors-action-btn"
+                              type="button"
+                              onClick={() => openPoolErrorAsObject(entry)}
+                              disabled={entry.dataset_obj !== 0}
+                              title={
+                                entry.dataset_obj === 0
+                                  ? 'Open object in MOS view'
+                                  : 'Objset-local object; open with FS action'
+                              }
+                            >
+                              MOS
+                            </button>
+                            <button
+                              className="pool-errors-action-btn"
+                              type="button"
+                              onClick={() => {
+                                void openPoolErrorInFs(entry)
+                              }}
+                              disabled={!datasetNode}
+                              title={
+                                datasetNode
+                                  ? 'Open dataset in filesystem view and inspect object'
+                                  : 'Dataset not available in dataset tree'
+                              }
+                            >
+                              FS
+                            </button>
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  !poolErrorsLoading && <p className="muted">No persistent error entries returned.</p>
+                )}
+
+                {poolErrors?.next !== null && (
+                  <button
+                    className="load-more"
+                    onClick={() =>
+                      fetchPoolErrors(
+                        selectedPool,
+                        poolErrors?.next ?? 0,
+                        true,
+                        poolErrorsResolvePaths,
+                        poolErrorsLimit
+                      )
+                    }
+                    disabled={poolErrorsLoading}
+                  >
+                    {poolErrorsLoading ? 'Loading…' : 'Load more errors'}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -4625,16 +6275,201 @@ function App() {
             <p className="muted">
               Currently observed runtime telemetry is sampled from the live system.
             </p>
+            <div className="runtime-window-controls">
+              <span>Window</span>
+              {[1, 5, 15].map(windowMinutes => (
+                <button
+                  key={windowMinutes}
+                  type="button"
+                  className={`window-btn ${runtimeWindowMinutes === windowMinutes ? 'active' : ''}`}
+                  onClick={() => setRuntimeWindowMinutes(windowMinutes as 1 | 5 | 15)}
+                >
+                  {windowMinutes}m
+                </button>
+              ))}
+            </div>
             {runtimeDisabled ? (
               <div className="hint">
                 Runtime telemetry is unavailable in offline mode. Switch to live mode to enable ARC
                 and vdev runtime sampling.
               </div>
             ) : (
-              <div className="hint">
-                Runtime endpoints are planned next (`/api/perf/arc`, `/api/perf/vdev_iostat`,
-                `/api/perf/txg`). This panel is now in place so we can wire those in directly.
-              </div>
+              <>
+                {perfArcLoading && !perfArc && <p className="muted">Loading ARC telemetry…</p>}
+                {perfArcError && (
+                  <div className="error">
+                    <strong>ARC telemetry:</strong> {perfArcError}
+                  </div>
+                )}
+                {perfVdevError && (
+                  <div className="error">
+                    <strong>Vdev telemetry:</strong> {perfVdevError}
+                  </div>
+                )}
+                {perfTxgError && (
+                  <div className="error">
+                    <strong>TXG telemetry:</strong> {perfTxgError}
+                  </div>
+                )}
+                {perfArc && (
+                  <>
+                    <dl className="info-grid">
+                      <div>
+                        <dt>ARC Size</dt>
+                        <dd>{formatBytes(perfArc.arc.size_bytes)}</dd>
+                      </div>
+                      <div>
+                        <dt>ARC Target</dt>
+                        <dd>
+                          {formatBytes(perfArc.arc.target_size_bytes)} (min{' '}
+                          {formatBytes(perfArc.arc.target_min_bytes)}, max{' '}
+                          {formatBytes(perfArc.arc.target_max_bytes)})
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>ARC Hit Ratio</dt>
+                        <dd>{formatRatioPercent(perfArc.ratios.arc_hit_ratio)}</dd>
+                      </div>
+                      <div>
+                        <dt>Demand Hit Ratio</dt>
+                        <dd>{formatRatioPercent(perfArc.ratios.demand_hit_ratio)}</dd>
+                      </div>
+                      <div>
+                        <dt>Prefetch Hit Ratio</dt>
+                        <dd>{formatRatioPercent(perfArc.ratios.prefetch_hit_ratio)}</dd>
+                      </div>
+                      <div>
+                        <dt>L2ARC Hit Ratio</dt>
+                        <dd>{formatRatioPercent(perfArc.ratios.l2arc_hit_ratio)}</dd>
+                      </div>
+                      <div>
+                        <dt>L2ARC Size</dt>
+                        <dd>{formatBytes(perfArc.l2arc.size_bytes)}</dd>
+                      </div>
+                      <div>
+                        <dt>Sampled</dt>
+                        <dd>{new Date(perfArc.sampled_at_unix_sec * 1000).toLocaleString()}</dd>
+                      </div>
+                    </dl>
+                    <div className="hint">
+                      <strong>Currently observed:</strong> ARC counters sampled from{' '}
+                      <code>{perfArc.source}</code>.
+                    </div>
+                  </>
+                )}
+                {perfVdevLoading && !perfVdevIostat && (
+                  <p className="muted">Loading per-vdev counters…</p>
+                )}
+                {perfTxgLoading && !perfTxg && <p className="muted">Loading txg counters…</p>}
+                {perfTxg?.latest && (
+                  <dl className="info-grid">
+                    <div>
+                      <dt>Latest TXG</dt>
+                      <dd>{String(perfTxg.latest.txg ?? '—')}</dd>
+                    </div>
+                    <div>
+                      <dt>State</dt>
+                      <dd>{String(perfTxg.latest.state ?? '—')}</dd>
+                    </div>
+                    <div>
+                      <dt>Dirty Bytes</dt>
+                      <dd>
+                        {typeof perfTxg.latest.ndirty === 'number'
+                          ? formatBytes(perfTxg.latest.ndirty)
+                          : String(perfTxg.latest.ndirty ?? '—')}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Sync Time</dt>
+                      <dd>{String(perfTxg.latest.stime ?? '—')}</dd>
+                    </div>
+                    <div>
+                      <dt>Open Time</dt>
+                      <dd>{String(perfTxg.latest.otime ?? '—')}</dd>
+                    </div>
+                    <div>
+                      <dt>Queue Time</dt>
+                      <dd>{String(perfTxg.latest.qtime ?? '—')}</dd>
+                    </div>
+                  </dl>
+                )}
+                <div className="runtime-chart-grid">
+                  {renderRuntimeChartCard(
+                    'ARC hit ratio',
+                    runtimeArcHitWindow,
+                    value => formatRatioPercent(value),
+                    '#6fcbff'
+                  )}
+                  {renderRuntimeChartCard(
+                    'ARC size',
+                    runtimeArcSizeWindow,
+                    value => formatBytes(value),
+                    '#7fe7c0'
+                  )}
+                  {renderRuntimeChartCard(
+                    'Pool ops/sample',
+                    runtimeVdevOpsWindow,
+                    value => value.toFixed(0),
+                    '#ffbf6d'
+                  )}
+                  {renderRuntimeChartCard(
+                    'TXG dirty bytes',
+                    runtimeTxgDirtyWindow,
+                    value => formatBytes(value),
+                    '#f19eff'
+                  )}
+                </div>
+                <div className="hint">
+                  Sampled every {RUNTIME_POLL_SECONDS} seconds. Showing the last{' '}
+                  {runtimeWindowPoints} samples (~{runtimeWindowMinutes} minute
+                  {runtimeWindowMinutes > 1 ? 's' : ''}) from live counters.
+                </div>
+                {perfVdevIostat && (
+                  <div className="perf-vdev-table">
+                    <h4>
+                      Vdev Counters · {perfVdevIostat.pool} ·{' '}
+                      {new Date(perfVdevIostat.sampled_at_unix_sec * 1000).toLocaleTimeString()}
+                    </h4>
+                    <div className="perf-vdev-header">
+                      <span>Name</span>
+                      <span>Alloc</span>
+                      <span>Free</span>
+                      <span>Read ops</span>
+                      <span>Write ops</span>
+                      <span>Read bytes</span>
+                      <span>Write bytes</span>
+                    </div>
+                    <div className="perf-vdev-body">
+                      {perfVdevIostat.rows.map((row, idx) => (
+                        <div className="perf-vdev-row" key={`${row.name}-${idx}`}>
+                          <span style={{ paddingLeft: `${Math.min(row.depth, 6) * 0.8}rem` }}>
+                            {row.name}
+                          </span>
+                          <span>{row.alloc === null ? '—' : formatBytes(row.alloc)}</span>
+                          <span>{row.free === null ? '—' : formatBytes(row.free)}</span>
+                          <span>{row.read_ops ?? '—'}</span>
+                          <span>{row.write_ops ?? '—'}</span>
+                          <span>{row.read_bytes === null ? '—' : formatBytes(row.read_bytes)}</span>
+                          <span>
+                            {row.write_bytes === null ? '—' : formatBytes(row.write_bytes)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {!perfArcLoading &&
+                  !perfVdevLoading &&
+                  !perfTxgLoading &&
+                  !perfArcError &&
+                  !perfVdevError &&
+                  !perfTxgError &&
+                  !perfArc &&
+                  !perfVdevIostat &&
+                  !perfTxg && (
+                  <div className="hint">No ARC telemetry sample yet.</div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -4723,14 +6558,271 @@ function App() {
     </div>
   )
 
+  const renderBlockTreePanel = () => {
+    const renderNode = (node: BlockTreeNode, depth: number): ReactNode => {
+      const children = blockTreeChildrenByParent.get(node.id) ?? []
+      const hasChildren = children.length > 0
+      const expanded = blockTreeExpanded[node.id] ?? depth < 1
+      const title =
+        node.kind === 'dnode'
+          ? `dnode object ${node.object ?? selectedObject ?? '—'}`
+          : node.is_spill
+            ? 'spill blkptr'
+            : `blkptr[${node.edge_index ?? '?'}]`
+      const subtitle =
+        node.kind === 'dnode'
+          ? `nlevels ${node.nlevels ?? '—'} · nblkptr ${node.nblkptr ?? '—'}`
+          : `L${node.level ?? '?'} · blkid ${node.blkid ?? '—'} · type ${node.type ?? '—'}`
+      const flags = (
+        node.kind === 'blkptr'
+          ? [
+              node.is_hole ? 'hole' : null,
+              node.is_embedded ? 'embedded' : null,
+              node.is_gang ? 'gang' : null,
+              node.dedup ? 'dedup' : null,
+              node.is_spill ? 'spill' : null,
+            ]
+          : []
+      ).filter(Boolean) as string[]
+
+      const details: Array<{ key: string; value: string }> =
+        node.kind === 'dnode'
+          ? [
+              { key: 'object', value: String(node.object ?? selectedObject ?? '—') },
+              { key: 'nlevels', value: String(node.nlevels ?? '—') },
+              { key: 'nblkptr', value: String(node.nblkptr ?? '—') },
+              { key: 'indblkshift', value: String(node.indblkshift ?? '—') },
+              {
+                key: 'datablksz',
+                value: node.datablksz === undefined ? '—' : formatAddr(node.datablksz),
+              },
+              { key: 'maxblkid', value: String(node.maxblkid ?? '—') },
+              { key: 'spill', value: node.has_spill ? 'yes' : 'no' },
+            ]
+          : [
+              { key: 'edge', value: node.is_spill ? 'spill' : String(node.edge_index ?? '—') },
+              { key: 'level', value: `L${node.level ?? '—'}` },
+              { key: 'blkid', value: String(node.blkid ?? '—') },
+              { key: 'type', value: String(node.type ?? '—') },
+              { key: 'lsize', value: node.lsize === undefined ? '—' : formatAddr(node.lsize) },
+              { key: 'psize', value: node.psize === undefined ? '—' : formatAddr(node.psize) },
+              { key: 'asize', value: node.asize === undefined ? '—' : formatAddr(node.asize) },
+              { key: 'birth txg', value: String(node.birth_txg ?? '—') },
+              { key: 'logical birth', value: String(node.logical_birth ?? '—') },
+              { key: 'physical birth', value: String(node.physical_birth ?? '—') },
+              { key: 'fill', value: String(node.fill ?? '—') },
+              { key: 'checksum', value: String(node.checksum ?? '—') },
+              { key: 'compression', value: String(node.compression ?? '—') },
+              { key: 'ndvas', value: String(node.ndvas ?? 0) },
+              { key: 'child slots', value: String(node.child_slots ?? 0) },
+              ...(flags.length > 0 ? [{ key: 'flags', value: flags.join(', ') }] : []),
+            ]
+
+      return (
+        <div className="block-tree-node" key={node.id}>
+          <div className="block-tree-node-head" style={{ marginLeft: `${depth * 18}px` }}>
+            <button
+              type="button"
+              className={`block-tree-toggle ${expanded ? 'expanded' : 'collapsed'} ${hasChildren ? '' : 'leaf'}`}
+              onClick={() => toggleBlockTreeNode(node.id, expanded)}
+              disabled={!hasChildren}
+              title={hasChildren ? (expanded ? 'Collapse' : 'Expand') : 'Leaf'}
+            >
+              {hasChildren ? '▸' : '•'}
+            </button>
+            <div className="block-tree-node-title-wrap">
+              <div className="block-tree-node-title">{title}</div>
+              <div className="block-tree-node-subtitle">{subtitle}</div>
+            </div>
+          </div>
+
+          <div className="block-tree-node-body" style={{ marginLeft: `${depth * 18 + 28}px` }}>
+            <div className="pool-vdev-meta-table block-tree-meta-table">
+              {details.map((entry, idx) => (
+                <div className="pool-vdev-meta-row block-tree-meta-row" key={`${node.id}-meta-${idx}`}>
+                  <span className="pool-vdev-meta-key">{entry.key}</span>
+                  <span className="pool-vdev-meta-value">{entry.value}</span>
+                </div>
+              ))}
+              {node.dvas &&
+                node.dvas.map((dva, idx) => (
+                  <div className="pool-vdev-meta-row block-tree-meta-row" key={`${node.id}-dva-${idx}`}>
+                    <span className="pool-vdev-meta-key">{`dva[${idx}]`}</span>
+                    <span className="pool-vdev-meta-value">
+                      {`vdev ${dva.vdev} · off ${formatAddr(dva.offset)} · asize ${formatAddr(
+                        dva.asize
+                      )}${dva.is_gang ? ' · gang' : ''}`}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          {hasChildren && expanded && (
+            <div className="block-tree-children">
+              {children.map(child => renderNode(child, depth + 1))}
+            </div>
+          )}
+        </div>
+      )
+    }
+
+    return (
+      <div className="block-tree-panel">
+        <div className="block-tree-toolbar">
+          <label>
+            Max depth
+            <input
+              className="spacemap-input"
+              type="text"
+              value={blockTreeDepthInput}
+              onChange={event => setBlockTreeDepthInput(event.target.value)}
+              placeholder={String(BLOCK_TREE_DEFAULT_DEPTH)}
+            />
+          </label>
+          <label>
+            Max nodes
+            <input
+              className="spacemap-input"
+              type="text"
+              value={blockTreeNodesInput}
+              onChange={event => setBlockTreeNodesInput(event.target.value)}
+              placeholder={String(BLOCK_TREE_DEFAULT_NODES)}
+            />
+          </label>
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={() => {
+              if (selectedObject === null) return
+              setBlockTreeExpanded({})
+              void fetchBlockTree(selectedObject)
+            }}
+            disabled={selectedObject === null || blockTreeLoading}
+          >
+            {blockTreeLoading ? 'Loading…' : 'Refresh'}
+          </button>
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={expandAllBlockTree}
+            disabled={!blockTree || blockTree.count === 0}
+          >
+            Expand all
+          </button>
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={collapseBlockTree}
+            disabled={!blockTree || blockTree.count === 0}
+          >
+            Collapse
+          </button>
+        </div>
+
+        {blockTreeError && (
+          <div className="error">
+            <strong>Block tree:</strong> {blockTreeError}
+          </div>
+        )}
+
+        {blockTree && (
+          <dl className="info-grid block-tree-summary">
+            <div>
+              <dt>Scope</dt>
+              <dd>{blockTreeScopeLabel}</dd>
+            </div>
+            <div>
+              <dt>Object</dt>
+              <dd>{blockTree.object}</dd>
+            </div>
+            <div>
+              <dt>Nodes</dt>
+              <dd>
+                {blockTreeNodesById.size} / {blockTree.max_nodes}
+              </dd>
+            </div>
+            <div>
+              <dt>Expanded</dt>
+              <dd>{blockTreeExpandedNodeCount}</dd>
+            </div>
+            <div>
+              <dt>Depth cap</dt>
+              <dd>{blockTree.max_depth}</dd>
+            </div>
+            <div>
+              <dt>Truncated</dt>
+              <dd>{blockTree.truncated ? 'yes' : 'no'}</dd>
+            </div>
+          </dl>
+        )}
+
+        <div className="block-tree-scroll">
+          {blockTreeLoading && <p className="muted">Loading block tree…</p>}
+          {!blockTreeLoading && !blockTree && !blockTreeError && (
+            <p className="muted">Select an object and open Physical view to load the block tree.</p>
+          )}
+          {!blockTreeLoading && blockTree && blockTreeRootNode && renderNode(blockTreeRootNode, 0)}
+          {!blockTreeLoading && blockTree && !blockTreeRootNode && (
+            <p className="muted">No block tree nodes returned.</p>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const renderSpacemapPanel = (mode: 'center' | 'inspector') => (
     <div className={mode === 'center' ? 'spacemap-center' : 'inspector-section spacemap-section'}>
       {mode === 'center' && (
         <div className="spacemap-center-header">
-          <h3>Spacemap Activity</h3>
+          <div className="spacemap-center-header-row">
+            <h3>Spacemap Activity</h3>
+            <button
+              type="button"
+              className="fs-action-btn"
+              onClick={() => setShowSpacemapGuide(open => !open)}
+            >
+              {showSpacemapGuide ? 'Hide help' : 'Explain this panel'}
+            </button>
+          </div>
           <span className="muted">Address-range transaction log view</span>
         </div>
       )}
+
+      {mode === 'center' &&
+        showSpacemapGuide &&
+        renderPanelGuide('Spacemap Quick Guide', [
+          {
+            term: 'Alloc/Free/Net',
+            description:
+              'Bytes recorded as allocations, frees, and their net delta in this spacemap log.',
+          },
+          {
+            term: 'TXG span',
+            description:
+              'Oldest to newest transaction group represented by loaded spacemap entries.',
+          },
+          {
+            term: 'Activity map',
+            description:
+              'Shows net allocation direction by address window (warm positive, cool negative).',
+          },
+          {
+            term: 'Churn map',
+            description:
+              'Shows total change intensity regardless of sign (alloc + free activity).',
+          },
+          {
+            term: 'Bin size',
+            description:
+              'Address window size used for map aggregation; smaller bins give finer detail.',
+          },
+          {
+            term: 'Range tables',
+            description:
+              'Largest/smallest lists and raw rows help pinpoint where fragmentation risk clusters.',
+          },
+        ])}
 
       <div className="spacemap-toolbar">
         <button
@@ -5359,7 +7451,7 @@ function App() {
       <header className="topbar">
         <div>
           <strong>ZFS Explorer</strong>
-          <p className="subtitle">Milestone 7: Spacemap Visualizer</p>
+          <p className="subtitle">Milestone 7: Advanced Forensics Views</p>
         </div>
         <div className="status">
           <div className="status-item">
@@ -6225,6 +8317,19 @@ function App() {
                       >
                         Lineage
                       </button>
+                      <button
+                        className={`graph-btn ${snapshotViewMode === 'divergence' ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setSnapshotViewMode('divergence')}
+                        disabled={snapshotRows.length < 2}
+                        title={
+                          snapshotRows.length < 2
+                            ? 'Need at least two snapshots'
+                            : 'Compare two snapshots'
+                        }
+                      >
+                        Divergence
+                      </button>
                     </div>
                     {snapshotViewMode === 'table' ? (
                       <>
@@ -6279,7 +8384,7 @@ function App() {
                           </button>
                         )}
                       </>
-                    ) : (
+                    ) : snapshotViewMode === 'lineage' ? (
                       <>
                         <select
                           className="graph-select"
@@ -6350,6 +8455,50 @@ function App() {
                           disabled={snapshotView.headDatasetObj === null}
                         >
                           Parent
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <select
+                          className="graph-select"
+                          value={snapshotDivergenceLeftDsobj ?? ''}
+                          onChange={e => setSnapshotDivergenceLeftDsobj(Number(e.target.value) || null)}
+                        >
+                          <option value="" disabled>
+                            Compare snapshot A
+                          </option>
+                          {sortedSnapshotRows.map(row => (
+                            <option key={`div-left-${row.dsobj}`} value={row.dsobj}>
+                              {row.name} (#{row.dsobj})
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          className="graph-select"
+                          value={snapshotDivergenceRightDsobj ?? ''}
+                          onChange={e =>
+                            setSnapshotDivergenceRightDsobj(Number(e.target.value) || null)
+                          }
+                        >
+                          <option value="" disabled>
+                            Compare snapshot B
+                          </option>
+                          {sortedSnapshotRows.map(row => (
+                            <option key={`div-right-${row.dsobj}`} value={row.dsobj}>
+                              {row.name} (#{row.dsobj})
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          className="graph-btn"
+                          type="button"
+                          onClick={() => {
+                            setSnapshotDivergenceLeftDsobj(snapshotDivergenceRightDsobj)
+                            setSnapshotDivergenceRightDsobj(snapshotDivergenceLeftDsobj)
+                          }}
+                          disabled={!snapshotDivergenceLeftDsobj || !snapshotDivergenceRightDsobj}
+                        >
+                          Swap
                         </button>
                       </>
                     )}
@@ -6484,6 +8633,114 @@ function App() {
                       )}
                       {!snapshotLineageLoading && !snapshotLineage && (
                         <div className="fs-empty">Select a snapshot object to load lineage.</div>
+                      )}
+                    </div>
+                  ) : snapshotViewMode === 'divergence' ? (
+                    <div className="fs-center-list snapshot-divergence">
+                      {snapshotRows.length < 2 ? (
+                        <div className="fs-empty">Need at least two snapshots to compare.</div>
+                      ) : snapshotDivergence ? (
+                        <>
+                          <div className="snapshot-divergence-grid">
+                            <div className="snapshot-divergence-card">
+                              <h4>Snapshot A</h4>
+                              <div className="snapshot-divergence-name">
+                                {snapshotDivergence.left.name}
+                              </div>
+                              <div className="muted">#{snapshotDivergence.left.dsobj}</div>
+                              <div className="snapshot-actions">
+                                <button
+                                  type="button"
+                                  className="pool-errors-action-btn"
+                                  onClick={() => openSnapshotAsObject(snapshotDivergence.left)}
+                                >
+                                  MOS
+                                </button>
+                                <button
+                                  type="button"
+                                  className="pool-errors-action-btn"
+                                  onClick={() => {
+                                    void openSnapshotInFs(snapshotDivergence.left)
+                                  }}
+                                  disabled={snapshotOpeningDsobj === snapshotDivergence.left.dsobj}
+                                >
+                                  {snapshotOpeningDsobj === snapshotDivergence.left.dsobj
+                                    ? 'Opening…'
+                                    : 'Open in FS'}
+                                </button>
+                              </div>
+                            </div>
+                            <div className="snapshot-divergence-card">
+                              <h4>Snapshot B</h4>
+                              <div className="snapshot-divergence-name">
+                                {snapshotDivergence.right.name}
+                              </div>
+                              <div className="muted">#{snapshotDivergence.right.dsobj}</div>
+                              <div className="snapshot-actions">
+                                <button
+                                  type="button"
+                                  className="pool-errors-action-btn"
+                                  onClick={() => openSnapshotAsObject(snapshotDivergence.right)}
+                                >
+                                  MOS
+                                </button>
+                                <button
+                                  type="button"
+                                  className="pool-errors-action-btn"
+                                  onClick={() => {
+                                    void openSnapshotInFs(snapshotDivergence.right)
+                                  }}
+                                  disabled={snapshotOpeningDsobj === snapshotDivergence.right.dsobj}
+                                >
+                                  {snapshotOpeningDsobj === snapshotDivergence.right.dsobj
+                                    ? 'Opening…'
+                                    : 'Open in FS'}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+
+                          <dl className="info-grid snapshot-divergence-metrics">
+                            <div>
+                              <dt>Creation TXG Delta (A-B)</dt>
+                              <dd>{snapshotDivergence.deltaCreationTxg ?? '—'}</dd>
+                            </div>
+                            <div>
+                              <dt>Creation Time Delta</dt>
+                              <dd>
+                                {snapshotDivergence.deltaCreationTimeSec === null
+                                  ? '—'
+                                  : `${snapshotDivergence.deltaCreationTimeSec}s`}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt>Referenced Delta (A-B)</dt>
+                              <dd>
+                                {snapshotDivergence.deltaReferenced === null
+                                  ? '—'
+                                  : `${snapshotDivergence.deltaReferenced >= 0 ? '+' : ''}${formatBytes(
+                                      Math.abs(snapshotDivergence.deltaReferenced)
+                                    )}`}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt>Unique Delta (A-B)</dt>
+                              <dd>
+                                {snapshotDivergence.deltaUnique === null
+                                  ? '—'
+                                  : `${snapshotDivergence.deltaUnique >= 0 ? '+' : ''}${formatBytes(
+                                      Math.abs(snapshotDivergence.deltaUnique)
+                                    )}`}
+                              </dd>
+                            </div>
+                          </dl>
+                          <div className="hint">
+                            <strong>Divergence clue:</strong> higher positive unique delta on A
+                            suggests more snapshot-specific data retained versus B.
+                          </div>
+                        </>
+                      ) : (
+                        <div className="fs-empty">Select two snapshots to compare.</div>
                       )}
                     </div>
                   ) : (
@@ -6883,6 +9140,8 @@ function App() {
                     </>
                   ) : effectiveCenterView === 'spacemap' ? (
                     <span className="muted">Address-range activity and distribution</span>
+                  ) : effectiveCenterView === 'physical' ? (
+                    <span className="muted">Dnode → blkptr tree (logical to physical mapping)</span>
                   ) : effectiveCenterView === 'performance' ? (
                     <span className="muted">
                       Forensics = evidence suggests, Runtime = currently observed
@@ -6910,27 +9169,24 @@ function App() {
                   {effectiveCenterView !== 'map' &&
                     effectiveCenterView !== 'spacemap' &&
                     effectiveCenterView !== 'performance' &&
-                    effectiveCenterView !== 'hex' && (
+                    effectiveCenterView !== 'hex' &&
+                    effectiveCenterView !== 'physical' && (
                     <>
-                      {effectiveCenterView !== 'physical' && (
-                        <button
-                          className="graph-btn"
-                          type="button"
-                          onClick={expandGraph}
-                          disabled={graphExpanding || selectedObject === null || !isMosScope}
-                        >
-                          {graphExpanding ? 'Expanding…' : 'Expand +1 hop'}
-                        </button>
-                      )}
-                      {effectiveCenterView !== 'physical' && (
-                        <button
-                          className={`graph-btn ${showPhysicalEdges ? 'active' : ''}`}
-                          type="button"
-                          onClick={() => setShowPhysicalEdges(prev => !prev)}
-                        >
-                          Physical edges
-                        </button>
-                      )}
+                      <button
+                        className="graph-btn"
+                        type="button"
+                        onClick={expandGraph}
+                        disabled={graphExpanding || selectedObject === null || !isMosScope}
+                      >
+                        {graphExpanding ? 'Expanding…' : 'Expand +1 hop'}
+                      </button>
+                      <button
+                        className={`graph-btn ${showPhysicalEdges ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setShowPhysicalEdges(prev => !prev)}
+                      >
+                        Physical edges
+                      </button>
                       <button
                         className={`graph-btn ${showBlkptrDetails ? 'active' : ''}`}
                         type="button"
@@ -6958,6 +9214,8 @@ function App() {
                   />
                 ) : effectiveCenterView === 'spacemap' ? (
                   renderSpacemapPanel('center')
+                ) : effectiveCenterView === 'physical' ? (
+                  renderBlockTreePanel()
                 ) : effectiveCenterView === 'performance' ? (
                   renderPerformancePanel()
                 ) : effectiveCenterView === 'hex' ? (
@@ -7053,7 +9311,7 @@ function App() {
                   </div>
                   <div>
                     <dt>View</dt>
-                    <dd>{snapshotViewMode === 'lineage' ? 'lineage' : 'table'}</dd>
+                    <dd>{snapshotViewMode}</dd>
                   </div>
                   <div>
                     <dt>Anchor Obj</dt>

@@ -213,6 +213,18 @@ pub fn mos_get_blkptrs(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
     ZdxResult::from_raw(raw)
 }
 
+/// Get MOS object block tree
+pub fn mos_block_tree(
+    pool: *mut zdx_pool_t,
+    objid: u64,
+    max_depth: u64,
+    max_nodes: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_mos_block_tree(pool, objid, max_depth, max_nodes) };
+    ZdxResult::from_raw(raw)
+}
+
 /// Unified object fetch
 pub fn obj_get(pool: *mut zdx_pool_t, objid: u64) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
@@ -354,6 +366,19 @@ pub fn objset_get_object(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> Z
 pub fn objset_get_blkptrs(pool: *mut zdx_pool_t, objset_id: u64, objid: u64) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
     let raw = unsafe { zdx_objset_get_blkptrs(pool, objset_id, objid) };
+    ZdxResult::from_raw(raw)
+}
+
+/// Objset object block tree
+pub fn objset_block_tree(
+    pool: *mut zdx_pool_t,
+    objset_id: u64,
+    objid: u64,
+    max_depth: u64,
+    max_nodes: u64,
+) -> ZdxResult {
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_objset_block_tree(pool, objset_id, objid, max_depth, max_nodes) };
     ZdxResult::from_raw(raw)
 }
 
