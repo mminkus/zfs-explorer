@@ -116,9 +116,35 @@ bootstrap_openzfs() {
     ./autogen.sh
   fi
 
-  ./configure --prefix="$OPENZFS_PREFIX_DIR" --with-config=user --enable-debug
+  local local_dracutdir="$OPENZFS_PREFIX_DIR/lib/dracut"
+  local local_udevdir="$OPENZFS_PREFIX_DIR/lib/udev"
+  local local_udevruledir="$local_udevdir/rules.d"
+  local local_systemdunitdir="$OPENZFS_PREFIX_DIR/lib/systemd/system"
+  local local_systemdpresetdir="$OPENZFS_PREFIX_DIR/lib/systemd/system-preset"
+  local local_systemdmodulesloaddir="$OPENZFS_PREFIX_DIR/lib/modules-load.d"
+  local local_systemdgeneratordir="$OPENZFS_PREFIX_DIR/lib/systemd/system-generators"
+  local local_initramfsdir="$OPENZFS_PREFIX_DIR/share/initramfs-tools"
+  local local_initconfdir="$OPENZFS_PREFIX_DIR/etc/default"
+  local local_bashcompletiondir="$OPENZFS_PREFIX_DIR/share/bash-completion/completions"
+  local local_mounthelperdir="$OPENZFS_PREFIX_DIR/sbin"
+
+  ./configure \
+    --prefix="$OPENZFS_PREFIX_DIR" \
+    --with-config=user \
+    --enable-debug \
+    --with-dracutdir="$local_dracutdir" \
+    --with-udevdir="$local_udevdir" \
+    --with-udevruledir="$local_udevruledir" \
+    --with-mounthelperdir="$local_mounthelperdir" \
+    --with-systemdunitdir="$local_systemdunitdir" \
+    --with-systemdpresetdir="$local_systemdpresetdir" \
+    --with-systemdmodulesloaddir="$local_systemdmodulesloaddir" \
+    --with-systemdgeneratordir="$local_systemdgeneratordir"
   make -j"$JOBS"
-  make install
+  make install \
+    i_tdir="$local_initramfsdir" \
+    initconfdir="$local_initconfdir" \
+    bashcompletiondir="$local_bashcompletiondir"
 }
 
 build_native() {
