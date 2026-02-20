@@ -117,6 +117,52 @@ fn is_objset_user_input_error(err_msg: &str) -> bool {
         || err_msg.contains("zap_cursor_retrieve failed")
 }
 
+fn is_zap_unreadable_error(err_msg: &str) -> bool {
+    (err_msg.contains("zap_get_stats failed")
+        || err_msg.contains("zap_lookup failed")
+        || err_msg.contains("zap_cursor_retrieve failed"))
+        && err_msg.contains("Invalid exchange")
+}
+
+fn zap_unreadable_hint() -> String {
+    "ZAP payload could not be decoded in this context. This commonly happens \
+for encrypted dataset contents when key material is unavailable."
+        .to_string()
+}
+
+fn api_error_for_objset(err_msg: &str) -> ApiError {
+    if is_zap_unreadable_error(err_msg) {
+        return api_error_with(
+            StatusCode::BAD_REQUEST,
+            "ZAP_UNREADABLE",
+            err_msg.to_string(),
+            Some(zap_unreadable_hint()),
+            true,
+        );
+    }
+
+    let status = if is_objset_user_input_error(err_msg) {
+        StatusCode::BAD_REQUEST
+    } else {
+        tracing::error!("FFI error: {}", err_msg);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    api_error(status, err_msg.to_string())
+}
+
+fn inline_zap_error_payload(err_msg: &str) -> Option<Value> {
+    if !is_zap_unreadable_error(err_msg) {
+        return None;
+    }
+
+    Some(json!({
+        "code": "ZAP_UNREADABLE",
+        "message": err_msg,
+        "hint": zap_unreadable_hint(),
+        "recoverable": true
+    }))
+}
+
 fn libzfs_error_name(code: i32) -> Option<&'static str> {
     match code {
         0 => Some("EZFS_SUCCESS"),
@@ -2287,13 +2333,7 @@ pub async fn objset_zap_info(
     let result = crate::ffi::objset_zap_info(pool_ptr, objset_id, objid);
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
-        let status = if is_objset_user_input_error(err_msg) {
-            StatusCode::BAD_REQUEST
-        } else {
-            tracing::error!("FFI error: {}", err_msg);
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return Err(api_error(status, err_msg.to_string()));
+        return Err(api_error_for_objset(err_msg));
     }
     let json_str = result
         .json()
@@ -2313,13 +2353,7 @@ pub async fn objset_zap_entries(
     let result = crate::ffi::objset_zap_entries(pool_ptr, objset_id, objid, cursor, limit);
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
-        let status = if is_objset_user_input_error(err_msg) {
-            StatusCode::BAD_REQUEST
-        } else {
-            tracing::error!("FFI error: {}", err_msg);
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return Err(api_error(status, err_msg.to_string()));
+        return Err(api_error_for_objset(err_msg));
     }
     let json_str = result
         .json()
@@ -2338,25 +2372,13 @@ pub async fn objset_get_full(
     let obj_result = crate::ffi::objset_get_object(pool_ptr, objset_id, objid);
     if !obj_result.is_ok() {
         let err_msg = obj_result.error_msg().unwrap_or("Unknown error");
-        let status = if is_objset_user_input_error(err_msg) {
-            StatusCode::BAD_REQUEST
-        } else {
-            tracing::error!("FFI error: {}", err_msg);
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return Err(api_error(status, err_msg.to_string()));
+        return Err(api_error_for_objset(err_msg));
     }
 
     let blk_result = crate::ffi::objset_get_blkptrs(pool_ptr, objset_id, objid);
     if !blk_result.is_ok() {
         let err_msg = blk_result.error_msg().unwrap_or("Unknown error");
-        let status = if is_objset_user_input_error(err_msg) {
-            StatusCode::BAD_REQUEST
-        } else {
-            tracing::error!("FFI error: {}", err_msg);
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return Err(api_error(status, err_msg.to_string()));
+        return Err(api_error_for_objset(err_msg));
     }
 
     let obj_json = obj_result.json().ok_or_else(|| {
@@ -2377,6 +2399,7 @@ pub async fn objset_get_full(
 
     let mut zap_info_value = Value::Null;
     let mut zap_entries_value = Value::Null;
+    let mut zap_error_value = Value::Null;
     let is_zap = obj_value
         .get("is_zap")
         .and_then(Value::as_bool)
@@ -2385,50 +2408,49 @@ pub async fn objset_get_full(
         let zinfo_result = crate::ffi::objset_zap_info(pool_ptr, objset_id, objid);
         if !zinfo_result.is_ok() {
             let err_msg = zinfo_result.error_msg().unwrap_or("Unknown error");
-            let status = if is_objset_user_input_error(err_msg) {
-                StatusCode::BAD_REQUEST
+            if let Some(payload) = inline_zap_error_payload(err_msg) {
+                zap_error_value = payload;
             } else {
-                tracing::error!("FFI error: {}", err_msg);
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            return Err(api_error(status, err_msg.to_string()));
+                return Err(api_error_for_objset(err_msg));
+            }
+        } else {
+            let zinfo_json = zinfo_result.json().ok_or_else(|| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Missing JSON in objset zap info result",
+                )
+            })?;
+            zap_info_value = parse_json_value(zinfo_json)?;
         }
 
-        let zents_result =
-            crate::ffi::objset_zap_entries(pool_ptr, objset_id, objid, 0, DEFAULT_PAGE_LIMIT);
-        if !zents_result.is_ok() {
-            let err_msg = zents_result.error_msg().unwrap_or("Unknown error");
-            let status = if is_objset_user_input_error(err_msg) {
-                StatusCode::BAD_REQUEST
+        if zap_error_value.is_null() {
+            let zents_result =
+                crate::ffi::objset_zap_entries(pool_ptr, objset_id, objid, 0, DEFAULT_PAGE_LIMIT);
+            if !zents_result.is_ok() {
+                let err_msg = zents_result.error_msg().unwrap_or("Unknown error");
+                if let Some(payload) = inline_zap_error_payload(err_msg) {
+                    zap_error_value = payload;
+                } else {
+                    return Err(api_error_for_objset(err_msg));
+                }
             } else {
-                tracing::error!("FFI error: {}", err_msg);
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            return Err(api_error(status, err_msg.to_string()));
+                let zents_json = zents_result.json().ok_or_else(|| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Missing JSON in objset zap entries result",
+                    )
+                })?;
+                zap_entries_value = parse_json_value(zents_json)?;
+            }
         }
-
-        let zinfo_json = zinfo_result.json().ok_or_else(|| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Missing JSON in objset zap info result",
-            )
-        })?;
-        let zents_json = zents_result.json().ok_or_else(|| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Missing JSON in objset zap entries result",
-            )
-        })?;
-
-        zap_info_value = parse_json_value(zinfo_json)?;
-        zap_entries_value = parse_json_value(zents_json)?;
     }
 
     Ok(Json(json!({
         "object": obj_value,
         "blkptrs": blk_value,
         "zap_info": zap_info_value,
-        "zap_entries": zap_entries_value
+        "zap_entries": zap_entries_value,
+        "zap_error": zap_error_value
     })))
 }
 
@@ -3554,6 +3576,33 @@ mod tests {
         assert_eq!(payload["head_dataset_obj"], 54);
         assert_eq!(payload["objset_id"], 54);
         assert_eq!(payload["rootbp"]["ndvas"], 2);
+    }
+
+    #[test]
+    fn zap_unreadable_error_detection_matches_invalid_exchange() {
+        assert!(is_zap_unreadable_error(
+            "zap_get_stats failed: Invalid exchange"
+        ));
+        assert!(is_zap_unreadable_error(
+            "zap_cursor_retrieve failed: Invalid exchange"
+        ));
+        assert!(!is_zap_unreadable_error(
+            "zap_get_stats failed: Invalid argument"
+        ));
+    }
+
+    #[test]
+    fn objset_error_maps_encrypted_zap_hint() {
+        let err = api_error_for_objset("zap_get_stats failed: Invalid exchange");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0["code"], "ZAP_UNREADABLE");
+        let hint = err
+            .1
+             .0
+            .get("hint")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(hint.contains("encrypted dataset contents"));
     }
 
     #[test]

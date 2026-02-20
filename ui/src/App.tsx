@@ -33,6 +33,27 @@ type ApiErrorPayload = {
   recoverable?: boolean
 }
 
+type InlineApiError = {
+  code?: string
+  message?: string
+  hint?: string
+  recoverable?: boolean
+}
+
+const formatInlineApiError = (payload: InlineApiError | null | undefined): string | null => {
+  if (!payload) return null
+  const message =
+    (typeof payload.message === 'string' && payload.message.trim()) ||
+    'Request failed'
+  const code = typeof payload.code === 'string' && payload.code.trim() ? payload.code.trim() : ''
+  const hint = typeof payload.hint === 'string' && payload.hint.trim() ? payload.hint.trim() : ''
+  const prefix = code ? `${code}: ` : ''
+  if (hint) {
+    return `${prefix}${message}\nHint: ${hint}`
+  }
+  return `${prefix}${message}`
+}
+
 const parseApiErrorMessage = async (response: Response): Promise<string | null> => {
   const fallback = response.statusText || 'Request failed'
   try {
@@ -201,6 +222,7 @@ type ObjsetObjectFullResponse = {
   blkptrs: BlkptrResponse & { objset_id: number }
   zap_info: ZapInfo | null
   zap_entries: ZapResponse | null
+  zap_error?: InlineApiError | null
 }
 
 type RawBlockResponse = {
@@ -3239,7 +3261,7 @@ function App() {
         setFsObjectZapEntries([])
         setFsObjectZapNext(null)
       }
-      setFsObjectZapError(null)
+      setFsObjectZapError(formatInlineApiError(data.zap_error))
     } catch (err) {
       if (fsObjectRequestKey.current === key) {
         setFsObjectInfo(null)
@@ -4547,6 +4569,9 @@ function App() {
           setZapInfo(data.zap_info)
           setZapEntries(data.zap_entries?.entries ?? [])
           setZapNext(data.zap_entries?.next ?? null)
+          setZapError(formatInlineApiError(data.zap_error))
+        } else {
+          setZapError(null)
         }
       }
     } catch (err) {
