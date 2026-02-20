@@ -10034,7 +10034,9 @@ function App() {
 
                           {fsObjectZapLoading && <p className="muted">Loading ZAP entries...</p>}
 
-                          {!fsObjectZapLoading && fsObjectZapEntries.length === 0 && (
+                          {!fsObjectZapLoading &&
+                            !fsObjectZapError &&
+                            fsObjectZapEntries.length === 0 && (
                             <p className="muted">No ZAP entries found.</p>
                           )}
 
@@ -10695,7 +10697,7 @@ function App() {
 
                     {zapLoading && <p className="muted">Loading ZAP entries...</p>}
 
-                    {!zapLoading && zapEntries.length === 0 && (
+                    {!zapLoading && !zapError && zapEntries.length === 0 && (
                       <p className="muted">No ZAP entries found.</p>
                     )}
 
