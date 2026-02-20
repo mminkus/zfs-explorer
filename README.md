@@ -188,6 +188,35 @@ Environment variables:
 - `ZFS_EXPLORER_ZPOOL_CACHEFILE`: optional override for pool cachefile path in live mode
   (useful on hosts that do not use `/etc/zfs/zpool.cache`, e.g. `/data/zfs/zpool.cache`)
 
+Offline troubleshooting:
+
+- API errors now return a structured envelope:
+  - `code` (for example `EZFS_NOENT`, `ERRNO_13`)
+  - `message`
+  - optional `hint`
+- Typical fixes:
+  - `EZFS_NOENT`: pool metadata was not found in the configured search paths
+  - `EZFS_PERM` / `ERRNO_13`: backend needs root/raw-device read access
+  - `EZFS_ACTIVE_POOL`: export pool before opening in offline mode
+
+Direct file recovery download (live or offline):
+
+```bash
+# Download by dataset path (or absolute mounted path), with attachment headers
+curl -fL -o recovered.bin \
+  "http://127.0.0.1:9000/api/pools/testpool/zpl/path/testpool/myds/path/file.bin"
+
+# Resume a partial transfer via HTTP Range
+curl -fL -C - -o recovered.bin \
+  "http://127.0.0.1:9000/api/pools/testpool/zpl/path/testpool/myds/path/file.bin"
+
+# Explicit single-range request
+curl -fL \
+  -H "Range: bytes=0-1048575" \
+  "http://127.0.0.1:9000/api/pools/testpool/zpl/path/testpool/myds/path/file.bin" \
+  -o chunk-0.bin
+```
+
 Optional parity check workflow (live vs offline responses):
 
 ```bash
@@ -268,6 +297,7 @@ zfs-explorer/
 - `GET /api/pools/:pool/objset/:objset_id/dir/:dir_obj/entries` - Directory entries
 - `GET /api/pools/:pool/objset/:objset_id/walk?path=/a/b` - Path walk
 - `GET /api/pools/:pool/objset/:objset_id/stat/:objid` - ZPL stat
+- `GET /api/pools/:pool/zpl/path/<path>` - File download by ZPL path (supports single `Range` request)
 - `GET /api/pools/:pool/block?vdev=&offset=&asize=` - Raw block hex dump
 
 ## Build from Scratch

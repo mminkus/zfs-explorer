@@ -27,6 +27,10 @@ const BLOCK_TREE_DEFAULT_NODES = 2000
 
 type ApiErrorPayload = {
   error?: string
+  message?: string
+  code?: string
+  hint?: string
+  recoverable?: boolean
 }
 
 const parseApiErrorMessage = async (response: Response): Promise<string | null> => {
@@ -38,8 +42,19 @@ const parseApiErrorMessage = async (response: Response): Promise<string | null> 
     }
     try {
       const parsed = JSON.parse(text) as ApiErrorPayload
-      if (typeof parsed?.error === 'string' && parsed.error.trim()) {
-        return parsed.error
+      const message =
+        (typeof parsed?.message === 'string' && parsed.message.trim()) ||
+        (typeof parsed?.error === 'string' && parsed.error.trim()) ||
+        ''
+      const code = typeof parsed?.code === 'string' && parsed.code.trim() ? parsed.code.trim() : ''
+      const hint = typeof parsed?.hint === 'string' && parsed.hint.trim() ? parsed.hint.trim() : ''
+
+      if (message) {
+        const prefix = code ? `${code}: ` : ''
+        if (hint) {
+          return `${prefix}${message}\nHint: ${hint}`
+        }
+        return `${prefix}${message}`
       }
     } catch {
       // Not JSON; fall through to raw text.

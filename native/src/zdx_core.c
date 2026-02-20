@@ -74,6 +74,22 @@ zdx_free_result(zdx_result_t *r)
 /*
  * Create an error result
  */
+static const char *
+zdx_error_text(int err)
+{
+    if (err >= EZFS_NOMEM && err <= EZFS_UNKNOWN) {
+        const char *libzfs_msg = libzfs_error_init(err);
+        if (libzfs_msg != NULL && libzfs_msg[0] != '\0')
+            return libzfs_msg;
+    }
+
+    const char *errno_msg = strerror(err);
+    if (errno_msg != NULL && errno_msg[0] != '\0')
+        return errno_msg;
+
+    return "unknown error";
+}
+
 zdx_result_t
 make_error(int err, const char *fmt, ...)
 {
@@ -90,9 +106,9 @@ make_error(int err, const char *fmt, ...)
 
     if (err > 0) {
         char with_errno[512];
-        const char *errtxt = strerror(err);
+        const char *errtxt = zdx_error_text(err);
         (void)snprintf(with_errno, sizeof (with_errno), "%s: %s", buf,
-            errtxt ? errtxt : "unknown error");
+            errtxt);
         result.errmsg = strdup(with_errno);
     } else {
         result.errmsg = strdup(buf);

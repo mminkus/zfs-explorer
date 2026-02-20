@@ -1,11 +1,18 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{
+        header::{
+            ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+        },
+        HeaderMap, HeaderName, HeaderValue, Response, StatusCode,
+    },
     Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
@@ -25,6 +32,7 @@ const BLOCK_TREE_DEFAULT_NODES: u64 = 2000;
 const BLOCK_TREE_MAX_NODES: u64 = 50_000;
 const OBJSET_DATA_DEFAULT_LIMIT: u64 = 64 * 1024;
 const OBJSET_DATA_MAX_LIMIT: u64 = 1 << 20;
+const ZPL_DOWNLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const BACKEND_NAME: &str = env!("CARGO_PKG_NAME");
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_SHA: &str = match option_env!("ZFS_EXPLORER_GIT_SHA") {
@@ -50,7 +58,36 @@ fn host_cli_command(program: &str) -> std::process::Command {
 }
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
-    (status, Json(json!({ "error": message.into() })))
+    let message = message.into();
+    api_error_with(
+        status,
+        format!("HTTP_{}", status.as_u16()),
+        message,
+        None,
+        status.is_client_error(),
+    )
+}
+
+fn api_error_with(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    hint: Option<String>,
+    recoverable: bool,
+) -> ApiError {
+    let message = message.into();
+    let mut payload = json!({
+        "error": message,
+        "message": message,
+        "code": code.into(),
+        "recoverable": recoverable,
+    });
+
+    if let Some(hint) = hint {
+        payload["hint"] = Value::String(hint);
+    }
+
+    (status, Json(payload))
 }
 
 fn is_dataset_user_input_error(err_msg: &str) -> bool {
@@ -78,6 +115,163 @@ fn is_objset_user_input_error(err_msg: &str) -> bool {
         || err_msg.contains("zap_get_stats failed")
         || err_msg.contains("zap_lookup failed")
         || err_msg.contains("zap_cursor_retrieve failed")
+}
+
+fn libzfs_error_name(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("EZFS_SUCCESS"),
+        2000 => Some("EZFS_NOMEM"),
+        2001 => Some("EZFS_BADPROP"),
+        2002 => Some("EZFS_PROPREADONLY"),
+        2003 => Some("EZFS_PROPTYPE"),
+        2004 => Some("EZFS_PROPNONINHERIT"),
+        2005 => Some("EZFS_PROPSPACE"),
+        2006 => Some("EZFS_BADTYPE"),
+        2007 => Some("EZFS_BUSY"),
+        2008 => Some("EZFS_EXISTS"),
+        2009 => Some("EZFS_NOENT"),
+        2010 => Some("EZFS_BADSTREAM"),
+        2011 => Some("EZFS_DSREADONLY"),
+        2012 => Some("EZFS_VOLTOOBIG"),
+        2013 => Some("EZFS_INVALIDNAME"),
+        2014 => Some("EZFS_BADRESTORE"),
+        2015 => Some("EZFS_BADBACKUP"),
+        2016 => Some("EZFS_BADTARGET"),
+        2017 => Some("EZFS_NODEVICE"),
+        2018 => Some("EZFS_BADDEV"),
+        2019 => Some("EZFS_NOREPLICAS"),
+        2020 => Some("EZFS_RESILVERING"),
+        2021 => Some("EZFS_BADVERSION"),
+        2022 => Some("EZFS_POOLUNAVAIL"),
+        2023 => Some("EZFS_DEVOVERFLOW"),
+        2024 => Some("EZFS_BADPATH"),
+        2025 => Some("EZFS_CROSSTARGET"),
+        2026 => Some("EZFS_ZONED"),
+        2027 => Some("EZFS_MOUNTFAILED"),
+        2028 => Some("EZFS_UMOUNTFAILED"),
+        2029 => Some("EZFS_UNSHARENFSFAILED"),
+        2030 => Some("EZFS_SHARENFSFAILED"),
+        2031 => Some("EZFS_PERM"),
+        2032 => Some("EZFS_NOSPC"),
+        2033 => Some("EZFS_FAULT"),
+        2034 => Some("EZFS_IO"),
+        2035 => Some("EZFS_INTR"),
+        2036 => Some("EZFS_ISSPARE"),
+        2037 => Some("EZFS_INVALCONFIG"),
+        2038 => Some("EZFS_RECURSIVE"),
+        2039 => Some("EZFS_NOHISTORY"),
+        2040 => Some("EZFS_POOLPROPS"),
+        2041 => Some("EZFS_POOL_NOTSUP"),
+        2042 => Some("EZFS_POOL_INVALARG"),
+        2043 => Some("EZFS_NAMETOOLONG"),
+        2044 => Some("EZFS_OPENFAILED"),
+        2045 => Some("EZFS_NOCAP"),
+        2046 => Some("EZFS_LABELFAILED"),
+        2047 => Some("EZFS_BADWHO"),
+        2048 => Some("EZFS_BADPERM"),
+        2049 => Some("EZFS_BADPERMSET"),
+        2050 => Some("EZFS_NODELEGATION"),
+        2051 => Some("EZFS_UNSHARESMBFAILED"),
+        2052 => Some("EZFS_SHARESMBFAILED"),
+        2053 => Some("EZFS_BADCACHE"),
+        2054 => Some("EZFS_ISL2CACHE"),
+        2055 => Some("EZFS_VDEVNOTSUP"),
+        2056 => Some("EZFS_NOTSUP"),
+        2057 => Some("EZFS_ACTIVE_SPARE"),
+        2058 => Some("EZFS_UNPLAYED_LOGS"),
+        2059 => Some("EZFS_REFTAG_RELE"),
+        2060 => Some("EZFS_REFTAG_HOLD"),
+        2061 => Some("EZFS_TAGTOOLONG"),
+        2062 => Some("EZFS_PIPEFAILED"),
+        2063 => Some("EZFS_THREADCREATEFAILED"),
+        2064 => Some("EZFS_POSTSPLIT_ONLINE"),
+        2065 => Some("EZFS_SCRUBBING"),
+        2066 => Some("EZFS_ERRORSCRUBBING"),
+        2067 => Some("EZFS_ERRORSCRUB_PAUSED"),
+        2068 => Some("EZFS_NO_SCRUB"),
+        2069 => Some("EZFS_DIFF"),
+        2070 => Some("EZFS_DIFFDATA"),
+        2071 => Some("EZFS_POOLREADONLY"),
+        2072 => Some("EZFS_SCRUB_PAUSED"),
+        2073 => Some("EZFS_SCRUB_PAUSED_TO_CANCEL"),
+        2074 => Some("EZFS_ACTIVE_POOL"),
+        2075 => Some("EZFS_CRYPTOFAILED"),
+        2076 => Some("EZFS_NO_PENDING"),
+        2077 => Some("EZFS_CHECKPOINT_EXISTS"),
+        2078 => Some("EZFS_DISCARDING_CHECKPOINT"),
+        2079 => Some("EZFS_NO_CHECKPOINT"),
+        2080 => Some("EZFS_DEVRM_IN_PROGRESS"),
+        2081 => Some("EZFS_VDEV_TOO_BIG"),
+        2082 => Some("EZFS_IOC_NOTSUPPORTED"),
+        2083 => Some("EZFS_TOOMANY"),
+        2084 => Some("EZFS_INITIALIZING"),
+        2085 => Some("EZFS_NO_INITIALIZE"),
+        2086 => Some("EZFS_WRONG_PARENT"),
+        2087 => Some("EZFS_TRIMMING"),
+        2088 => Some("EZFS_NO_TRIM"),
+        2089 => Some("EZFS_TRIM_NOTSUP"),
+        2090 => Some("EZFS_NO_RESILVER_DEFER"),
+        2091 => Some("EZFS_EXPORT_IN_PROGRESS"),
+        2092 => Some("EZFS_REBUILDING"),
+        2093 => Some("EZFS_VDEV_NOTSUP"),
+        2094 => Some("EZFS_NOT_USER_NAMESPACE"),
+        2095 => Some("EZFS_CKSUM"),
+        2096 => Some("EZFS_RESUME_EXISTS"),
+        2097 => Some("EZFS_SHAREFAILED"),
+        2098 => Some("EZFS_RAIDZ_EXPAND_IN_PROGRESS"),
+        2099 => Some("EZFS_ASHIFT_MISMATCH"),
+        2100 => Some("EZFS_UNKNOWN"),
+        _ => None,
+    }
+}
+
+fn pool_open_error_code(code: i32) -> String {
+    if let Some(name) = libzfs_error_name(code) {
+        return name.to_string();
+    }
+    if code > 0 {
+        return format!("ERRNO_{code}");
+    }
+    format!("ZDX_{code}")
+}
+
+fn offline_pool_open_hint(pool: &str, code: i32) -> Option<String> {
+    let pool_name = pool.to_string();
+    if matches!(libzfs_error_name(code), Some("EZFS_NOENT")) || code == libc::ENOENT {
+        return Some(format!(
+            "Pool '{pool_name}' was not found in the offline search paths. \
+Ensure the pool is exported and ZFS_EXPLORER_OFFLINE_PATHS points to parent \
+directories (for example /dev/disk/by-id)."
+        ));
+    }
+
+    if matches!(libzfs_error_name(code), Some("EZFS_PERM"))
+        || code == libc::EACCES
+        || code == libc::EPERM
+    {
+        return Some(
+            "Permission denied while opening offline media. Run the backend as \
+root or grant read access to the underlying devices/images."
+                .to_string(),
+        );
+    }
+
+    if matches!(libzfs_error_name(code), Some("EZFS_ACTIVE_POOL")) || code == libc::EEXIST {
+        return Some(format!(
+            "Pool '{pool_name}' appears active/imported. Export it before \
+opening in offline mode."
+        ));
+    }
+
+    if matches!(libzfs_error_name(code), Some("EZFS_CRYPTOFAILED")) {
+        return Some(
+            "The pool appears encrypted and keys are unavailable in offline \
+mode. Unlock keys first, or inspect metadata-only views."
+                .to_string(),
+        );
+    }
+
+    None
 }
 
 fn pool_open_mode_name(mode: crate::PoolOpenMode) -> &'static str {
@@ -1310,10 +1504,15 @@ fn build_dataset_objset_response(dir_obj: u64, head_obj: u64, objset_value: &Val
 fn json_from_result(result: crate::ffi::ZdxResult) -> ApiResult {
     if !result.is_ok() {
         let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let err_code = result.error_code();
+        let code_label = pool_open_error_code(err_code);
         tracing::error!("FFI error: {}", err_msg);
-        return Err(api_error(
+        return Err(api_error_with(
             StatusCode::INTERNAL_SERVER_ERROR,
+            code_label,
             err_msg.to_string(),
+            None,
+            false,
         ));
     }
 
@@ -1348,11 +1547,56 @@ fn ensure_pool(state: &AppState, pool: &str) -> Result<*mut crate::ffi::zdx_pool
             crate::ffi::pool_open_offline(pool, pool_open.offline_search_paths.as_deref())
         }
     }
-    .map_err(|(_code, msg)| {
-        tracing::error!("Failed to open pool {} (mode={}): {}", pool, mode_name, msg);
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+    .map_err(|(code, msg)| {
+        let err_code = pool_open_error_code(code);
+        let hint = if matches!(mode, crate::PoolOpenMode::Offline) {
+            offline_pool_open_hint(pool, code)
+        } else if code == libc::EACCES || code == libc::EPERM {
+            Some("Run backend with sudo for live imported pools.".to_string())
+        } else {
+            None
+        };
+
+        let expected_client_error = matches!(mode, crate::PoolOpenMode::Offline)
+            && matches!(
+                libzfs_error_name(code),
+                Some("EZFS_NOENT" | "EZFS_PERM" | "EZFS_ACTIVE_POOL" | "EZFS_CRYPTOFAILED")
+            )
+            || matches!(
+                code,
+                libc::ENOENT | libc::EACCES | libc::EPERM | libc::EEXIST
+            );
+
+        if expected_client_error {
+            tracing::warn!(
+                "Pool open warning for {} (mode={}, code={}): {}",
+                pool,
+                mode_name,
+                err_code,
+                msg
+            );
+        } else {
+            tracing::error!(
+                "Failed to open pool {} (mode={}, code={}): {}",
+                pool,
+                mode_name,
+                err_code,
+                msg
+            );
+        }
+
+        let status = if expected_client_error {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+
+        api_error_with(
+            status,
+            err_code,
             format!("pool open failed ({mode_name}): {msg}"),
+            hint,
+            true,
         )
     })?;
 
@@ -2222,6 +2466,696 @@ pub async fn objset_read_data(
 }
 
 #[derive(Debug, Deserialize)]
+struct DatasetCatalogEntry {
+    name: String,
+    #[serde(rename = "type")]
+    dataset_type: String,
+    mountpoint: Option<String>,
+    mounted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjsetWalkPayload {
+    objid: u64,
+    found: bool,
+    remaining: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjsetStatPayload {
+    size: u64,
+    type_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjsetDataPayload {
+    data_hex: String,
+}
+
+#[derive(Debug, Clone)]
+struct ZplPathContext {
+    dataset_name: String,
+    objset_id: u64,
+    rel_path: String,
+    objid: u64,
+    file_size: u64,
+    filename: String,
+}
+
+fn decode_hex_bytes(data_hex: &str) -> Result<Vec<u8>, ApiError> {
+    let trimmed = data_hex.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.len() % 2 != 0 {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid hex payload length from backend read",
+        ));
+    }
+
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let hi = nibble(bytes[idx]).ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid hex payload from backend read",
+            )
+        })?;
+        let lo = nibble(bytes[idx + 1]).ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid hex payload from backend read",
+            )
+        })?;
+        out.push((hi << 4) | lo);
+        idx += 2;
+    }
+
+    Ok(out)
+}
+
+fn split_clean_path(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn dataset_path_match(dataset: &str, path: &str) -> Option<String> {
+    if path == dataset {
+        return Some(String::new());
+    }
+
+    let prefix = format!("{dataset}/");
+    if path.starts_with(&prefix) {
+        return Some(path[prefix.len()..].to_string());
+    }
+
+    None
+}
+
+fn mountpoint_path_match(mountpoint: &str, absolute_path: &str) -> Option<String> {
+    if absolute_path == mountpoint {
+        return Some(String::new());
+    }
+
+    let prefix = format!("{mountpoint}/");
+    if absolute_path.starts_with(&prefix) {
+        return Some(absolute_path[prefix.len()..].to_string());
+    }
+
+    None
+}
+
+fn load_dataset_catalog(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+) -> Result<Vec<DatasetCatalogEntry>, ApiError> {
+    let datasets_result = crate::ffi::pool_datasets(pool_ptr);
+    if !datasets_result.is_ok() {
+        let err_msg = datasets_result.error_msg().unwrap_or("Unknown error");
+        let err_code = datasets_result.error_code();
+        let code = pool_open_error_code(err_code);
+        return Err(api_error_with(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            format!("failed to list datasets: {err_msg}"),
+            None,
+            false,
+        ));
+    }
+
+    let datasets_json = datasets_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let datasets_value = parse_json_value(datasets_json)?;
+    serde_json::from_value::<Vec<DatasetCatalogEntry>>(datasets_value).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse dataset catalog: {err}"),
+        )
+    })
+}
+
+fn resolve_dataset_dir_obj_by_name(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    pool_name: &str,
+    dataset_name: &str,
+) -> Result<u64, ApiError> {
+    let root_result = crate::ffi::dsl_root_dir(pool_ptr);
+    if !root_result.is_ok() {
+        let err_msg = root_result.error_msg().unwrap_or("Unknown error");
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to resolve DSL root: {err_msg}"),
+        ));
+    }
+    let root_json = root_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let root_value = parse_json_value(root_json)?;
+    let root_dir_obj = root_value["root_dir_obj"].as_u64().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "root_dir_obj missing in DSL root payload",
+        )
+    })?;
+
+    if dataset_name == pool_name {
+        return Ok(root_dir_obj);
+    }
+
+    let pool_prefix = format!("{pool_name}/");
+    let suffix = dataset_name.strip_prefix(&pool_prefix).ok_or_else(|| {
+        api_error_with(
+            StatusCode::BAD_REQUEST,
+            "INVALID_DATASET_PATH",
+            format!("dataset '{dataset_name}' is not under pool '{pool_name}'"),
+            Some("Use paths rooted at the selected pool name.".to_string()),
+            true,
+        )
+    })?;
+
+    let components = split_clean_path(suffix);
+    if components.is_empty() {
+        return Ok(root_dir_obj);
+    }
+
+    let mut current_dir_obj = root_dir_obj;
+    for component in components {
+        let children_result = crate::ffi::dsl_dir_children(pool_ptr, current_dir_obj);
+        if !children_result.is_ok() {
+            let err_msg = children_result.error_msg().unwrap_or("Unknown error");
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to enumerate DSL children: {err_msg}"),
+            ));
+        }
+        let children_json = children_result.json().ok_or_else(|| {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result")
+        })?;
+        let children_value = parse_json_value(children_json)?;
+        let children = parse_dsl_children(&children_value);
+        let next_obj = children
+            .iter()
+            .find_map(|(name, obj)| if name == component { Some(*obj) } else { None })
+            .ok_or_else(|| {
+                api_error_with(
+                    StatusCode::NOT_FOUND,
+                    "DATASET_NOT_FOUND",
+                    format!("dataset component '{component}' not found under '{dataset_name}'"),
+                    Some("Refresh dataset tree and verify the dataset path exists.".to_string()),
+                    true,
+                )
+            })?;
+        current_dir_obj = next_obj;
+    }
+
+    Ok(current_dir_obj)
+}
+
+fn resolve_zpl_path_context(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    pool_name: &str,
+    zpl_path: &str,
+) -> Result<ZplPathContext, ApiError> {
+    let trimmed = zpl_path.trim();
+    if trimmed.is_empty() {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PATH",
+            "path is empty",
+            Some(
+                "Provide a dataset-relative path like pool/dataset/file or an absolute mount path."
+                    .to_string(),
+            ),
+            true,
+        ));
+    }
+
+    let absolute_path = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let normalized_path = trimmed.trim_start_matches('/').to_string();
+
+    let catalog = load_dataset_catalog(pool_ptr)?;
+    let mut candidates: Vec<(usize, String, String)> = Vec::new();
+    for entry in catalog
+        .iter()
+        .filter(|entry| entry.dataset_type == "filesystem")
+    {
+        if let Some(rel) = dataset_path_match(&entry.name, &normalized_path) {
+            candidates.push((entry.name.len(), entry.name.clone(), rel));
+        }
+
+        if let Some(mountpoint) = entry.mountpoint.as_deref() {
+            if entry.mounted != Some(false) {
+                if let Some(rel) = mountpoint_path_match(mountpoint, &absolute_path) {
+                    candidates.push((mountpoint.len(), entry.name.clone(), rel));
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let Some((_, dataset_name, rel_path)) = candidates.into_iter().next() else {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "DATASET_PATH_UNRESOLVED",
+            format!("could not resolve dataset for path '{zpl_path}'"),
+            Some(
+                "Use either an absolute mounted path (/pool/dataset/file) or a dataset path \
+like pool/dataset/file."
+                    .to_string(),
+            ),
+            true,
+        ));
+    };
+
+    let dir_obj = resolve_dataset_dir_obj_by_name(pool_ptr, pool_name, &dataset_name)?;
+    let objset_payload = resolve_dataset_objset(pool_ptr, dir_obj)?;
+    let objset_id = objset_payload["objset_id"].as_u64().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "objset_id missing in dataset resolution payload",
+        )
+    })?;
+
+    let walk_path = if rel_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{rel_path}")
+    };
+    let walk_result = crate::ffi::objset_walk(pool_ptr, objset_id, &walk_path)
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, err))?;
+    if !walk_result.is_ok() {
+        let err_msg = walk_result.error_msg().unwrap_or("Unknown error");
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "ZPL_WALK_FAILED",
+            format!("failed to walk path '{walk_path}': {err_msg}"),
+            Some("Verify the file path and dataset context.".to_string()),
+            true,
+        ));
+    }
+    let walk_json = walk_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let walk_value = parse_json_value(walk_json)?;
+    let walk = serde_json::from_value::<ObjsetWalkPayload>(walk_value).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse walk payload: {err}"),
+        )
+    })?;
+
+    if !walk.found || !walk.remaining.is_empty() {
+        return Err(api_error_with(
+            StatusCode::NOT_FOUND,
+            "PATH_NOT_FOUND",
+            format!("path '{walk_path}' could not be fully resolved"),
+            Some("The requested file may not exist in this dataset or snapshot state.".to_string()),
+            true,
+        ));
+    }
+
+    let stat_result = crate::ffi::objset_stat(pool_ptr, objset_id, walk.objid);
+    if !stat_result.is_ok() {
+        let err_msg = stat_result.error_msg().unwrap_or("Unknown error");
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "OBJSET_STAT_FAILED",
+            format!("failed to stat object {}: {}", walk.objid, err_msg),
+            None,
+            true,
+        ));
+    }
+    let stat_json = stat_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let stat_value = parse_json_value(stat_json)?;
+    let stat = serde_json::from_value::<ObjsetStatPayload>(stat_value).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse stat payload: {err}"),
+        )
+    })?;
+
+    if stat.type_name != "file" {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "NOT_A_FILE",
+            format!(
+                "resolved path '{walk_path}' is a {} object, not a file",
+                stat.type_name
+            ),
+            Some("Use this endpoint only for file paths.".to_string()),
+            true,
+        ));
+    }
+
+    let filename = split_clean_path(&rel_path)
+        .last()
+        .map(|segment| (*segment).to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("objset-{objset_id}-obj-{}", walk.objid));
+
+    Ok(ZplPathContext {
+        dataset_name,
+        objset_id,
+        rel_path,
+        objid: walk.objid,
+        file_size: stat.size,
+        filename,
+    })
+}
+
+fn parse_range_header(headers: &HeaderMap, total_size: u64) -> Result<(u64, u64, bool), ApiError> {
+    let Some(range_header) = headers.get(RANGE) else {
+        if total_size == 0 {
+            return Ok((0, 0, false));
+        }
+        return Ok((0, total_size - 1, false));
+    };
+
+    let header_value = range_header.to_str().map_err(|_| {
+        api_error_with(
+            StatusCode::BAD_REQUEST,
+            "BAD_RANGE",
+            "invalid Range header",
+            None,
+            true,
+        )
+    })?;
+    let trimmed = header_value.trim();
+    if !trimmed.starts_with("bytes=") {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "BAD_RANGE",
+            format!("unsupported Range header '{trimmed}'"),
+            Some("Use a single byte range, for example: bytes=0-1048575".to_string()),
+            true,
+        ));
+    }
+
+    let range_expr = trimmed.trim_start_matches("bytes=").trim();
+    if range_expr.contains(',') {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "BAD_RANGE",
+            "multiple byte ranges are not supported",
+            Some("Use a single range request per call.".to_string()),
+            true,
+        ));
+    }
+
+    if total_size == 0 {
+        return Err(api_error_with(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "RANGE_NOT_SATISFIABLE",
+            "cannot satisfy range for empty file",
+            None,
+            true,
+        ));
+    }
+
+    let parts: Vec<&str> = range_expr.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "BAD_RANGE",
+            format!("invalid Range header '{trimmed}'"),
+            None,
+            true,
+        ));
+    }
+
+    let start_raw = parts[0].trim();
+    let end_raw = parts[1].trim();
+
+    let (start, end) = if start_raw.is_empty() {
+        let suffix_len = u64::from_str(end_raw).map_err(|_| {
+            api_error_with(
+                StatusCode::BAD_REQUEST,
+                "BAD_RANGE",
+                format!("invalid suffix range '{trimmed}'"),
+                None,
+                true,
+            )
+        })?;
+        if suffix_len == 0 {
+            return Err(api_error_with(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "RANGE_NOT_SATISFIABLE",
+                "suffix length must be greater than zero",
+                None,
+                true,
+            ));
+        }
+        if suffix_len >= total_size {
+            (0, total_size - 1)
+        } else {
+            (total_size - suffix_len, total_size - 1)
+        }
+    } else {
+        let start = u64::from_str(start_raw).map_err(|_| {
+            api_error_with(
+                StatusCode::BAD_REQUEST,
+                "BAD_RANGE",
+                format!("invalid range start '{start_raw}'"),
+                None,
+                true,
+            )
+        })?;
+        let end = if end_raw.is_empty() {
+            total_size - 1
+        } else {
+            u64::from_str(end_raw).map_err(|_| {
+                api_error_with(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_RANGE",
+                    format!("invalid range end '{end_raw}'"),
+                    None,
+                    true,
+                )
+            })?
+        };
+        if start >= total_size || start > end {
+            return Err(api_error_with(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "RANGE_NOT_SATISFIABLE",
+                format!("range {start}-{end} is outside object size {total_size}"),
+                None,
+                true,
+            ));
+        }
+        (start, end.min(total_size - 1))
+    };
+
+    Ok((start, end, true))
+}
+
+fn read_objset_bytes(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    objset_id: u64,
+    objid: u64,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, ApiError> {
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let total = end - start + 1;
+    if total > ZPL_DOWNLOAD_MAX_BYTES {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "DOWNLOAD_TOO_LARGE",
+            format!(
+                "requested byte range is {} bytes; max per request is {} bytes",
+                total, ZPL_DOWNLOAD_MAX_BYTES
+            ),
+            Some("Use HTTP Range requests to download the file in chunks.".to_string()),
+            true,
+        ));
+    }
+
+    let mut out = Vec::with_capacity(total as usize);
+    let mut offset = start;
+    while offset <= end {
+        let remaining = end - offset + 1;
+        let chunk_size = remaining.min(OBJSET_DATA_MAX_LIMIT);
+        let chunk_result =
+            crate::ffi::objset_read_data(pool_ptr, objset_id, objid, offset, chunk_size);
+        if !chunk_result.is_ok() {
+            let err_msg = chunk_result.error_msg().unwrap_or("Unknown error");
+            let status = if is_objset_user_input_error(err_msg) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return Err(api_error(
+                status,
+                format!("failed to read object data at offset {offset}: {err_msg}"),
+            ));
+        }
+
+        let chunk_json = chunk_result.json().ok_or_else(|| {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result")
+        })?;
+        let chunk_value = parse_json_value(chunk_json)?;
+        let chunk = serde_json::from_value::<ObjsetDataPayload>(chunk_value).map_err(|err| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to parse object data payload: {err}"),
+            )
+        })?;
+
+        let mut bytes = decode_hex_bytes(&chunk.data_hex)?;
+        if bytes.is_empty() {
+            break;
+        }
+
+        if (bytes.len() as u64) > remaining {
+            bytes.truncate(remaining as usize);
+        }
+
+        let consumed = bytes.len() as u64;
+        out.extend_from_slice(&bytes);
+        if consumed == 0 {
+            break;
+        }
+        offset = offset.saturating_add(consumed);
+    }
+
+    if out.len() as u64 != total {
+        return Err(api_error_with(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SHORT_READ",
+            format!(
+                "short read while exporting object data (expected {total} bytes, got {})",
+                out.len()
+            ),
+            Some(
+                "Try smaller range requests; the object may be sparse or partially unreadable."
+                    .to_string(),
+            ),
+            false,
+        ));
+    }
+
+    Ok(out)
+}
+
+fn sanitize_download_filename(raw: &str) -> String {
+    let mut cleaned = raw.replace(['"', '\\', '/'], "_");
+    if cleaned.is_empty() {
+        cleaned = "download.bin".to_string();
+    }
+    cleaned
+}
+
+/// GET /api/pools/:pool/zpl/path/<path> (supports single HTTP Range request)
+pub async fn zpl_path_download(
+    State(state): State<AppState>,
+    Path((pool, zpl_path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, ApiError> {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let ctx = resolve_zpl_path_context(pool_ptr, &pool, &zpl_path)?;
+
+    if ctx.file_size == 0 {
+        let filename = sanitize_download_filename(&ctx.filename);
+        let content_type = mime_guess::from_path(&filename)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let mut response = Response::new(Body::from(Vec::<u8>::new()));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(&content_type)
+                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+        );
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        response.headers_mut().insert(
+            CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                .unwrap_or(HeaderValue::from_static("attachment")),
+        );
+        return Ok(response);
+    }
+
+    let (start, end, partial) = parse_range_header(&headers, ctx.file_size)?;
+    let bytes = read_objset_bytes(pool_ptr, ctx.objset_id, ctx.objid, start, end)?;
+    let filename = sanitize_download_filename(&ctx.filename);
+    let content_type = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = if partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&content_type)
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&(end - start + 1).to_string())
+            .unwrap_or(HeaderValue::from_static("0")),
+    );
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .unwrap_or(HeaderValue::from_static("attachment")),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-zfs-dataset"),
+        HeaderValue::from_str(&ctx.dataset_name).unwrap_or(HeaderValue::from_static("unknown")),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-zfs-relpath"),
+        HeaderValue::from_str(&ctx.rel_path).unwrap_or(HeaderValue::from_static("/")),
+    );
+
+    if partial {
+        response.headers_mut().insert(
+            CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{}", ctx.file_size))
+                .unwrap_or(HeaderValue::from_static("bytes */0")),
+        );
+    }
+
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SpacemapRangesQuery {
     pub cursor: Option<u64>,
     pub limit: Option<u64>,
@@ -2581,6 +3515,25 @@ mod tests {
         let err = api_error(StatusCode::BAD_REQUEST, "boom");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1 .0["error"], "boom");
+        assert_eq!(err.1 .0["message"], "boom");
+        assert_eq!(err.1 .0["code"], "HTTP_400");
+        assert_eq!(err.1 .0["recoverable"], true);
+    }
+
+    #[test]
+    fn pool_open_error_code_maps_libzfs_names() {
+        assert_eq!(pool_open_error_code(2009), "EZFS_NOENT");
+        assert_eq!(pool_open_error_code(libc::EACCES), "ERRNO_13");
+        assert_eq!(pool_open_error_code(-3), "ZDX_-3");
+    }
+
+    #[test]
+    fn offline_pool_open_hint_is_user_friendly() {
+        let noent = offline_pool_open_hint("tank", 2009).unwrap_or_default();
+        assert!(noent.contains("offline search paths"));
+        let perm = offline_pool_open_hint("tank", libc::EACCES).unwrap_or_default();
+        assert!(perm.contains("Run the backend as root"));
+        assert!(offline_pool_open_hint("tank", libc::EIO).is_none());
     }
 
     #[test]
@@ -2751,6 +3704,39 @@ c_max                           4    8192
         assert_eq!(parse_iostat_counter("1234"), Some(1234));
         assert_eq!(parse_iostat_counter("-"), None);
         assert_eq!(parse_iostat_counter(""), None);
+    }
+
+    #[test]
+    fn parse_range_header_supports_standard_and_suffix_forms() {
+        let empty_headers = HeaderMap::new();
+        let (start, end, partial) = parse_range_header(&empty_headers, 100).unwrap();
+        assert_eq!((start, end, partial), (0, 99, false));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=10-19"));
+        let (start, end, partial) = parse_range_header(&headers, 100).unwrap();
+        assert_eq!((start, end, partial), (10, 19, true));
+
+        headers.insert(RANGE, HeaderValue::from_static("bytes=-20"));
+        let (start, end, partial) = parse_range_header(&headers, 100).unwrap();
+        assert_eq!((start, end, partial), (80, 99, true));
+    }
+
+    #[test]
+    fn dataset_and_mountpoint_path_match_handles_prefixes() {
+        assert_eq!(
+            dataset_path_match("tank/data", "tank/data/file.bin"),
+            Some("file.bin".to_string())
+        );
+        assert_eq!(
+            mountpoint_path_match("/tank/data", "/tank/data/file.bin"),
+            Some("file.bin".to_string())
+        );
+        assert_eq!(dataset_path_match("tank/data", "tank/other/file.bin"), None);
+        assert_eq!(
+            mountpoint_path_match("/tank/data", "/tank/other/file.bin"),
+            None
+        );
     }
 
     #[test]
