@@ -51,6 +51,56 @@ fn parse_offline_pool_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn check_runtime_privileges(mode: PoolOpenMode) -> Result<(), String> {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        return Ok(());
+    }
+
+    let allow_non_root = env_truthy("ZFS_EXPLORER_ALLOW_NON_ROOT");
+    if mode == PoolOpenMode::Live && !allow_non_root {
+        return Err(format!(
+            "live mode requires root privileges (euid={}). Run with sudo, \
+or set ZFS_EXPLORER_ALLOW_NON_ROOT=1 to bypass at your own risk.",
+            euid
+        ));
+    }
+
+    if allow_non_root {
+        tracing::warn!(
+            "running as non-root (euid={}) with ZFS_EXPLORER_ALLOW_NON_ROOT=1; \
+pool access may fail depending on device/file permissions",
+            euid
+        );
+    } else {
+        tracing::warn!(
+            "running as non-root (euid={}); some pools/devices may be inaccessible. \
+Use sudo for reliable access.",
+            euid
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_runtime_privileges(_mode: PoolOpenMode) -> Result<(), String> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing with INFO level by default
@@ -61,19 +111,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Initialize ZFS
-    tracing::info!("Initializing ZFS library...");
-    ffi::init()?;
-
-    let version = ffi::version();
-    tracing::info!("ZFS Explorer starting (OpenZFS {})", version);
-
     let mode = parse_pool_open_mode()?;
     let offline_search_paths = std::env::var("ZFS_EXPLORER_OFFLINE_PATHS")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let offline_pool_names = parse_offline_pool_names();
+    check_runtime_privileges(mode)?;
+
+    // Initialize ZFS
+    tracing::info!("Initializing ZFS library...");
+    ffi::init()?;
+
+    let version = ffi::version();
+    tracing::info!("ZFS Explorer starting (OpenZFS {})", version);
 
     match mode {
         PoolOpenMode::Live => {
