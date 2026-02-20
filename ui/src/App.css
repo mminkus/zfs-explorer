@@ -1628,6 +1628,9 @@ footer code {
   min-height: 0;
   overflow: auto;
   padding-right: 0.22rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
 }
 
 .block-tree-node {
@@ -1642,6 +1645,29 @@ footer code {
   display: flex;
   align-items: flex-start;
   gap: 0.45rem;
+}
+
+.block-tree-node-select {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.14rem;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  padding: 0.08rem 0.28rem 0.12rem;
+}
+
+.block-tree-node-select:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.block-tree-node-select.is-selected {
+  border-color: rgba(77, 208, 225, 0.42);
+  background: rgba(77, 208, 225, 0.1);
 }
 
 .block-tree-toggle {
@@ -1728,15 +1754,24 @@ footer code {
   gap: 0.28rem;
 }
 
-.block-tree-flag {
+.block-tree-flag-badge {
   padding: 0.1rem 0.4rem;
   border-radius: 8px;
-  border: 1px solid rgba(255, 140, 66, 0.34);
-  background: rgba(255, 140, 66, 0.14);
-  color: #ffbe8a;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--muted);
   font-family: var(--mono);
   font-size: 0.66rem;
-  text-transform: lowercase;
+}
+
+.block-tree-flag-badge.is-active {
+  border-color: rgba(255, 140, 66, 0.34);
+  background: rgba(255, 140, 66, 0.14);
+  color: #ffbe8a;
+}
+
+.block-tree-flag-badge.is-inactive {
+  opacity: 0.72;
 }
 
 .block-tree-dvas {
@@ -1757,6 +1792,55 @@ footer code {
   font-size: 0.68rem;
   color: var(--muted);
   font-family: var(--mono);
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+
+.block-tree-dva-row:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.block-tree-dva-row.is-active {
+  border-color: rgba(77, 208, 225, 0.45);
+  background: rgba(77, 208, 225, 0.13);
+  color: #9fe6f2;
+}
+
+.block-tree-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.6rem;
+}
+
+.block-tree-detail-panel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 0.5rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-height: 0;
+}
+
+.block-tree-detail-actions {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.block-tree-detail-panel h4 {
+  margin: 0;
+  font-size: 0.82rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.block-tree-action-message {
+  margin: 0;
 }
 
 .block-tree-children {

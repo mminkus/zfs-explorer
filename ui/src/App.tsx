@@ -368,6 +368,17 @@ type BlockTreeResponse = {
   nodes: BlockTreeNode[]
 }
 
+type BlockTreeDvaRef = {
+  nodeId: number
+  index: number
+}
+
+type HexDvaFocus = {
+  nodeId: number
+  dvaIndex: number
+  dva: DvaInfo
+}
+
 type PoolSummaryPool = {
   name: string
   guid: number
@@ -1129,6 +1140,7 @@ function App() {
   const [hexDump, setHexDump] = useState<RawBlockResponse | null>(null)
   const [hexLoading, setHexLoading] = useState(false)
   const [hexError, setHexError] = useState<string | null>(null)
+  const [hexFocusedDva, setHexFocusedDva] = useState<HexDvaFocus | null>(null)
   const [centerHexDump, setCenterHexDump] = useState<ObjsetDataResponse | null>(null)
   const [centerHexLoading, setCenterHexLoading] = useState(false)
   const [centerHexError, setCenterHexError] = useState<string | null>(null)
@@ -1224,6 +1236,10 @@ function App() {
   const [blockTreeDepthInput, setBlockTreeDepthInput] = useState(String(BLOCK_TREE_DEFAULT_DEPTH))
   const [blockTreeNodesInput, setBlockTreeNodesInput] = useState(String(BLOCK_TREE_DEFAULT_NODES))
   const [blockTreeExpanded, setBlockTreeExpanded] = useState<Record<number, boolean>>({})
+  const [blockTreeSelectedNodeId, setBlockTreeSelectedNodeId] = useState<number | null>(null)
+  const [blockTreePinnedDva, setBlockTreePinnedDva] = useState<BlockTreeDvaRef | null>(null)
+  const [blockTreeHoveredDva, setBlockTreeHoveredDva] = useState<BlockTreeDvaRef | null>(null)
+  const [blockTreeActionMessage, setBlockTreeActionMessage] = useState<string | null>(null)
   const [centerView, setCenterView] = useState<
     'explore' | 'graph' | 'physical' | 'spacemap' | 'hex' | 'performance'
   >(
@@ -2507,12 +2523,19 @@ function App() {
     try {
       const data = await fetchJson<BlockTreeResponse>(`${endpoint}?${params.toString()}`)
       if (blockTreeRequestKey.current !== requestKey) return
+      const root = data.nodes.find(node => node.parent_id === null) ?? data.nodes[0] ?? null
       setBlockTree(data)
-      setBlockTreeExpanded({ 0: true })
+      setBlockTreeExpanded(root ? { [root.id]: true } : {})
+      setBlockTreeSelectedNodeId(root?.id ?? null)
+      setBlockTreePinnedDva(null)
+      setBlockTreeHoveredDva(null)
     } catch (err) {
       if (blockTreeRequestKey.current !== requestKey) return
       setBlockTree(null)
       setBlockTreeError((err as Error).message)
+      setBlockTreeSelectedNodeId(null)
+      setBlockTreePinnedDva(null)
+      setBlockTreeHoveredDva(null)
     } finally {
       if (blockTreeRequestKey.current !== requestKey) return
       setBlockTreeLoading(false)
@@ -4728,6 +4751,22 @@ function App() {
     return null
   }, [blkptrs])
 
+  const activeHexSource = useMemo(() => {
+    if (hexFocusedDva) {
+      return {
+        label: `block-tree node #${hexFocusedDva.nodeId} · DVA ${hexFocusedDva.dvaIndex}`,
+        dva: hexFocusedDva.dva,
+      }
+    }
+    if (firstDataDva) {
+      return {
+        label: `blkptr ${firstDataDva.bpIndex} · DVA ${firstDataDva.dvaIndex}`,
+        dva: firstDataDva.dva,
+      }
+    }
+    return null
+  }, [firstDataDva, hexFocusedDva])
+
   const isSpacemapObject = useMemo(() => isSpacemapDnode(objectInfo), [objectInfo])
   const isObjsetPlainFile = useMemo(() => {
     if (!objectInfo || objectScope.kind === 'mos') return false
@@ -5102,6 +5141,27 @@ function App() {
     return blockTree.nodes.find(node => node.parent_id === null) ?? blockTree.nodes[0]
   }, [blockTree])
 
+  const blockTreeSelectedNode = useMemo(() => {
+    if (!blockTree) return null
+    if (blockTreeSelectedNodeId !== null) {
+      const selected = blockTreeNodesById.get(blockTreeSelectedNodeId)
+      if (selected) return selected
+    }
+    return blockTreeRootNode
+  }, [blockTree, blockTreeNodesById, blockTreeRootNode, blockTreeSelectedNodeId])
+
+  const blockTreeFocusedDva = useMemo(() => {
+    const ref = blockTreeHoveredDva ?? blockTreePinnedDva
+    if (!ref) return null
+    const node = blockTreeNodesById.get(ref.nodeId)
+    if (!node?.dvas || ref.index < 0 || ref.index >= node.dvas.length) return null
+    return {
+      node,
+      index: ref.index,
+      dva: node.dvas[ref.index],
+    }
+  }, [blockTreeHoveredDva, blockTreeNodesById, blockTreePinnedDva])
+
   const blockTreeExpandedNodeCount = useMemo(() => {
     if (!blockTree) return 0
     return Object.values(blockTreeExpanded).filter(Boolean).length
@@ -5116,6 +5176,80 @@ function App() {
     }
     return `${objectScope.datasetName}@${objectScope.snapshotName} (objset ${objectScope.objsetId})`
   }, [objectScope])
+
+  const getBlockTreeFlagBadges = (node: BlockTreeNode) => {
+    if (node.kind !== 'blkptr') return []
+    return [
+      { label: 'G', active: !!node.is_gang, hint: 'gang block pointer' },
+      { label: 'D', active: !!node.dedup, hint: 'deduplicated block pointer' },
+      { label: 'X', active: !!node.is_embedded, hint: 'embedded payload marker' },
+      { label: 'hole', active: !!node.is_hole, hint: 'logical hole' },
+      { label: 'embedded', active: !!node.is_embedded, hint: 'data embedded in blkptr' },
+      { label: 'gang', active: !!node.is_gang, hint: 'gang block' },
+    ]
+  }
+
+  const getBlockTreeNodeDetails = (node: BlockTreeNode): Array<{ key: string; value: string }> =>
+    node.kind === 'dnode'
+      ? [
+          { key: 'object', value: String(node.object ?? selectedObject ?? '—') },
+          { key: 'nlevels', value: String(node.nlevels ?? '—') },
+          { key: 'nblkptr', value: String(node.nblkptr ?? '—') },
+          { key: 'indblkshift', value: String(node.indblkshift ?? '—') },
+          {
+            key: 'datablksz',
+            value: node.datablksz === undefined ? '—' : formatAddr(node.datablksz),
+          },
+          { key: 'maxblkid', value: String(node.maxblkid ?? '—') },
+          { key: 'spill', value: node.has_spill ? 'yes' : 'no' },
+        ]
+      : [
+          { key: 'edge', value: node.is_spill ? 'spill' : String(node.edge_index ?? '—') },
+          { key: 'level', value: `L${node.level ?? '—'}` },
+          { key: 'blkid', value: String(node.blkid ?? '—') },
+          { key: 'type', value: String(node.type ?? '—') },
+          { key: 'lsize', value: node.lsize === undefined ? '—' : formatAddr(node.lsize) },
+          { key: 'psize', value: node.psize === undefined ? '—' : formatAddr(node.psize) },
+          { key: 'asize', value: node.asize === undefined ? '—' : formatAddr(node.asize) },
+          { key: 'birth txg', value: String(node.birth_txg ?? '—') },
+          { key: 'logical birth', value: String(node.logical_birth ?? '—') },
+          { key: 'physical birth', value: String(node.physical_birth ?? '—') },
+          { key: 'fill', value: String(node.fill ?? '—') },
+          { key: 'checksum', value: String(node.checksum ?? '—') },
+          { key: 'compression', value: String(node.compression ?? '—') },
+          { key: 'ndvas', value: String(node.ndvas ?? 0) },
+          { key: 'child slots', value: String(node.child_slots ?? 0) },
+        ]
+
+  const openDvaHexPreview = (nodeId: number, dvaIndex: number, dva: BlockTreeDva) => {
+    setHexFocusedDva({
+      nodeId,
+      dvaIndex,
+      dva: {
+        vdev: dva.vdev,
+        offset: dva.offset,
+        asize: dva.asize,
+        is_gang: dva.is_gang,
+      },
+    })
+    setInspectorTab('raw')
+    setRawView('hex')
+    setHexError(null)
+    setHexDump(null)
+  }
+
+  const copyDvaZdbReadCommand = async (dva: DvaInfo) => {
+    if (!selectedPool) return
+    const cmd = `sudo zdb -R ${selectedPool} ${dva.vdev}:${formatHexNoPrefix(
+      dva.offset
+    )}:${formatHexNoPrefix(dva.asize)}:r`
+    try {
+      await navigator.clipboard.writeText(cmd)
+      setBlockTreeActionMessage('Copied zdb -R command.')
+    } catch (err) {
+      setBlockTreeActionMessage(`Copy failed: ${(err as Error).message}`)
+    }
+  }
 
   const toggleBlockTreeNode = (nodeId: number, currentlyExpanded: boolean) => {
     setBlockTreeExpanded(prev => ({ ...prev, [nodeId]: !currentlyExpanded }))
@@ -5140,6 +5274,116 @@ function App() {
     setBlockTreeExpanded({ [blockTreeRootNode.id]: true })
   }
 
+  const buildBlockTreeExportPayload = () => {
+    if (!blockTree || !selectedPool) return null
+    return {
+      pool: selectedPool,
+      scope: objectScope,
+      loaded_at_unix_sec: Math.floor(Date.now() / 1000),
+      requested: {
+        max_depth_input: blockTreeDepthInput,
+        max_nodes_input: blockTreeNodesInput,
+      },
+      summary: {
+        object: blockTree.object,
+        scope: blockTree.scope,
+        objset_id: blockTree.objset_id,
+        count: blockTree.count,
+        max_depth: blockTree.max_depth,
+        max_nodes: blockTree.max_nodes,
+        truncated: blockTree.truncated,
+      },
+      expanded_node_ids: Object.entries(blockTreeExpanded)
+        .filter(([, expanded]) => expanded)
+        .map(([id]) => Number(id))
+        .sort((a, b) => a - b),
+      selected_node_id: blockTreeSelectedNode?.id ?? null,
+      selected_dva:
+        blockTreeFocusedDva === null
+          ? null
+          : {
+              node_id: blockTreeFocusedDva.node.id,
+              index: blockTreeFocusedDva.index,
+              ...blockTreeFocusedDva.dva,
+            },
+      tree: blockTree,
+    }
+  }
+
+  const copyBlockTreeJson = async () => {
+    const payload = buildBlockTreeExportPayload()
+    if (!payload) return
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2))
+      setBlockTreeActionMessage('Copied block tree JSON.')
+    } catch (err) {
+      setBlockTreeActionMessage(`Copy failed: ${(err as Error).message}`)
+    }
+  }
+
+  const exportBlockTreeJson = () => {
+    const payload = buildBlockTreeExportPayload()
+    if (!payload || !selectedPool) return
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json',
+    })
+    const url = window.URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `block-tree-${selectedPool}-${payload.summary.object}.json`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.URL.revokeObjectURL(url)
+    setBlockTreeActionMessage('Exported block tree JSON.')
+  }
+
+  useEffect(() => {
+    if (!blockTreeActionMessage) return
+    const timer = window.setTimeout(() => {
+      setBlockTreeActionMessage(null)
+    }, 2200)
+    return () => window.clearTimeout(timer)
+  }, [blockTreeActionMessage])
+
+  useEffect(() => {
+    if (!blockTree) {
+      setBlockTreeSelectedNodeId(null)
+      setBlockTreePinnedDva(null)
+      setBlockTreeHoveredDva(null)
+      return
+    }
+
+    const selectedStillExists =
+      blockTreeSelectedNodeId !== null && blockTreeNodesById.has(blockTreeSelectedNodeId)
+    if (!selectedStillExists) {
+      setBlockTreeSelectedNodeId(blockTreeRootNode?.id ?? null)
+    }
+
+    const pinnedRefValid =
+      blockTreePinnedDva !== null &&
+      blockTreeNodesById.get(blockTreePinnedDva.nodeId)?.dvas?.[blockTreePinnedDva.index] !==
+        undefined
+    if (!pinnedRefValid) {
+      setBlockTreePinnedDva(null)
+    }
+
+    const hoveredRefValid =
+      blockTreeHoveredDva !== null &&
+      blockTreeNodesById.get(blockTreeHoveredDva.nodeId)?.dvas?.[blockTreeHoveredDva.index] !==
+        undefined
+    if (!hoveredRefValid) {
+      setBlockTreeHoveredDva(null)
+    }
+  }, [
+    blockTree,
+    blockTreeHoveredDva,
+    blockTreeNodesById,
+    blockTreePinnedDva,
+    blockTreeRootNode,
+    blockTreeSelectedNodeId,
+  ])
+
   const fetchObjsetDataChunk = useCallback(
     async (scope: ObjectScope, objid: number, offset: number, limit: number) => {
       if (!selectedPool) throw new Error('No pool selected')
@@ -5161,6 +5405,10 @@ function App() {
       setCenterView('explore')
     }
   }, [centerView, isObjsetPlainFile])
+
+  useEffect(() => {
+    setHexFocusedDva(null)
+  }, [objectScope.key, selectedObject, selectedPool])
 
   useEffect(() => {
     if (
@@ -5322,12 +5570,12 @@ function App() {
       return
     }
 
-    if (!firstDataDva) {
+    if (!activeHexSource) {
       setHexError('No readable DVA found for this object.')
       return
     }
 
-    const { dva } = firstDataDva
+    const { dva } = activeHexSource
     const limit = 64 * 1024
     const key = `${selectedPool}:${selectedObject}:${dva.vdev}:${dva.offset}:${dva.asize}:${limit}`
     if (hexRequestKey.current === key) {
@@ -5356,7 +5604,7 @@ function App() {
       .finally(() => {
         setHexLoading(false)
       })
-  }, [selectedPool, selectedObject, rawView, firstDataDva])
+  }, [selectedPool, selectedObject, rawView, activeHexSource])
 
   useEffect(() => {
     if (
@@ -6563,6 +6811,7 @@ function App() {
       const children = blockTreeChildrenByParent.get(node.id) ?? []
       const hasChildren = children.length > 0
       const expanded = blockTreeExpanded[node.id] ?? depth < 1
+      const isSelected = blockTreeSelectedNode?.id === node.id
       const title =
         node.kind === 'dnode'
           ? `dnode object ${node.object ?? selectedObject ?? '—'}`
@@ -6573,50 +6822,8 @@ function App() {
         node.kind === 'dnode'
           ? `nlevels ${node.nlevels ?? '—'} · nblkptr ${node.nblkptr ?? '—'}`
           : `L${node.level ?? '?'} · blkid ${node.blkid ?? '—'} · type ${node.type ?? '—'}`
-      const flags = (
-        node.kind === 'blkptr'
-          ? [
-              node.is_hole ? 'hole' : null,
-              node.is_embedded ? 'embedded' : null,
-              node.is_gang ? 'gang' : null,
-              node.dedup ? 'dedup' : null,
-              node.is_spill ? 'spill' : null,
-            ]
-          : []
-      ).filter(Boolean) as string[]
-
-      const details: Array<{ key: string; value: string }> =
-        node.kind === 'dnode'
-          ? [
-              { key: 'object', value: String(node.object ?? selectedObject ?? '—') },
-              { key: 'nlevels', value: String(node.nlevels ?? '—') },
-              { key: 'nblkptr', value: String(node.nblkptr ?? '—') },
-              { key: 'indblkshift', value: String(node.indblkshift ?? '—') },
-              {
-                key: 'datablksz',
-                value: node.datablksz === undefined ? '—' : formatAddr(node.datablksz),
-              },
-              { key: 'maxblkid', value: String(node.maxblkid ?? '—') },
-              { key: 'spill', value: node.has_spill ? 'yes' : 'no' },
-            ]
-          : [
-              { key: 'edge', value: node.is_spill ? 'spill' : String(node.edge_index ?? '—') },
-              { key: 'level', value: `L${node.level ?? '—'}` },
-              { key: 'blkid', value: String(node.blkid ?? '—') },
-              { key: 'type', value: String(node.type ?? '—') },
-              { key: 'lsize', value: node.lsize === undefined ? '—' : formatAddr(node.lsize) },
-              { key: 'psize', value: node.psize === undefined ? '—' : formatAddr(node.psize) },
-              { key: 'asize', value: node.asize === undefined ? '—' : formatAddr(node.asize) },
-              { key: 'birth txg', value: String(node.birth_txg ?? '—') },
-              { key: 'logical birth', value: String(node.logical_birth ?? '—') },
-              { key: 'physical birth', value: String(node.physical_birth ?? '—') },
-              { key: 'fill', value: String(node.fill ?? '—') },
-              { key: 'checksum', value: String(node.checksum ?? '—') },
-              { key: 'compression', value: String(node.compression ?? '—') },
-              { key: 'ndvas', value: String(node.ndvas ?? 0) },
-              { key: 'child slots', value: String(node.child_slots ?? 0) },
-              ...(flags.length > 0 ? [{ key: 'flags', value: flags.join(', ') }] : []),
-            ]
+      const details = getBlockTreeNodeDetails(node)
+      const flags = getBlockTreeFlagBadges(node)
 
       return (
         <div className="block-tree-node" key={node.id}>
@@ -6630,10 +6837,14 @@ function App() {
             >
               {hasChildren ? '▸' : '•'}
             </button>
-            <div className="block-tree-node-title-wrap">
+            <button
+              type="button"
+              className={`block-tree-node-select ${isSelected ? 'is-selected' : ''}`}
+              onClick={() => setBlockTreeSelectedNodeId(node.id)}
+            >
               <div className="block-tree-node-title">{title}</div>
               <div className="block-tree-node-subtitle">{subtitle}</div>
-            </div>
+            </button>
           </div>
 
           <div className="block-tree-node-body" style={{ marginLeft: `${depth * 18 + 28}px` }}>
@@ -6644,18 +6855,59 @@ function App() {
                   <span className="pool-vdev-meta-value">{entry.value}</span>
                 </div>
               ))}
-              {node.dvas &&
-                node.dvas.map((dva, idx) => (
-                  <div className="pool-vdev-meta-row block-tree-meta-row" key={`${node.id}-dva-${idx}`}>
-                    <span className="pool-vdev-meta-key">{`dva[${idx}]`}</span>
-                    <span className="pool-vdev-meta-value">
-                      {`vdev ${dva.vdev} · off ${formatAddr(dva.offset)} · asize ${formatAddr(
-                        dva.asize
-                      )}${dva.is_gang ? ' · gang' : ''}`}
-                    </span>
-                  </div>
-                ))}
             </div>
+            {flags.length > 0 && (
+              <div className="block-tree-flags" aria-label="Block pointer flags">
+                {flags.map(flag => (
+                  <span
+                    key={`${node.id}-${flag.label}`}
+                    className={`block-tree-flag-badge ${flag.active ? 'is-active' : 'is-inactive'}`}
+                    title={flag.hint}
+                  >
+                    {flag.label}
+                  </span>
+                ))}
+              </div>
+            )}
+            {node.dvas && node.dvas.length > 0 && (
+              <div className="block-tree-dvas">
+                {node.dvas.map((dva, idx) => {
+                  const isFocused =
+                    blockTreeFocusedDva?.node.id === node.id && blockTreeFocusedDva.index === idx
+                  return (
+                    <button
+                      key={`${node.id}-dva-${idx}`}
+                      type="button"
+                      className={`block-tree-dva-row ${isFocused ? 'is-active' : ''}`}
+                      title="Click to inspect DVA details; double-click to preview raw block hex"
+                      onClick={() => {
+                        setBlockTreeSelectedNodeId(node.id)
+                        setBlockTreePinnedDva({ nodeId: node.id, index: idx })
+                      }}
+                      onDoubleClick={() => openDvaHexPreview(node.id, idx, dva)}
+                      onMouseEnter={() => setBlockTreeHoveredDva({ nodeId: node.id, index: idx })}
+                      onMouseLeave={() =>
+                        setBlockTreeHoveredDva(prev =>
+                          prev && prev.nodeId === node.id && prev.index === idx ? null : prev
+                        )
+                      }
+                      onFocus={() => setBlockTreeHoveredDva({ nodeId: node.id, index: idx })}
+                      onBlur={() =>
+                        setBlockTreeHoveredDva(prev =>
+                          prev && prev.nodeId === node.id && prev.index === idx ? null : prev
+                        )
+                      }
+                    >
+                      <span>{`dva[${idx}]`}</span>
+                      <span>{`vdev ${dva.vdev}`}</span>
+                      <span>{`off ${formatAddr(dva.offset)}`}</span>
+                      <span>{`asize ${formatAddr(dva.asize)}`}</span>
+                      {dva.is_gang && <span>gang</span>}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
           </div>
 
           {hasChildren && expanded && (
@@ -6718,6 +6970,24 @@ function App() {
           >
             Collapse
           </button>
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={() => {
+              void copyBlockTreeJson()
+            }}
+            disabled={!blockTree}
+          >
+            Copy JSON
+          </button>
+          <button
+            type="button"
+            className="fs-action-btn"
+            onClick={exportBlockTreeJson}
+            disabled={!blockTree}
+          >
+            Export JSON
+          </button>
         </div>
 
         {blockTreeError && (
@@ -6725,42 +6995,168 @@ function App() {
             <strong>Block tree:</strong> {blockTreeError}
           </div>
         )}
-
-        {blockTree && (
-          <dl className="info-grid block-tree-summary">
-            <div>
-              <dt>Scope</dt>
-              <dd>{blockTreeScopeLabel}</dd>
-            </div>
-            <div>
-              <dt>Object</dt>
-              <dd>{blockTree.object}</dd>
-            </div>
-            <div>
-              <dt>Nodes</dt>
-              <dd>
-                {blockTreeNodesById.size} / {blockTree.max_nodes}
-              </dd>
-            </div>
-            <div>
-              <dt>Expanded</dt>
-              <dd>{blockTreeExpandedNodeCount}</dd>
-            </div>
-            <div>
-              <dt>Depth cap</dt>
-              <dd>{blockTree.max_depth}</dd>
-            </div>
-            <div>
-              <dt>Truncated</dt>
-              <dd>{blockTree.truncated ? 'yes' : 'no'}</dd>
-            </div>
-          </dl>
-        )}
+        {blockTreeActionMessage && <p className="muted block-tree-action-message">{blockTreeActionMessage}</p>}
 
         <div className="block-tree-scroll">
           {blockTreeLoading && <p className="muted">Loading block tree…</p>}
           {!blockTreeLoading && !blockTree && !blockTreeError && (
             <p className="muted">Select an object and open Physical view to load the block tree.</p>
+          )}
+          {blockTree && (
+            <dl className="info-grid block-tree-summary">
+              <div>
+                <dt>Scope</dt>
+                <dd>{blockTreeScopeLabel}</dd>
+              </div>
+              <div>
+                <dt>Object</dt>
+                <dd>{blockTree.object}</dd>
+              </div>
+              <div>
+                <dt>Nodes</dt>
+                <dd>
+                  {blockTreeNodesById.size} / {blockTree.max_nodes}
+                </dd>
+              </div>
+              <div>
+                <dt>Expanded</dt>
+                <dd>{blockTreeExpandedNodeCount}</dd>
+              </div>
+              <div>
+                <dt>Depth cap</dt>
+                <dd>{blockTree.max_depth}</dd>
+              </div>
+              <div>
+                <dt>Truncated</dt>
+                <dd>{blockTree.truncated ? 'yes' : 'no'}</dd>
+              </div>
+            </dl>
+          )}
+          {(blockTreeSelectedNode || blockTreeFocusedDva) && (
+            <div className="block-tree-detail-grid">
+              <section className="block-tree-detail-panel">
+                <h4>Node Detail</h4>
+                {!blockTreeSelectedNode && (
+                  <p className="muted">Select a node to inspect it here.</p>
+                )}
+                {blockTreeSelectedNode && (
+                  <>
+                    <p className="muted">
+                      {blockTreeSelectedNode.kind === 'dnode'
+                        ? `dnode ${blockTreeSelectedNode.object ?? selectedObject ?? '—'}`
+                        : `blkptr edge ${blockTreeSelectedNode.edge_index ?? '—'} at L${
+                            blockTreeSelectedNode.level ?? '—'
+                          }`}
+                    </p>
+                    <div className="pool-vdev-meta-table block-tree-meta-table">
+                      {getBlockTreeNodeDetails(blockTreeSelectedNode).map((entry, idx) => (
+                        <div
+                          className="pool-vdev-meta-row block-tree-meta-row"
+                          key={`${blockTreeSelectedNode.id}-detail-${idx}`}
+                        >
+                          <span className="pool-vdev-meta-key">{entry.key}</span>
+                          <span className="pool-vdev-meta-value">{entry.value}</span>
+                        </div>
+                      ))}
+                    </div>
+                    {getBlockTreeFlagBadges(blockTreeSelectedNode).length > 0 && (
+                      <div className="block-tree-flags">
+                        {getBlockTreeFlagBadges(blockTreeSelectedNode).map(flag => (
+                          <span
+                            key={`${blockTreeSelectedNode.id}-detail-${flag.label}`}
+                            className={`block-tree-flag-badge ${
+                              flag.active ? 'is-active' : 'is-inactive'
+                            }`}
+                            title={flag.hint}
+                          >
+                            {flag.label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </section>
+              <section className="block-tree-detail-panel">
+                <h4>DVA Detail</h4>
+                {!blockTreeFocusedDva && (
+                  <p className="muted">
+                    Hover or click a DVA row to inspect vdev + offset details.
+                  </p>
+                )}
+                {blockTreeFocusedDva && (
+                  <>
+                    <p className="muted">
+                      node #{blockTreeFocusedDva.node.id} · dva[{blockTreeFocusedDva.index}]
+                    </p>
+                    <div className="block-tree-detail-actions">
+                      <button
+                        type="button"
+                        className="fs-action-btn"
+                        onClick={() =>
+                          openDvaHexPreview(
+                            blockTreeFocusedDva.node.id,
+                            blockTreeFocusedDva.index,
+                            blockTreeFocusedDva.dva
+                          )
+                        }
+                      >
+                        Preview Hex
+                      </button>
+                      <button
+                        type="button"
+                        className="fs-action-btn"
+                        onClick={() => {
+                          void copyDvaZdbReadCommand(blockTreeFocusedDva.dva)
+                        }}
+                      >
+                        Copy zdb -R
+                      </button>
+                    </div>
+                    <div className="pool-vdev-meta-table block-tree-meta-table">
+                      <div className="pool-vdev-meta-row block-tree-meta-row">
+                        <span className="pool-vdev-meta-key">vdev</span>
+                        <span className="pool-vdev-meta-value">{blockTreeFocusedDva.dva.vdev}</span>
+                      </div>
+                      <div className="pool-vdev-meta-row block-tree-meta-row">
+                        <span className="pool-vdev-meta-key">offset</span>
+                        <span className="pool-vdev-meta-value">
+                          {formatAddr(blockTreeFocusedDva.dva.offset)} (
+                          {blockTreeFocusedDva.dva.offset})
+                        </span>
+                      </div>
+                      <div className="pool-vdev-meta-row block-tree-meta-row">
+                        <span className="pool-vdev-meta-key">asize</span>
+                        <span className="pool-vdev-meta-value">
+                          {formatAddr(blockTreeFocusedDva.dva.asize)} (
+                          {blockTreeFocusedDva.dva.asize} B)
+                        </span>
+                      </div>
+                      <div className="pool-vdev-meta-row block-tree-meta-row">
+                        <span className="pool-vdev-meta-key">is_gang</span>
+                        <span className="pool-vdev-meta-value">
+                          {blockTreeFocusedDva.dva.is_gang ? 'yes' : 'no'}
+                        </span>
+                      </div>
+                      <div className="pool-vdev-meta-row block-tree-meta-row">
+                        <span className="pool-vdev-meta-key">edge</span>
+                        <span className="pool-vdev-meta-value">
+                          {blockTreeFocusedDva.node.is_spill
+                            ? 'spill'
+                            : String(blockTreeFocusedDva.node.edge_index ?? '—')}
+                        </span>
+                      </div>
+                      <div className="pool-vdev-meta-row block-tree-meta-row">
+                        <span className="pool-vdev-meta-key">level</span>
+                        <span className="pool-vdev-meta-value">
+                          L{blockTreeFocusedDva.node.level ?? '—'}
+                        </span>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </section>
+            </div>
           )}
           {!blockTreeLoading && blockTree && blockTreeRootNode && renderNode(blockTreeRootNode, 0)}
           {!blockTreeLoading && blockTree && !blockTreeRootNode && (
@@ -10381,11 +10777,7 @@ function App() {
                           {!hexLoading && !hexError && hexDump && (
                             <div className="raw-hex">
                               <div className="raw-hex-meta">
-                                {firstDataDva && (
-                                  <span>
-                                    blkptr {firstDataDva.bpIndex} · DVA {firstDataDva.dvaIndex}
-                                  </span>
-                                )}
+                                {activeHexSource && <span>{activeHexSource.label}</span>}
                                 <span>vdev {hexDump.vdev}</span>
                                 <span>off {formatAddr(hexDump.offset)}</span>
                                 <span>
