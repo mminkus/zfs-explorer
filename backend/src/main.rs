@@ -271,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(api::objset_read_data),
         )
         .route(
-            "/api/pools/{pool}/zpl/path/*zpl_path",
+            "/api/pools/{pool}/zpl/path/{*zpl_path}",
             get(api::zpl_path_download),
         )
         .route(

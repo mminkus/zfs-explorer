@@ -238,6 +238,34 @@ sudo build/test-offline-fixture.sh \
   --search-paths "$(pwd)/fixtures/offline/zdx_fixture"
 ```
 
+Create and validate corpus fixtures (layout/profile matrix):
+
+```bash
+# generate exported corpus fixture
+build/create-corpus-fixture.sh \
+  --pool zdx_mirror_base \
+  --layout mirror \
+  --profile baseline \
+  --force
+
+# run smoke checks + file checksum validation from manifest
+sudo build/test-corpus-fixture.sh \
+  --manifest fixtures/corpus/vdevtype=mirror/features=baseline/zdx_mirror_base/manifest.json
+```
+
+Run a focused OpenZFS ZTS smoke set (non-root user with passwordless sudo):
+
+```bash
+# list default "corpus" smoke tests
+build/run-zts-smoke.sh --list
+
+# run corpus profile smoke checks using sparse file-vdevs
+build/run-zts-smoke.sh --profile corpus
+
+# continue after failures and include extra zfs-tests.sh args
+build/run-zts-smoke.sh --profile extended --keep-going -- -v
+```
+
 ## Project Structure
 
 ```

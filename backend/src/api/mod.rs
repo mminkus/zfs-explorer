@@ -3066,7 +3066,8 @@ fn sanitize_download_filename(raw: &str) -> String {
     cleaned
 }
 
-/// GET /api/pools/:pool/zpl/path/<path> (supports single HTTP Range request)
+/// GET /api/pools/{pool}/zpl/path/{*zpl_path}
+/// (supports single HTTP Range request)
 pub async fn zpl_path_download(
     State(state): State<AppState>,
     Path((pool, zpl_path)): Path<(String, String)>,
