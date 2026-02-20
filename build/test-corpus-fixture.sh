@@ -132,35 +132,109 @@ echo "==> Verifying known file checksums"
 known_count="$(jq '.known_files | length' "$MANIFEST")"
 if [[ "$known_count" -eq 0 ]]; then
   echo "warning: manifest has no known_files; skipping checksum checks"
-  exit 0
+else
+  failures=0
+  while IFS= read -r row; do
+    path="$(jq -r '.path' <<<"$row")"
+    expected="$(jq -r '.sha256' <<<"$row")"
+    tmp_file="$(mktemp /tmp/zdx-corpus-file.XXXXXX.bin)"
+
+    if ! curl -fsS --path-as-is "$BASE_URL/api/pools/$POOL/zpl/path/$path" -o "$tmp_file"; then
+      echo "FAIL: download failed for $path" >&2
+      failures=$((failures + 1))
+      rm -f "$tmp_file"
+      continue
+    fi
+
+    got="$(sha256sum "$tmp_file" | awk '{print $1}')"
+    rm -f "$tmp_file"
+    if [[ "$got" != "$expected" ]]; then
+      echo "FAIL: checksum mismatch for $path" >&2
+      echo "      expected: $expected" >&2
+      echo "      got:      $got" >&2
+      failures=$((failures + 1))
+    else
+      echo "OK: $path"
+    fi
+  done < <(jq -c '.known_files[]' "$MANIFEST")
+
+  if [[ "$failures" -ne 0 ]]; then
+    echo
+    echo "Corpus validation failed: $failures checksum mismatches." >&2
+    exit 1
+  fi
 fi
 
-failures=0
-while IFS= read -r row; do
-  path="$(jq -r '.path' <<<"$row")"
-  expected="$(jq -r '.sha256' <<<"$row")"
-  tmp_file="$(mktemp /tmp/zdx-corpus-file.XXXXXX.bin)"
-
-  if ! curl -fsS --path-as-is "$BASE_URL/api/pools/$POOL/zpl/path/$path" -o "$tmp_file"; then
-    echo "FAIL: download failed for $path" >&2
-    failures=$((failures + 1))
-    rm -f "$tmp_file"
-    continue
-  fi
-
-  got="$(sha256sum "$tmp_file" | awk '{print $1}')"
-  rm -f "$tmp_file"
-  if [[ "$got" != "$expected" ]]; then
-    echo "FAIL: checksum mismatch for $path" >&2
-    echo "      expected: $expected" >&2
-    echo "      got:      $got" >&2
-    failures=$((failures + 1))
+echo "==> Validating encrypted dataset expectations"
+enc_count="$(jq '(.expectations.encrypted_datasets // []) | length' "$MANIFEST")"
+if [[ "$enc_count" -gt 0 ]]; then
+  check_failures=0
+  tree_json="$(curl -fsS "$BASE_URL/api/pools/$POOL/datasets/tree" || true)"
+  if [[ -z "$tree_json" ]]; then
+    echo "FAIL: failed to fetch dataset tree for encrypted expectation checks" >&2
+    check_failures=$((check_failures + 1))
   else
-    echo "OK: $path"
-  fi
-done < <(jq -c '.known_files[]' "$MANIFEST")
+    while IFS= read -r dataset_name; do
+      dsl_obj="$(
+        jq -r --arg target "$dataset_name" '
+          def walk($prefix):
+            . as $node
+            | ($prefix + [$node.name]) as $parts
+            | ({full: ($parts | join("/")), dsl: $node.dsl_dir_obj}),
+              ($node.children[]? | walk($parts));
+          .root
+          | walk([])
+          | select(.full == $target)
+          | .dsl
+          | tostring
+        ' <<<"$tree_json" | head -n 1
+      )"
+      if [[ -z "$dsl_obj" || "$dsl_obj" == "null" ]]; then
+        echo "FAIL: encrypted dataset '$dataset_name' not found in dataset tree" >&2
+        check_failures=$((check_failures + 1))
+        continue
+      fi
 
-if [[ "$failures" -ne 0 ]]; then
+      head_json="$(curl -fsS "$BASE_URL/api/pools/$POOL/dataset/$dsl_obj/head" || true)"
+      objset_id="$(jq -r '.objset_id // empty' <<<"$head_json")"
+      if [[ -z "$objset_id" ]]; then
+        echo "FAIL: could not resolve objset for encrypted dataset '$dataset_name'" >&2
+        check_failures=$((check_failures + 1))
+        continue
+      fi
+
+      zap_url="$BASE_URL/api/pools/$POOL/objset/$objset_id/obj/1/zap/info"
+      zap_body_file="$(mktemp /tmp/zdx-corpus-zap-body.XXXXXX.json)"
+      zap_status="$(
+        curl -sS -o "$zap_body_file" -w "%{http_code}" "$zap_url" || true
+      )"
+      if [[ "$zap_status" != "400" ]]; then
+        echo "FAIL: expected HTTP 400 for encrypted dataset '$dataset_name' objset=$objset_id obj=1 (got $zap_status)" >&2
+        check_failures=$((check_failures + 1))
+        rm -f "$zap_body_file"
+        continue
+      fi
+      zap_code="$(jq -r '.code // empty' "$zap_body_file")"
+      rm -f "$zap_body_file"
+      if [[ "$zap_code" != "ZAP_UNREADABLE" ]]; then
+        echo "FAIL: expected ZAP_UNREADABLE for encrypted dataset '$dataset_name' objset=$objset_id obj=1 (got '$zap_code')" >&2
+        check_failures=$((check_failures + 1))
+        continue
+      fi
+      echo "OK: encrypted dataset '$dataset_name' reports ZAP_UNREADABLE without key material"
+    done < <(jq -r '.expectations.encrypted_datasets[]' "$MANIFEST")
+  fi
+
+  if [[ "$check_failures" -ne 0 ]]; then
+    echo
+    echo "Corpus validation failed: $check_failures encrypted expectation check(s) failed." >&2
+    exit 1
+  fi
+else
+  echo "warning: manifest has no encrypted_datasets expectations; skipping"
+fi
+
+if [[ "${failures:-0}" -ne 0 ]]; then
   echo
   echo "Corpus validation failed: $failures checksum mismatches." >&2
   exit 1

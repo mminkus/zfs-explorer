@@ -16,7 +16,7 @@ Options:
   --pool <name>        Pool name (default: zdx_corpus)
   --layout <type>      Vdev layout: single|mirror|raidz1|raidz2|raidz3
                        (default: mirror)
-  --profile <name>     Feature profile: baseline|dedup|embedded-zstd
+  --profile <name>     Feature profile: baseline|dedup|embedded-zstd|encryption-no-key
                        (default: baseline)
   --root <path>        Corpus root directory (default: fixtures/corpus)
   --size <value>       Per-vdev image size for truncate (default: 512M)
@@ -89,7 +89,7 @@ case "$LAYOUT" in
 esac
 
 case "$PROFILE" in
-  baseline|dedup|embedded-zstd) ;;
+  baseline|dedup|embedded-zstd|encryption-no-key) ;;
   *)
     echo "error: unsupported profile '$PROFILE'" >&2
     exit 2
@@ -128,6 +128,9 @@ POOL_CREATED=0
 cleanup() {
   if [[ "$POOL_CREATED" -eq 1 ]] && sudo zpool list -H -o name "$POOL" >/dev/null 2>&1; then
     sudo zpool export "$POOL" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${encrypted_keyfile:-}" ]]; then
+    rm -f "$encrypted_keyfile" >/dev/null 2>&1 || true
   fi
   rm -rf "$MNT"
 }
@@ -178,6 +181,8 @@ sudo zfs create "$POOL/data/media"
 compression="lz4"
 recordsize="128K"
 dedup="off"
+encrypted_dataset=""
+encrypted_keyfile=""
 
 case "$PROFILE" in
   baseline)
@@ -195,6 +200,13 @@ case "$PROFILE" in
     recordsize="16K"
     dedup="off"
     ;;
+  encryption-no-key)
+    compression="lz4"
+    recordsize="128K"
+    dedup="off"
+    encrypted_dataset="$POOL/enc"
+    encrypted_keyfile="$FIXTURE_DIR/enc.key"
+    ;;
 esac
 
 sudo zfs set compression="$compression" "$POOL/data"
@@ -203,13 +215,31 @@ sudo zfs set dedup="$dedup" "$POOL/data"
 sudo zfs set atime=off "$POOL/data"
 sudo zfs set xattr=sa "$POOL/data"
 
+if [[ -n "$encrypted_dataset" ]]; then
+  echo "==> Creating encrypted dataset '$encrypted_dataset' (key intentionally removed)"
+  sudo dd if=/dev/urandom of="$encrypted_keyfile" bs=32 count=1 status=none
+  sudo zfs create \
+    -o encryption=on \
+    -o keyformat=raw \
+    -o keylocation="file://$encrypted_keyfile" \
+    "$encrypted_dataset"
+fi
+
 sudo sh -c "echo 'zfs-explorer corpus fixture (${LAYOUT}/${PROFILE})' > '$MNT/$POOL/data/docs/readme.txt'"
 sudo dd if=/dev/urandom of="$MNT/$POOL/data/media/seed.bin" bs=1M count=8 status=none
+if [[ -n "$encrypted_dataset" ]]; then
+  sudo sh -c "echo 'encrypted fixture payload' > '$MNT/$encrypted_dataset/secret.txt'"
+fi
 
 if [[ "$PROFILE" == "dedup" ]]; then
   for i in $(seq 1 16); do
     sudo cp "$MNT/$POOL/data/media/seed.bin" "$MNT/$POOL/data/media/clone-$i.bin"
   done
+fi
+
+if [[ -n "$encrypted_dataset" ]]; then
+  sudo zfs unload-key "$encrypted_dataset" >/dev/null 2>&1 || true
+  rm -f "$encrypted_keyfile"
 fi
 
 sudo zfs snapshot "$POOL/data@seed"
@@ -246,7 +276,7 @@ echo "==> Exporting pool '$POOL'"
 sudo zpool export "$POOL"
 POOL_CREATED=0
 
-export POOL LAYOUT PROFILE SIZE FIXTURE_DIR MANIFEST compression recordsize dedup pool_guid ddt_entries
+export POOL LAYOUT PROFILE SIZE FIXTURE_DIR MANIFEST compression recordsize dedup pool_guid ddt_entries encrypted_dataset
 export KNOWN_LINES_FILE="$known_lines_file"
 export FEATURE_LINES_FILE="$feature_lines_file"
 
@@ -266,6 +296,7 @@ recordsize = os.environ["recordsize"]
 dedup = os.environ["dedup"]
 pool_guid = os.environ["pool_guid"]
 ddt_entries = int(os.environ["ddt_entries"])
+encrypted_dataset = os.environ.get("encrypted_dataset", "")
 
 known_files = []
 with open(os.environ["KNOWN_LINES_FILE"], "r", encoding="utf-8") as fh:
@@ -312,6 +343,12 @@ manifest = {
         "ddt_entries": ddt_entries,
     },
 }
+
+if encrypted_dataset:
+    manifest["expectations"] = {
+        "encrypted_datasets": [encrypted_dataset],
+        "zap_unreadable_expected": True,
+    }
 
 with open(manifest_path, "w", encoding="utf-8") as fh:
     json.dump(manifest, fh, indent=2)

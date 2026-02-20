@@ -248,9 +248,20 @@ build/create-corpus-fixture.sh \
   --profile baseline \
   --force
 
+# generate encrypted dataset fixture (no key material available offline)
+build/create-corpus-fixture.sh \
+  --pool zdx_enc_nokey \
+  --layout single \
+  --profile encryption-no-key \
+  --force
+
 # run smoke checks + file checksum validation from manifest
 sudo build/test-corpus-fixture.sh \
   --manifest fixtures/corpus/vdevtype=mirror/features=baseline/zdx_mirror_base/manifest.json
+
+# run the default minimal corpus subset (mirror + raidz1 + encryption-no-key)
+sudo build/test-corpus-subset.sh --list
+sudo build/test-corpus-subset.sh
 ```
 
 Run a focused OpenZFS ZTS smoke set (non-root user with passwordless sudo):
