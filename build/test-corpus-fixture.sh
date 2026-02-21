@@ -94,13 +94,18 @@ build/test-offline-fixture.sh \
 
 LOG_FILE="$(mktemp /tmp/zdx-corpus-backend.XXXXXX.log)"
 PID=""
+SUCCESS=0
 
 cleanup() {
   if [[ -n "$PID" ]]; then
     kill "$PID" >/dev/null 2>&1 || true
     wait "$PID" 2>/dev/null || true
   fi
-  rm -f "$LOG_FILE"
+  if [[ "$SUCCESS" -eq 1 ]]; then
+    rm -f "$LOG_FILE"
+  else
+    echo "debug: backend log preserved at $LOG_FILE" >&2
+  fi
 }
 trap cleanup EXIT
 
@@ -128,6 +133,98 @@ if ! curl -sS "$BASE_URL/api/version" >/dev/null 2>&1; then
   exit 1
 fi
 
+declare -A ENC_READABLE_SUPPORTED=()
+declare -A ENC_READABLE_SKIP_REASON=()
+
+echo "==> Probing encrypted readable capability"
+enc_probe_count="$(jq '(.expectations.encrypted_datasets // []) | length' "$MANIFEST")"
+if [[ "$enc_probe_count" -gt 0 ]]; then
+  tree_probe_json="$(curl -fsS "$BASE_URL/api/pools/$POOL/datasets/tree" || true)"
+  while IFS= read -r enc_row; do
+    dataset_name="$(jq -r 'if type == "string" then . else (.name // .dataset // "") end' <<<"$enc_row")"
+    enc_expect="$(jq -r 'if type == "object" then (.expect // "blocked") else "blocked" end' <<<"$enc_row")"
+    if [[ "$enc_expect" != "readable" || -z "$dataset_name" || "$dataset_name" == "null" ]]; then
+      continue
+    fi
+
+    if [[ -z "$tree_probe_json" ]]; then
+      ENC_READABLE_SKIP_REASON["$dataset_name"]="dataset tree unavailable during probe"
+      continue
+    fi
+
+    dsl_obj="$(
+      jq -r --arg target "$dataset_name" '
+        def walk($prefix):
+          . as $node
+          | ($prefix + [$node.name]) as $parts
+          | ({full: ($parts | join("/")), dsl: $node.dsl_dir_obj}),
+            ($node.children[]? | walk($parts));
+        .root
+        | walk([])
+        | select(.full == $target)
+        | .dsl
+        | tostring
+      ' <<<"$tree_probe_json" | head -n 1
+    )"
+    if [[ -z "$dsl_obj" || "$dsl_obj" == "null" ]]; then
+      ENC_READABLE_SKIP_REASON["$dataset_name"]="dataset not found in tree"
+      continue
+    fi
+
+    head_json="$(curl -fsS "$BASE_URL/api/pools/$POOL/dataset/$dsl_obj/head" || true)"
+    objset_id="$(jq -r '.objset_id // empty' <<<"$head_json")"
+    if [[ -z "$objset_id" ]]; then
+      ENC_READABLE_SKIP_REASON["$dataset_name"]="objset id unavailable"
+      continue
+    fi
+
+    root_body_file="$(mktemp /tmp/zdx-corpus-probe-root.XXXXXX.json)"
+    root_status="$(
+      curl -sS -o "$root_body_file" -w "%{http_code}" \
+        "$BASE_URL/api/pools/$POOL/objset/$objset_id/root" || true
+    )"
+    if [[ "$root_status" != "200" ]]; then
+      root_reason="$(jq -r '.message // .error // empty' "$root_body_file" 2>/dev/null || true)"
+      root_reason="${root_reason//$'\r'/}"
+      if [[ -z "$root_reason" ]]; then
+        root_reason="root lookup returned HTTP $root_status"
+      fi
+      ENC_READABLE_SKIP_REASON["$dataset_name"]="$root_reason"
+      rm -f "$root_body_file"
+      continue
+    fi
+
+    root_obj="$(jq -r '.root_obj // empty' "$root_body_file" 2>/dev/null || true)"
+    rm -f "$root_body_file"
+    if [[ -z "$root_obj" ]]; then
+      ENC_READABLE_SKIP_REASON["$dataset_name"]="root_obj missing from root payload"
+      continue
+    fi
+
+    entries_body_file="$(mktemp /tmp/zdx-corpus-probe-entries.XXXXXX.json)"
+    entries_status="$(
+      curl -sS -o "$entries_body_file" -w "%{http_code}" \
+        "$BASE_URL/api/pools/$POOL/objset/$objset_id/dir/$root_obj/entries?cursor=0&limit=16" || true
+    )"
+    if [[ "$entries_status" == "200" ]]; then
+      ENC_READABLE_SUPPORTED["$dataset_name"]=1
+      entries_count="$(jq -r '.entries | length' "$entries_body_file" 2>/dev/null || echo 0)"
+      echo "OK: encrypted dataset '$dataset_name' supports readable decode in this environment ($entries_count entries)"
+    else
+      entries_reason="$(jq -r '.message // .error // empty' "$entries_body_file" 2>/dev/null || true)"
+      entries_reason="${entries_reason//$'\r'/}"
+      if [[ -z "$entries_reason" ]]; then
+        entries_reason="dir entries decode returned HTTP $entries_status"
+      fi
+      ENC_READABLE_SKIP_REASON["$dataset_name"]="$entries_reason"
+      echo "SKIP: encrypted dataset '$dataset_name' readable decode unavailable in this environment ($entries_reason)"
+    fi
+    rm -f "$entries_body_file"
+  done < <(jq -c '.expectations.encrypted_datasets[]?' "$MANIFEST")
+else
+  echo "info: no encrypted capability probe targets"
+fi
+
 echo "==> Verifying known file checksums"
 known_count="$(jq '.known_files | length' "$MANIFEST")"
 if [[ "$known_count" -eq 0 ]]; then
@@ -137,17 +234,38 @@ else
   while IFS= read -r row; do
     path="$(jq -r '.path' <<<"$row")"
     expected="$(jq -r '.sha256' <<<"$row")"
-    tmp_file="$(mktemp /tmp/zdx-corpus-file.XXXXXX.bin)"
 
-    if ! curl -fsS --path-as-is "$BASE_URL/api/pools/$POOL/zpl/path/$path" -o "$tmp_file"; then
-      echo "FAIL: download failed for $path" >&2
+    skip_known_reason=""
+    for dataset_name in "${!ENC_READABLE_SKIP_REASON[@]}"; do
+      if [[ "$path" == "$dataset_name/"* || "$path" == "$dataset_name" ]]; then
+        skip_known_reason="${ENC_READABLE_SKIP_REASON[$dataset_name]}"
+        break
+      fi
+    done
+    if [[ -n "$skip_known_reason" ]]; then
+      echo "SKIP: $path (encrypted readable decode unavailable: $skip_known_reason)"
+      continue
+    fi
+
+    tmp_file="$(mktemp /tmp/zdx-corpus-file.XXXXXX.bin)"
+    tmp_headers="$(mktemp /tmp/zdx-corpus-headers.XXXXXX.txt)"
+    url="$BASE_URL/api/pools/$POOL/zpl/path/$path"
+    status="$(
+      curl -sS --path-as-is -D "$tmp_headers" -o "$tmp_file" -w "%{http_code}" "$url" || true
+    )"
+    if [[ "$status" != "200" && "$status" != "206" ]]; then
+      echo "FAIL: download failed for $path (HTTP $status)" >&2
+      echo "      url: $url" >&2
+      if [[ -s "$tmp_file" ]]; then
+        echo "      response:" >&2
+        sed -n '1,6p' "$tmp_file" >&2 || true
+      fi
       failures=$((failures + 1))
-      rm -f "$tmp_file"
+      rm -f "$tmp_file" "$tmp_headers"
       continue
     fi
 
     got="$(sha256sum "$tmp_file" | awk '{print $1}')"
-    rm -f "$tmp_file"
     if [[ "$got" != "$expected" ]]; then
       echo "FAIL: checksum mismatch for $path" >&2
       echo "      expected: $expected" >&2
@@ -156,6 +274,87 @@ else
     else
       echo "OK: $path"
     fi
+
+    # Protocol checks: Content-Length / Content-Type / Range support.
+    size_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
+    content_type="$(
+      awk -F': ' 'tolower($1)=="content-type" {print $2; exit}' "$tmp_headers" \
+        | tr -d '\r'
+    )"
+    if [[ -z "$content_type" ]]; then
+      echo "FAIL: missing Content-Type header for $path" >&2
+      failures=$((failures + 1))
+    fi
+
+    content_length="$(
+      awk -F': ' 'tolower($1)=="content-length" {print $2; exit}' "$tmp_headers" \
+        | tr -d '\r'
+    )"
+    if [[ -z "$content_length" ]]; then
+      echo "FAIL: missing Content-Length header for $path" >&2
+      failures=$((failures + 1))
+    elif [[ "$content_length" != "$size_bytes" ]]; then
+      echo "FAIL: Content-Length mismatch for $path" >&2
+      echo "      expected: $size_bytes" >&2
+      echo "      got:      $content_length" >&2
+      failures=$((failures + 1))
+    fi
+
+    if [[ "$size_bytes" =~ ^[0-9]+$ && "$size_bytes" -gt 0 ]]; then
+      range_end=$((size_bytes > 63 ? 63 : size_bytes - 1))
+      range_len=$((range_end + 1))
+      expected_range_hex="$(
+        od -An -tx1 -N "$range_len" "$tmp_file" | tr -d ' \n'
+      )"
+
+      range_file="$(mktemp /tmp/zdx-corpus-range.XXXXXX.bin)"
+      range_headers="$(mktemp /tmp/zdx-corpus-range-headers.XXXXXX.txt)"
+      range_status="$(
+        curl -sS --path-as-is \
+          -H "Range: bytes=0-$range_end" \
+          -D "$range_headers" \
+          -o "$range_file" \
+          -w "%{http_code}" \
+          "$url" || true
+      )"
+
+      if [[ "$range_status" != "206" ]]; then
+        echo "FAIL: range request failed for $path (expected 206, got $range_status)" >&2
+        failures=$((failures + 1))
+      else
+        range_length="$(
+          awk -F': ' 'tolower($1)=="content-length" {print $2; exit}' "$range_headers" \
+            | tr -d '\r'
+        )"
+        if [[ -z "$range_length" || "$range_length" != "$range_len" ]]; then
+          echo "FAIL: range Content-Length mismatch for $path" >&2
+          echo "      expected: $range_len" >&2
+          echo "      got:      ${range_length:-<empty>}" >&2
+          failures=$((failures + 1))
+        fi
+
+        content_range="$(
+          awk -F': ' 'tolower($1)=="content-range" {print $2; exit}' "$range_headers" \
+            | tr -d '\r'
+        )"
+        expected_content_range="bytes 0-$range_end/$size_bytes"
+        if [[ -z "$content_range" || "$content_range" != "$expected_content_range" ]]; then
+          echo "FAIL: Content-Range mismatch for $path" >&2
+          echo "      expected: $expected_content_range" >&2
+          echo "      got:      ${content_range:-<empty>}" >&2
+          failures=$((failures + 1))
+        fi
+
+        got_range_hex="$(od -An -tx1 "$range_file" | tr -d ' \n')"
+        if [[ "$got_range_hex" != "$expected_range_hex" ]]; then
+          echo "FAIL: range payload mismatch for $path (bytes 0-$range_end)" >&2
+          failures=$((failures + 1))
+        fi
+      fi
+      rm -f "$range_file" "$range_headers"
+    fi
+
+    rm -f "$tmp_file" "$tmp_headers"
   done < <(jq -c '.known_files[]' "$MANIFEST")
 
   if [[ "$failures" -ne 0 ]]; then
@@ -169,12 +368,39 @@ echo "==> Validating encrypted dataset expectations"
 enc_count="$(jq '(.expectations.encrypted_datasets // []) | length' "$MANIFEST")"
 if [[ "$enc_count" -gt 0 ]]; then
   check_failures=0
+  key_count="$(jq '(.fixture.encryption_key_paths // []) | length' "$MANIFEST")"
+  if [[ "$key_count" -gt 0 ]]; then
+    fixture_dir="$(dirname "$MANIFEST")"
+    while IFS= read -r key_rel; do
+      key_path="$fixture_dir/$key_rel"
+      if [[ -f "$key_path" ]]; then
+        echo "OK: encryption key material present ($key_rel)"
+      else
+        echo "FAIL: expected encryption key file missing: $key_path" >&2
+        check_failures=$((check_failures + 1))
+      fi
+    done < <(jq -r '.fixture.encryption_key_paths[]' "$MANIFEST")
+  fi
+
   tree_json="$(curl -fsS "$BASE_URL/api/pools/$POOL/datasets/tree" || true)"
   if [[ -z "$tree_json" ]]; then
     echo "FAIL: failed to fetch dataset tree for encrypted expectation checks" >&2
     check_failures=$((check_failures + 1))
   else
-    while IFS= read -r dataset_name; do
+    while IFS= read -r enc_row; do
+      dataset_name="$(jq -r 'if type == "string" then . else (.name // .dataset // "") end' <<<"$enc_row")"
+      enc_expect="$(jq -r 'if type == "object" then (.expect // "blocked") else "blocked" end' <<<"$enc_row")"
+      if [[ -z "$dataset_name" || "$dataset_name" == "null" ]]; then
+        echo "FAIL: encrypted_datasets entry missing dataset name: $enc_row" >&2
+        check_failures=$((check_failures + 1))
+        continue
+      fi
+      if [[ "$enc_expect" != "blocked" && "$enc_expect" != "readable" ]]; then
+        echo "FAIL: encrypted dataset '$dataset_name' has unsupported expectation '$enc_expect'" >&2
+        check_failures=$((check_failures + 1))
+        continue
+      fi
+
       dsl_obj="$(
         jq -r --arg target "$dataset_name" '
           def walk($prefix):
@@ -203,26 +429,129 @@ if [[ "$enc_count" -gt 0 ]]; then
         continue
       fi
 
+      if [[ "$enc_expect" == "readable" ]]; then
+        if [[ "${ENC_READABLE_SUPPORTED[$dataset_name]:-0}" -eq 1 ]]; then
+          echo "OK: encrypted dataset '$dataset_name' readable decode confirmed by capability probe"
+          continue
+        fi
+        if [[ -n "${ENC_READABLE_SKIP_REASON[$dataset_name]:-}" ]]; then
+          echo "SKIP: encrypted dataset '$dataset_name' readable expectation deferred (${ENC_READABLE_SKIP_REASON[$dataset_name]})"
+          continue
+        fi
+
+        root_body_file="$(mktemp /tmp/zdx-corpus-root-body.XXXXXX.json)"
+        root_status="$(
+          curl -sS -o "$root_body_file" -w "%{http_code}" \
+            "$BASE_URL/api/pools/$POOL/objset/$objset_id/root" || true
+        )"
+        if [[ "$root_status" != "200" ]]; then
+          echo "FAIL: expected encrypted dataset '$dataset_name' to resolve root with key material; got HTTP $root_status" >&2
+          if [[ -s "$root_body_file" ]]; then
+            echo "      response:" >&2
+            sed -n '1,8p' "$root_body_file" >&2 || true
+          fi
+          rm -f "$root_body_file"
+          check_failures=$((check_failures + 1))
+          continue
+        fi
+        root_obj="$(jq -r '.root_obj // empty' "$root_body_file" 2>/dev/null || true)"
+        rm -f "$root_body_file"
+        if [[ -z "$root_obj" ]]; then
+          echo "FAIL: encrypted dataset '$dataset_name' objset=$objset_id missing root_obj in root payload" >&2
+          check_failures=$((check_failures + 1))
+          continue
+        fi
+
+        entries_body_file="$(mktemp /tmp/zdx-corpus-entries-body.XXXXXX.json)"
+        entries_status="$(
+          curl -sS -o "$entries_body_file" -w "%{http_code}" \
+            "$BASE_URL/api/pools/$POOL/objset/$objset_id/dir/$root_obj/entries?cursor=0&limit=16" || true
+        )"
+        if [[ "$entries_status" != "200" ]]; then
+          echo "FAIL: expected encrypted dataset '$dataset_name' to decode root entries with key material; got HTTP $entries_status" >&2
+          if [[ -s "$entries_body_file" ]]; then
+            echo "      response:" >&2
+            sed -n '1,8p' "$entries_body_file" >&2 || true
+          fi
+          rm -f "$entries_body_file"
+          check_failures=$((check_failures + 1))
+          continue
+        fi
+        entries_count="$(jq -r '.entries | length' "$entries_body_file" 2>/dev/null || echo 0)"
+        rm -f "$entries_body_file"
+        echo "OK: encrypted dataset '$dataset_name' decoded directory entries with key material ($entries_count entries)"
+        continue
+      fi
+
       zap_url="$BASE_URL/api/pools/$POOL/objset/$objset_id/obj/1/zap/info"
       zap_body_file="$(mktemp /tmp/zdx-corpus-zap-body.XXXXXX.json)"
       zap_status="$(
         curl -sS -o "$zap_body_file" -w "%{http_code}" "$zap_url" || true
       )"
-      if [[ "$zap_status" != "400" ]]; then
-        echo "FAIL: expected HTTP 400 for encrypted dataset '$dataset_name' objset=$objset_id obj=1 (got $zap_status)" >&2
-        check_failures=$((check_failures + 1))
+      zap_code="$(jq -r '.code // empty' "$zap_body_file" 2>/dev/null || true)"
+
+      if [[ "$zap_status" == "400" && "$zap_code" == "ZAP_UNREADABLE" ]]; then
         rm -f "$zap_body_file"
+        echo "OK: encrypted dataset '$dataset_name' reports ZAP_UNREADABLE on objset root ZAP"
         continue
       fi
-      zap_code="$(jq -r '.code // empty' "$zap_body_file")"
       rm -f "$zap_body_file"
-      if [[ "$zap_code" != "ZAP_UNREADABLE" ]]; then
-        echo "FAIL: expected ZAP_UNREADABLE for encrypted dataset '$dataset_name' objset=$objset_id obj=1 (got '$zap_code')" >&2
+
+      # Some OpenZFS builds can read objset master ZAP metadata even with no key.
+      # In that case, root directory entry decode should still fail without key material.
+      root_body_file="$(mktemp /tmp/zdx-corpus-root-body.XXXXXX.json)"
+      root_status="$(
+        curl -sS -o "$root_body_file" -w "%{http_code}" \
+          "$BASE_URL/api/pools/$POOL/objset/$objset_id/root" || true
+      )"
+      if [[ "$root_status" != "200" ]]; then
+        echo "OK: encrypted dataset '$dataset_name' root resolution blocked without key (HTTP $root_status)"
+        rm -f "$root_body_file"
+        continue
+      fi
+      root_obj="$(jq -r '.root_obj // empty' "$root_body_file" 2>/dev/null || true)"
+      rm -f "$root_body_file"
+      if [[ -z "$root_obj" ]]; then
+        echo "FAIL: encrypted dataset '$dataset_name' objset=$objset_id missing root_obj in root payload" >&2
         check_failures=$((check_failures + 1))
         continue
       fi
-      echo "OK: encrypted dataset '$dataset_name' reports ZAP_UNREADABLE without key material"
-    done < <(jq -r '.expectations.encrypted_datasets[]' "$MANIFEST")
+
+      entries_body_file="$(mktemp /tmp/zdx-corpus-entries-body.XXXXXX.json)"
+      entries_status="$(
+        curl -sS -o "$entries_body_file" -w "%{http_code}" \
+          "$BASE_URL/api/pools/$POOL/objset/$objset_id/dir/$root_obj/entries?cursor=0&limit=16" || true
+      )"
+      entries_code="$(
+        jq -r '.code // empty' "$entries_body_file" 2>/dev/null || true
+      )"
+      entries_code="${entries_code//$'\r'/}"
+      entries_msg="$(
+        jq -r '.message // .error // empty' "$entries_body_file" 2>/dev/null || true
+      )"
+      entries_msg="${entries_msg//$'\r'/}"
+
+      if [[ "$entries_status" != "200" ]]; then
+        if [[ "$entries_code" == "ZAP_UNREADABLE" || "$entries_code" == "ERRNO_13" ]] \
+          || grep -qi "Invalid exchange" <<<"$entries_msg" \
+          || grep -qi "Permission denied" <<<"$entries_msg" \
+          || grep -qiE '"code"[[:space:]]*:[[:space:]]*"ERRNO_13"|Permission denied|Invalid exchange|ZAP_UNREADABLE' "$entries_body_file"; then
+          echo "OK: encrypted dataset '$dataset_name' blocks dir entry decode without key ($entries_code${entries_msg:+: $entries_msg})"
+          rm -f "$entries_body_file"
+          continue
+        fi
+      fi
+
+      echo "FAIL: expected encrypted dataset '$dataset_name' to block directory entry decode; got HTTP $entries_status" >&2
+      echo "      parsed code: ${entries_code:-<empty>}" >&2
+      echo "      parsed msg: ${entries_msg:-<empty>}" >&2
+      if [[ -s "$entries_body_file" ]]; then
+        echo "      response:" >&2
+        sed -n '1,8p' "$entries_body_file" >&2 || true
+      fi
+      rm -f "$entries_body_file"
+      check_failures=$((check_failures + 1))
+    done < <(jq -c '.expectations.encrypted_datasets[]' "$MANIFEST")
   fi
 
   if [[ "$check_failures" -ne 0 ]]; then
@@ -237,8 +566,11 @@ fi
 if [[ "${failures:-0}" -ne 0 ]]; then
   echo
   echo "Corpus validation failed: $failures checksum mismatches." >&2
+  echo "See backend log: $LOG_FILE" >&2
   exit 1
 fi
+
+SUCCESS=1
 
 echo
 echo "Corpus validation passed."

@@ -33,9 +33,19 @@
 #include <sys/vdev.h>
 #include <sys/zio.h>
 #include <sys/abd.h>
-#include <libzpool.h>
 #include <libzfs.h>
 #include <libzutil.h>
+
+/*
+ * OpenZFS master added include/libzpool.h recently. Older releases
+ * (including zfs-2.4.0) do not ship this header and still declare
+ * kernel_init/kernel_fini via sys/zfs_context.h.
+ */
+#if defined(__has_include)
+#if __has_include(<libzpool.h>)
+#include <libzpool.h>
+#endif
+#endif
 
 /* Build-time version info */
 #ifndef ZDX_GIT_SHA

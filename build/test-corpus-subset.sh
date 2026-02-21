@@ -15,6 +15,8 @@ Run the minimal offline corpus subset from Milestone O.5:
   - mirror + baseline
   - raidz1 + baseline
   - encryption-no-key (any vdev layout)
+  - encryption-with-key (any vdev layout)
+  - degraded-missing-vdev (any redundant layout)
 
 Options:
   --root <path>        Corpus root directory (default: fixtures/corpus)
@@ -91,6 +93,14 @@ encrypted_manifest="$(
   find_first_manifest \
     "$ROOT_DIR/vdevtype=*/features=encryption-no-key/*/manifest.json"
 )"
+encrypted_with_key_manifest="$(
+  find_first_manifest \
+    "$ROOT_DIR/vdevtype=*/features=encryption-with-key/*/manifest.json"
+)"
+degraded_manifest="$(
+  find_first_manifest \
+    "$ROOT_DIR/vdevtype=*/features=degraded-missing-vdev/*/manifest.json"
+)"
 
 declare -a manifests=()
 declare -a missing=()
@@ -111,6 +121,18 @@ if [[ -n "$encrypted_manifest" ]]; then
   manifests+=("$encrypted_manifest")
 else
   missing+=("*/encryption-no-key")
+fi
+
+if [[ -n "$encrypted_with_key_manifest" ]]; then
+  manifests+=("$encrypted_with_key_manifest")
+else
+  missing+=("*/encryption-with-key")
+fi
+
+if [[ -n "$degraded_manifest" ]]; then
+  manifests+=("$degraded_manifest")
+else
+  missing+=("*/degraded-missing-vdev")
 fi
 
 if [[ ${#missing[@]} -gt 0 ]]; then

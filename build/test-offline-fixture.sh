@@ -6,6 +6,7 @@ SEARCH_PATHS=""
 BACKEND_BIN="./backend/target/debug/zfs-explorer"
 BASE_URL="http://127.0.0.1:9000"
 RUST_LOG_LEVEL="${RUST_LOG:-warn}"
+VERBOSE=0
 
 usage() {
   cat <<'EOF'
@@ -18,6 +19,7 @@ Required:
 Optional:
   --backend <path>          Backend binary path (default: ./backend/target/debug/zfs-explorer)
   --base-url <url>          Backend base URL (default: http://127.0.0.1:9000)
+  --verbose                 Print per-check OK lines
   -h, --help                Show this help
 
 This script starts a backend in offline mode and runs a small API smoke suite.
@@ -41,6 +43,9 @@ while [[ $# -gt 0 ]]; do
     --base-url)
       shift
       BASE_URL="${1:-}"
+      ;;
+    --verbose)
+      VERBOSE=1
       ;;
     -h|--help)
       usage
@@ -90,6 +95,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+ok() {
+  local msg="${1:-}"
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    echo "OK: $msg"
+  fi
+}
+
 echo "==> Starting backend in offline mode"
 (
   export ZFS_EXPLORER_POOL_MODE=offline
@@ -119,18 +131,30 @@ echo "==> Running offline smoke checks"
 VERSION_JSON="$(curl -fsS "$BASE_URL/api/version")"
 echo "$VERSION_JSON" | jq -e '.pool_open.mode == "offline"' >/dev/null \
   || { echo "error: /api/version does not report offline mode" >&2; exit 1; }
+ok "/api/version reports offline mode"
 
 POOLS_JSON="$(curl -fsS "$BASE_URL/api/pools")"
 echo "$POOLS_JSON" | jq -e --arg pool "$POOL" 'index($pool) != null' >/dev/null \
   || { echo "error: pool '$POOL' missing from /api/pools in offline mode" >&2; exit 1; }
+ok "/api/pools includes $POOL"
+
+SUMMARY_JSON="$(curl -fsS "$BASE_URL/api/pools/$POOL/summary")"
+echo "$SUMMARY_JSON" | jq -e --arg pool "$POOL" '.pool.name == $pool' >/dev/null \
+  || { echo "error: /api/pools/$POOL/summary has unexpected pool name" >&2; exit 1; }
+ok "/api/pools/$POOL/summary pool.name matches"
+echo "$SUMMARY_JSON" | jq -e '.vdev_tree.type == "root"' >/dev/null \
+  || { echo "error: /api/pools/$POOL/summary missing root vdev tree" >&2; exit 1; }
+ok "/api/pools/$POOL/summary has root vdev tree"
 
 DSL_ROOT_JSON="$(curl -fsS "$BASE_URL/api/pools/$POOL/dsl/root")"
 echo "$DSL_ROOT_JSON" | jq -e '.root_dir_obj | type == "number"' >/dev/null \
   || { echo "error: /api/pools/$POOL/dsl/root missing numeric root_dir_obj" >&2; exit 1; }
+ok "/api/pools/$POOL/dsl/root has numeric root_dir_obj"
 
 MOS_LIST_JSON="$(curl -fsS "$BASE_URL/api/pools/$POOL/mos/objects?start=0&limit=32")"
 echo "$MOS_LIST_JSON" | jq -e '.objects | type == "array"' >/dev/null \
   || { echo "error: /api/pools/$POOL/mos/objects did not return an objects array" >&2; exit 1; }
+ok "/api/pools/$POOL/mos/objects returned array"
 
 FIRST_OBJ="$(
   curl -fsS "$BASE_URL/api/pools/$POOL/mos/objects?start=0&limit=1" \
@@ -141,6 +165,7 @@ if [[ -n "$FIRST_OBJ" ]]; then
   echo "$OBJ_JSON" \
     | jq -e --argjson id "$FIRST_OBJ" '((.id? // .object.id?) == $id)' >/dev/null \
     || { echo "error: /api/pools/$POOL/obj/$FIRST_OBJ id mismatch" >&2; exit 1; }
+  ok "/api/pools/$POOL/obj/$FIRST_OBJ id matches"
 fi
 echo
 echo "Offline fixture smoke checks passed."

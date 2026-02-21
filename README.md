@@ -262,6 +262,21 @@ sudo build/test-corpus-fixture.sh \
 # run the default minimal corpus subset (mirror + raidz1 + encryption-no-key)
 sudo build/test-corpus-subset.sh --list
 sudo build/test-corpus-subset.sh
+
+# create the full layout/profile matrix (20 combinations)
+build/create-corpus-matrix.sh --list
+build/create-corpus-matrix.sh --force
+
+# validate every discovered manifest in the selected matrix
+sudo build/test-corpus-matrix.sh --list
+sudo build/test-corpus-matrix.sh --keep-going
+```
+
+Quick API sanity checks (backend runs on `127.0.0.1:9000`):
+
+```bash
+curl -s http://127.0.0.1:9000/api/pools | jq
+curl -s http://127.0.0.1:9000/api/pools/<pool>/summary | jq
 ```
 
 Run a focused OpenZFS ZTS smoke set (non-root user with passwordless sudo):
@@ -341,6 +356,99 @@ zfs-explorer/
 
 ## Build from Scratch
 
+### 0. Clone with submodules
+
+`zfs/` is an OpenZFS git submodule and is required for native/backend builds.
+
+```bash
+# fresh clone
+git clone --recurse-submodules https://github.com/<you>/zfs-explorer.git
+cd zfs-explorer
+
+# if you already cloned without submodules
+git submodule update --init --recursive
+```
+
+If you switch OpenZFS branches/tags in `zfs/` (for example `zfs-2.4.0` vs
+`master`), do a clean re-sync before rebuilding to avoid mixed generated files.
+
+```bash
+git submodule update --init --recursive --force
+git -C zfs reset --hard
+git -C zfs clean -fdx
+git -C zfs sparse-checkout disable || true
+```
+
+### 1. Install prerequisites (Debian/Ubuntu)
+
+Quick bootstrap (recommended on fresh Debian VMs):
+
+```bash
+./build/bootstrap-debian.sh
+```
+
+This installs apt dependencies, host OpenZFS runtime packages, and initializes
+submodules. Then continue with `./build/build.sh --bootstrap-openzfs`.
+
+Manual install:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  git build-essential autoconf automake libtool pkg-config m4 gawk \
+  libssl-dev libelf-dev libudev-dev libblkid-dev uuid-dev zlib1g-dev \
+  libzstd-dev libtirpc-dev clang libclang-dev \
+  python3 python3-pip python3-setuptools python3-cffi libffi-dev \
+  nodejs npm curl jq
+```
+
+Install Rust (if `cargo` is missing):
+
+```bash
+curl https://sh.rustup.rs -sSf | sh
+source "$HOME/.cargo/env"
+```
+
+Node 20+ is recommended for current Vite/TypeScript tooling.
+
+Backend note: Rust `bindgen` requires `libclang` at build time. If you see
+`Unable to find libclang`, ensure `clang` and `libclang-dev` are installed.
+
+### 1.1 Install OpenZFS runtime packages on Debian (recommended: backports)
+
+For live pool access (`/dev/zfs`) and CLI-backed telemetry (`zpool`, `zfs`),
+install Debian OpenZFS packages from backports.
+
+```bash
+# enable backports (adjust if your host manages apt sources differently)
+echo "deb http://deb.debian.org/debian $(. /etc/os-release; echo $VERSION_CODENAME)-backports main contrib" \
+  | sudo tee /etc/apt/sources.list.d/backports.list
+
+sudo apt-get update
+sudo apt-get install -y -t "$( . /etc/os-release; echo $VERSION_CODENAME)-backports" \
+  zfsutils-linux zfs-dkms zfs-zed
+
+# optional test tooling
+sudo apt-get install -y -t "$( . /etc/os-release; echo $VERSION_CODENAME)-backports" zfs-test
+
+# optional: required for build/run-zts-smoke.sh (ZTS uses ksh tests)
+sudo apt-get install -y ksh
+```
+
+Notes:
+- This project builds against the vendored `zfs/` submodule, not distro
+  OpenZFS headers/libs.
+- Host OpenZFS packages are still needed to access imported pools in live mode.
+- After `zfs-dkms` install/upgrade, a reboot or `modprobe zfs` may be required.
+- Debian backports currently tracks OpenZFS 2.4.0. If you want strict
+  parity testing against those host packages, you can temporarily check out
+  `zfs-2.4.0` in the `zfs/` submodule for local builds:
+  `git -C zfs checkout zfs-2.4.0`
+  and switch back to the repo-pinned baseline with:
+  `git submodule update --init --recursive`.
+
+### 2. Build
+
 Canonical build entrypoint:
 
 ```bash
@@ -388,6 +496,32 @@ cd ..
 # 4. Install UI dependencies
 cd ui
 npm install
+```
+
+### Build Troubleshooting (OpenZFS submodule state)
+
+If OpenZFS fails with errors like:
+
+- `No rule to make target 'libuutil.h', needed by 'all-am'`
+- missing header mismatches after switching `zfs/` commits
+
+the issue is usually a stale/mixed OpenZFS source tree state, not a missing
+system package. Reset and rebuild from a clean `zfs/` tree:
+
+```bash
+git submodule update --init --recursive --force
+git -C zfs reset --hard
+git -C zfs clean -fdx
+git -C zfs sparse-checkout disable || true
+
+# Optional: choose a specific OpenZFS ref for parity testing
+# git -C zfs checkout zfs-2.4.0
+
+cd zfs
+./autogen.sh
+./configure --prefix="$PWD/../_deps/openzfs" --with-config=user --enable-debug
+make -j"$(nproc)"
+make install
 ```
 
 ## Packaging for Remote Hosts

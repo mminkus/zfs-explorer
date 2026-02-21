@@ -103,11 +103,16 @@ ensure_cargo() {
   fi
 }
 
-bootstrap_openzfs() {
-  if [[ ! -d "$OPENZFS_SRC_DIR" ]]; then
-    echo "error: missing OpenZFS source dir: $OPENZFS_SRC_DIR" >&2
+ensure_openzfs_submodule() {
+  if [[ ! -f "$OPENZFS_SRC_DIR/configure.ac" || ! -f "$OPENZFS_SRC_DIR/module/zfs/spa.c" ]]; then
+    echo "error: OpenZFS submodule is missing or not initialized at $OPENZFS_SRC_DIR" >&2
+    echo "hint: run 'git submodule update --init --recursive' from repo root." >&2
     exit 1
   fi
+}
+
+bootstrap_openzfs() {
+  ensure_openzfs_submodule
 
   log_step "Bootstrapping vendored OpenZFS userland"
   cd "$OPENZFS_SRC_DIR"
@@ -209,6 +214,7 @@ if [[ "$BOOTSTRAP_OPENZFS" -eq 1 ]]; then
   bootstrap_openzfs
 fi
 
+ensure_openzfs_submodule
 check_openzfs_glibc_compat
 
 build_native

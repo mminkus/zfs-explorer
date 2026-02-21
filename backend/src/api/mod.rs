@@ -2706,6 +2706,76 @@ fn resolve_dataset_dir_obj_by_name(
     Ok(current_dir_obj)
 }
 
+fn resolve_dataset_from_pool_path_via_dsl(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    pool_name: &str,
+    normalized_path: &str,
+) -> Result<Option<(String, String, u64)>, ApiError> {
+    let components = split_clean_path(normalized_path);
+    if components.is_empty() || components[0] != pool_name {
+        return Ok(None);
+    }
+
+    let root_result = crate::ffi::dsl_root_dir(pool_ptr);
+    if !root_result.is_ok() {
+        let err_msg = root_result.error_msg().unwrap_or("Unknown error");
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to resolve DSL root: {err_msg}"),
+        ));
+    }
+    let root_json = root_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let root_value = parse_json_value(root_json)?;
+    let root_dir_obj = root_value["root_dir_obj"].as_u64().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "root_dir_obj missing in DSL root payload",
+        )
+    })?;
+
+    let mut current_dir_obj = root_dir_obj;
+    let mut dataset_components: Vec<&str> = vec![pool_name];
+    let mut idx = 1usize;
+
+    while idx < components.len() {
+        let component = components[idx];
+        let children_result = crate::ffi::dsl_dir_children(pool_ptr, current_dir_obj);
+        if !children_result.is_ok() {
+            let err_msg = children_result.error_msg().unwrap_or("Unknown error");
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to enumerate DSL children: {err_msg}"),
+            ));
+        }
+        let children_json = children_result
+            .json()
+            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+        let children_value = parse_json_value(children_json)?;
+        let children = parse_dsl_children(&children_value);
+        let next_obj = children
+            .iter()
+            .find_map(|(name, obj)| if name == component { Some(*obj) } else { None });
+        if let Some(next) = next_obj {
+            current_dir_obj = next;
+            dataset_components.push(component);
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+
+    let dataset_name = dataset_components.join("/");
+    let rel_path = if idx < components.len() {
+        components[idx..].join("/")
+    } else {
+        String::new()
+    };
+
+    Ok(Some((dataset_name, rel_path, current_dir_obj)))
+}
+
 fn resolve_zpl_path_context(
     pool_ptr: *mut crate::ffi::zdx_pool_t,
     pool_name: &str,
@@ -2732,41 +2802,54 @@ fn resolve_zpl_path_context(
     };
     let normalized_path = trimmed.trim_start_matches('/').to_string();
 
-    let catalog = load_dataset_catalog(pool_ptr)?;
-    let mut candidates: Vec<(usize, String, String)> = Vec::new();
-    for entry in catalog
-        .iter()
-        .filter(|entry| entry.dataset_type == "filesystem")
-    {
-        if let Some(rel) = dataset_path_match(&entry.name, &normalized_path) {
-            candidates.push((entry.name.len(), entry.name.clone(), rel));
-        }
+    let (dataset_name, rel_path, dir_obj) = match load_dataset_catalog(pool_ptr) {
+        Ok(catalog) => {
+            let mut candidates: Vec<(usize, String, String)> = Vec::new();
+            for entry in catalog
+                .iter()
+                .filter(|entry| entry.dataset_type == "filesystem")
+            {
+                if let Some(rel) = dataset_path_match(&entry.name, &normalized_path) {
+                    candidates.push((entry.name.len(), entry.name.clone(), rel));
+                }
 
-        if let Some(mountpoint) = entry.mountpoint.as_deref() {
-            if entry.mounted != Some(false) {
-                if let Some(rel) = mountpoint_path_match(mountpoint, &absolute_path) {
-                    candidates.push((mountpoint.len(), entry.name.clone(), rel));
+                if let Some(mountpoint) = entry.mountpoint.as_deref() {
+                    if entry.mounted != Some(false) {
+                        if let Some(rel) = mountpoint_path_match(mountpoint, &absolute_path) {
+                            candidates.push((mountpoint.len(), entry.name.clone(), rel));
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    let Some((_, dataset_name, rel_path)) = candidates.into_iter().next() else {
-        return Err(api_error_with(
-            StatusCode::BAD_REQUEST,
-            "DATASET_PATH_UNRESOLVED",
-            format!("could not resolve dataset for path '{zpl_path}'"),
-            Some(
-                "Use either an absolute mounted path (/pool/dataset/file) or a dataset path \
+            candidates.sort_by(|a, b| b.0.cmp(&a.0));
+            let Some((_, dataset_name, rel_path)) = candidates.into_iter().next() else {
+                return Err(api_error_with(
+                    StatusCode::BAD_REQUEST,
+                    "DATASET_PATH_UNRESOLVED",
+                    format!("could not resolve dataset for path '{zpl_path}'"),
+                    Some(
+                        "Use either an absolute mounted path (/pool/dataset/file) or a dataset path \
 like pool/dataset/file."
-                    .to_string(),
-            ),
-            true,
-        ));
+                            .to_string(),
+                    ),
+                    true,
+                ));
+            };
+            let dir_obj = resolve_dataset_dir_obj_by_name(pool_ptr, pool_name, &dataset_name)?;
+            (dataset_name, rel_path, dir_obj)
+        }
+        Err(catalog_err) => {
+            if let Some((dataset_name, rel_path, dir_obj)) =
+                resolve_dataset_from_pool_path_via_dsl(pool_ptr, pool_name, &normalized_path)?
+            {
+                (dataset_name, rel_path, dir_obj)
+            } else {
+                return Err(catalog_err);
+            }
+        }
     };
 
-    let dir_obj = resolve_dataset_dir_obj_by_name(pool_ptr, pool_name, &dataset_name)?;
     let objset_payload = resolve_dataset_objset(pool_ptr, dir_obj)?;
     let objset_id = objset_payload["objset_id"].as_u64().ok_or_else(|| {
         api_error(

@@ -16,7 +16,9 @@ Options:
   --pool <name>        Pool name (default: zdx_corpus)
   --layout <type>      Vdev layout: single|mirror|raidz1|raidz2|raidz3
                        (default: mirror)
-  --profile <name>     Feature profile: baseline|dedup|embedded-zstd|encryption-no-key
+  --profile <name>     Feature profile:
+                       baseline|dedup|embedded-zstd|encryption-no-key|
+                       encryption-with-key|degraded-missing-vdev
                        (default: baseline)
   --root <path>        Corpus root directory (default: fixtures/corpus)
   --size <value>       Per-vdev image size for truncate (default: 512M)
@@ -89,7 +91,7 @@ case "$LAYOUT" in
 esac
 
 case "$PROFILE" in
-  baseline|dedup|embedded-zstd|encryption-no-key) ;;
+  baseline|dedup|embedded-zstd|encryption-no-key|encryption-with-key|degraded-missing-vdev) ;;
   *)
     echo "error: unsupported profile '$PROFILE'" >&2
     exit 2
@@ -114,10 +116,10 @@ FIXTURE_DIR="$(cd "$FIXTURE_DIR" && pwd)"
 MANIFEST="$FIXTURE_DIR/manifest.json"
 
 if [[ "$FORCE" -eq 1 ]]; then
-  rm -f "$FIXTURE_DIR"/vdev-*.img "$MANIFEST"
+  rm -f "$FIXTURE_DIR"/vdev-*.img "$FIXTURE_DIR"/vdev-*.img.missing "$MANIFEST"
 fi
 
-if compgen -G "$FIXTURE_DIR/vdev-*.img" >/dev/null; then
+if compgen -G "$FIXTURE_DIR/vdev-*.img" >/dev/null || compgen -G "$FIXTURE_DIR/vdev-*.img.missing" >/dev/null; then
   echo "error: fixture images already exist under $FIXTURE_DIR (use --force)" >&2
   exit 1
 fi
@@ -129,7 +131,7 @@ cleanup() {
   if [[ "$POOL_CREATED" -eq 1 ]] && sudo zpool list -H -o name "$POOL" >/dev/null 2>&1; then
     sudo zpool export "$POOL" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${encrypted_keyfile:-}" ]]; then
+  if [[ "${encrypted_mode:-none}" == "no-key" && -n "${encrypted_keyfile:-}" ]]; then
     rm -f "$encrypted_keyfile" >/dev/null 2>&1 || true
   fi
   rm -rf "$MNT"
@@ -183,6 +185,10 @@ recordsize="128K"
 dedup="off"
 encrypted_dataset=""
 encrypted_keyfile=""
+encrypted_mode="none"
+degrade_missing_vdev=0
+missing_vdev_path=""
+missing_vdev_shadow=""
 
 case "$PROFILE" in
   baseline)
@@ -206,8 +212,28 @@ case "$PROFILE" in
     dedup="off"
     encrypted_dataset="$POOL/enc"
     encrypted_keyfile="$FIXTURE_DIR/enc.key"
+    encrypted_mode="no-key"
+    ;;
+  encryption-with-key)
+    compression="lz4"
+    recordsize="128K"
+    dedup="off"
+    encrypted_dataset="$POOL/enc"
+    encrypted_keyfile="$FIXTURE_DIR/enc.key"
+    encrypted_mode="with-key"
+    ;;
+  degraded-missing-vdev)
+    compression="lz4"
+    recordsize="128K"
+    dedup="off"
+    degrade_missing_vdev=1
     ;;
 esac
+
+if [[ "$degrade_missing_vdev" -eq 1 && "$vdev_count" -lt 2 ]]; then
+  echo "error: profile '$PROFILE' requires a redundant layout (mirror/raidz*)" >&2
+  exit 2
+fi
 
 sudo zfs set compression="$compression" "$POOL/data"
 sudo zfs set recordsize="$recordsize" "$POOL/data"
@@ -216,7 +242,11 @@ sudo zfs set atime=off "$POOL/data"
 sudo zfs set xattr=sa "$POOL/data"
 
 if [[ -n "$encrypted_dataset" ]]; then
-  echo "==> Creating encrypted dataset '$encrypted_dataset' (key intentionally removed)"
+  if [[ "$encrypted_mode" == "no-key" ]]; then
+    echo "==> Creating encrypted dataset '$encrypted_dataset' (key intentionally removed)"
+  else
+    echo "==> Creating encrypted dataset '$encrypted_dataset' (key retained for offline decode checks)"
+  fi
   sudo dd if=/dev/urandom of="$encrypted_keyfile" bs=32 count=1 status=none
   sudo zfs create \
     -o encryption=on \
@@ -237,7 +267,7 @@ if [[ "$PROFILE" == "dedup" ]]; then
   done
 fi
 
-if [[ -n "$encrypted_dataset" ]]; then
+if [[ "$encrypted_mode" == "no-key" && -n "$encrypted_dataset" ]]; then
   sudo zfs unload-key "$encrypted_dataset" >/dev/null 2>&1 || true
   rm -f "$encrypted_keyfile"
 fi
@@ -261,6 +291,9 @@ add_known_file "$POOL/data/media/seed.bin" "$MNT/$POOL/data/media/seed.bin"
 if [[ "$PROFILE" == "dedup" ]]; then
   add_known_file "$POOL/data/media/clone-1.bin" "$MNT/$POOL/data/media/clone-1.bin"
 fi
+if [[ "$encrypted_mode" == "with-key" ]]; then
+  add_known_file "$encrypted_dataset/secret.txt" "$MNT/$encrypted_dataset/secret.txt"
+fi
 
 sudo zpool get -H -o property,value all "$POOL" \
   | awk -F'\t' '$1 ~ /^feature@/ && $2 != "disabled" {sub(/^feature@/, "", $1); printf "%s|%s\n", $1, $2}' \
@@ -268,6 +301,8 @@ sudo zpool get -H -o property,value all "$POOL" \
 
 pool_guid="$(sudo zpool get -H -o value guid "$POOL")"
 ddt_entries="$(sudo zpool status -D -p "$POOL" | awk '/dedup: DDT entries/ {print $4; exit}' || true)"
+ddt_entries="${ddt_entries//,/}"
+ddt_entries="${ddt_entries//[^0-9]/}"
 if [[ -z "$ddt_entries" ]]; then
   ddt_entries="0"
 fi
@@ -276,7 +311,15 @@ echo "==> Exporting pool '$POOL'"
 sudo zpool export "$POOL"
 POOL_CREATED=0
 
+if [[ "$degrade_missing_vdev" -eq 1 ]]; then
+  missing_vdev_path="${vdev_paths[$((vdev_count - 1))]}"
+  missing_vdev_shadow="$missing_vdev_path.missing"
+  echo "==> Simulating missing vdev for offline import: $(basename "$missing_vdev_path")"
+  mv "$missing_vdev_path" "$missing_vdev_shadow"
+fi
+
 export POOL LAYOUT PROFILE SIZE FIXTURE_DIR MANIFEST compression recordsize dedup pool_guid ddt_entries encrypted_dataset
+export encrypted_mode degrade_missing_vdev missing_vdev_path
 export KNOWN_LINES_FILE="$known_lines_file"
 export FEATURE_LINES_FILE="$feature_lines_file"
 
@@ -297,6 +340,9 @@ dedup = os.environ["dedup"]
 pool_guid = os.environ["pool_guid"]
 ddt_entries = int(os.environ["ddt_entries"])
 encrypted_dataset = os.environ.get("encrypted_dataset", "")
+encrypted_mode = os.environ.get("encrypted_mode", "none")
+degrade_missing_vdev = os.environ.get("degrade_missing_vdev", "0") == "1"
+missing_vdev_path = os.environ.get("missing_vdev_path", "")
 
 known_files = []
 with open(os.environ["KNOWN_LINES_FILE"], "r", encoding="utf-8") as fh:
@@ -345,10 +391,22 @@ manifest = {
 }
 
 if encrypted_dataset:
-    manifest["expectations"] = {
-        "encrypted_datasets": [encrypted_dataset],
-        "zap_unreadable_expected": True,
-    }
+    manifest.setdefault("expectations", {})
+    expectation = "blocked" if encrypted_mode == "no-key" else "readable"
+    manifest["expectations"]["encrypted_datasets"] = [
+        {"name": encrypted_dataset, "expect": expectation}
+    ]
+    manifest["expectations"]["zap_unreadable_expected"] = encrypted_mode == "no-key"
+
+if encrypted_mode == "with-key":
+    manifest["fixture"]["encryption_key_paths"] = ["enc.key"]
+
+if degrade_missing_vdev:
+    manifest.setdefault("expectations", {})
+    manifest["expectations"]["offline_degraded_expected"] = True
+    if missing_vdev_path:
+        missing_name = os.path.basename(missing_vdev_path)
+        manifest["fixture"]["missing_vdev_images"] = [missing_name]
 
 with open(manifest_path, "w", encoding="utf-8") as fh:
     json.dump(manifest, fh, indent=2)
