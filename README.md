@@ -99,7 +99,7 @@ for readability; click any image to open the full-resolution PNG.
 ## Architecture
 
 ```
-React UI (port 8080) → Rust API (port 9000) → libzdbdecode.so → ZFS Libraries
+React UI (port 8080) -> Rust API (port 9000) -> libzdbdecode.so -> ZFS Libraries
 ```
 
 ## What's Implemented (Milestones 0-6)
@@ -112,6 +112,37 @@ React UI (port 8080) → Rust API (port 9000) → libzdbdecode.so → ZFS Librar
 - ✅ Filesystem navigation (list + graph modes) with dataset/mount handoff
 - ✅ SPA history-friendly UI navigation, breadcrumbs, and object pinning
 - ✅ Packaging/build scripts and offline fixture + parity validation tooling
+
+## Bootstrap (Fresh Host)
+
+Use the platform bootstrap script first, then run the normal build.
+
+Debian:
+
+```bash
+build/bootstrap-debian.sh
+build/build.sh --bootstrap-openzfs
+```
+
+Ubuntu:
+
+```bash
+build/bootstrap-ubuntu.sh
+build/build.sh --bootstrap-openzfs
+```
+
+FreeBSD:
+
+```bash
+build/bootstrap-freebsd.sh
+env MAKE=gmake build/build.sh --bootstrap-openzfs
+```
+
+Notes:
+
+- `build/build.sh` uses `gmake` automatically on FreeBSD (or `MAKE` if set).
+- On Ubuntu, `zfsutils-linux` is required for corpus fixture create/test scripts.
+- If UI build warns about Node version, upgrade to Node `>= 20.19` for Vite 7.
 
 ## Running on a Host with ZFS Access
 
@@ -343,9 +374,9 @@ zfs-explorer/
 - `GET /api/pools/:pool/obj/:objid/zap` - ZAP entries
 - `GET /api/pools/:pool/graph/from/:objid` - 1-hop graph slice
 - `GET /api/pools/:pool/datasets/tree` - Dataset tree
-- `GET /api/pools/:pool/dataset/:dsl_dir_obj/head` - Dataset → objset
+- `GET /api/pools/:pool/dataset/:dsl_dir_obj/head` - Dataset -> objset
 - `GET /api/pools/:pool/dataset/:dsl_dir_obj/snapshots` - Snapshot list for a DSL dir
-- `GET /api/pools/:pool/snapshot/:dsobj/objset` - Snapshot dataset object → objset
+- `GET /api/pools/:pool/snapshot/:dsobj/objset` - Snapshot dataset object -> objset
 - `GET /api/pools/:pool/snapshot/:dsobj/lineage?max_prev=&max_next=` - Bounded snapshot lineage chain
 - `GET /api/pools/:pool/objset/:objset_id/root` - ZPL root znode
 - `GET /api/pools/:pool/objset/:objset_id/dir/:dir_obj/entries` - Directory entries

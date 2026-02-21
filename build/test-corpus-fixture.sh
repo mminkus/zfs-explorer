@@ -5,6 +5,8 @@ MANIFEST=""
 BACKEND_BIN="./backend/target/debug/zfs-explorer"
 BASE_URL="http://127.0.0.1:9000"
 RUST_LOG_LEVEL="${RUST_LOG:-warn}"
+SEARCH_PATHS_OVERRIDE=""
+USE_MANIFEST_SEARCH_PATHS=0
 
 usage() {
   cat <<'EOF'
@@ -16,6 +18,9 @@ Required:
 Optional:
   --backend <path>       Backend binary path (default: ./backend/target/debug/zfs-explorer)
   --base-url <url>       Backend base URL (default: http://127.0.0.1:9000)
+  --search-paths <paths> Override search paths instead of manifest/dir defaults
+  --use-manifest-search-paths
+                         Use fixture.search_paths from manifest as-is
   -h, --help             Show help
 
 Runs:
@@ -37,6 +42,13 @@ while [[ $# -gt 0 ]]; do
     --base-url)
       shift
       BASE_URL="${1:-}"
+      ;;
+    --search-paths)
+      shift
+      SEARCH_PATHS_OVERRIDE="${1:-}"
+      ;;
+    --use-manifest-search-paths)
+      USE_MANIFEST_SEARCH_PATHS=1
       ;;
     -h|--help)
       usage
@@ -61,12 +73,43 @@ if [[ ! -f "$MANIFEST" ]]; then
   exit 1
 fi
 
-for cmd in jq curl sha256sum; do
+for cmd in jq curl; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "error: missing required command '$cmd'" >&2
     exit 2
   fi
 done
+
+SHA256_MODE=""
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256_MODE="gnu"
+elif command -v sha256 >/dev/null 2>&1; then
+  SHA256_MODE="bsd"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256_MODE="perl"
+else
+  echo "error: missing sha256 tool (sha256sum, sha256, or shasum)" >&2
+  exit 2
+fi
+
+hash_file_sha256() {
+  local file="$1"
+  case "$SHA256_MODE" in
+    gnu)
+      sha256sum "$file" | awk '{print $1}'
+      ;;
+    bsd)
+      sha256 -q "$file"
+      ;;
+    perl)
+      shasum -a 256 "$file" | awk '{print $1}'
+      ;;
+    *)
+      echo "error: unknown SHA256_MODE '$SHA256_MODE'" >&2
+      exit 2
+      ;;
+  esac
+}
 
 if [[ ! -x "$BACKEND_BIN" ]]; then
   echo "error: backend binary not executable: $BACKEND_BIN" >&2
@@ -79,10 +122,29 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
 fi
 
 POOL="$(jq -r '.pool.name // empty' "$MANIFEST")"
-SEARCH_PATHS="$(jq -r '.fixture.search_paths // empty' "$MANIFEST")"
-if [[ -z "$POOL" || -z "$SEARCH_PATHS" ]]; then
-  echo "error: manifest missing pool.name or fixture.search_paths" >&2
+if [[ -z "$POOL" ]]; then
+  echo "error: manifest missing pool.name" >&2
   exit 1
+fi
+
+MANIFEST_SEARCH_PATHS="$(jq -r '.fixture.search_paths // empty' "$MANIFEST")"
+MANIFEST_DIR="$(cd "$(dirname "$MANIFEST")" && pwd)"
+
+if [[ -n "$SEARCH_PATHS_OVERRIDE" ]]; then
+  SEARCH_PATHS="$SEARCH_PATHS_OVERRIDE"
+elif [[ "$USE_MANIFEST_SEARCH_PATHS" -eq 1 ]]; then
+  SEARCH_PATHS="$MANIFEST_SEARCH_PATHS"
+else
+  SEARCH_PATHS="$MANIFEST_DIR"
+fi
+
+if [[ -z "$SEARCH_PATHS" ]]; then
+  echo "error: search paths resolved empty (manifest: '$MANIFEST_SEARCH_PATHS')" >&2
+  exit 1
+fi
+
+if [[ "$SEARCH_PATHS" != "$MANIFEST_SEARCH_PATHS" && -n "$MANIFEST_SEARCH_PATHS" ]]; then
+  echo "note: using search paths '$SEARCH_PATHS' (manifest has '$MANIFEST_SEARCH_PATHS')" >&2
 fi
 
 echo "==> Running offline smoke checks for '$POOL'"
@@ -265,7 +327,7 @@ else
       continue
     fi
 
-    got="$(sha256sum "$tmp_file" | awk '{print $1}')"
+    got="$(hash_file_sha256 "$tmp_file")"
     if [[ "$got" != "$expected" ]]; then
       echo "FAIL: checksum mismatch for $path" >&2
       echo "      expected: $expected" >&2

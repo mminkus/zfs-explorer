@@ -98,12 +98,36 @@ case "$PROFILE" in
     ;;
 esac
 
-for cmd in zpool zfs truncate mktemp jq sha256sum python3; do
+for cmd in zpool zfs truncate mktemp jq; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "error: missing required command '$cmd'" >&2
     exit 2
   fi
 done
+
+PYTHON_BIN=""
+for candidate in python3 python3.12 python3.11 python3.10; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    PYTHON_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "error: missing required command 'python3' (or python3.x)" >&2
+  exit 2
+fi
+
+SHA256_MODE=""
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256_MODE="gnu"
+elif command -v sha256 >/dev/null 2>&1; then
+  SHA256_MODE="bsd"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256_MODE="perl"
+else
+  echo "error: missing sha256 tool (sha256sum, sha256, or shasum)" >&2
+  exit 2
+fi
 
 if sudo zpool list -H -o name "$POOL" >/dev/null 2>&1; then
   echo "error: pool '$POOL' is already imported; export/destroy it first" >&2
@@ -282,7 +306,21 @@ add_known_file() {
   local rel_path="$1"
   local full_path="$2"
   local hash
-  hash="$(sha256sum "$full_path" | awk '{print $1}')"
+  case "$SHA256_MODE" in
+    gnu)
+      hash="$(sha256sum "$full_path" | awk '{print $1}')"
+      ;;
+    bsd)
+      hash="$(sha256 -q "$full_path")"
+      ;;
+    perl)
+      hash="$(shasum -a 256 "$full_path" | awk '{print $1}')"
+      ;;
+    *)
+      echo "error: unknown SHA256_MODE '$SHA256_MODE'" >&2
+      exit 2
+      ;;
+  esac
   printf '%s|%s\n' "$rel_path" "$hash" >>"$known_lines_file"
 }
 
@@ -323,7 +361,7 @@ export encrypted_mode degrade_missing_vdev missing_vdev_path
 export KNOWN_LINES_FILE="$known_lines_file"
 export FEATURE_LINES_FILE="$feature_lines_file"
 
-python3 <<'PY'
+"$PYTHON_BIN" <<'PY'
 import json
 import os
 from datetime import datetime, timezone

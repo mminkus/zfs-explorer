@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENZFS_SRC_DIR="$ROOT_DIR/zfs"
 OPENZFS_PREFIX_DIR="$ROOT_DIR/_deps/openzfs"
+HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
+
+if [[ -n "${MAKE:-}" ]]; then
+  MAKE_CMD="$MAKE"
+elif [[ "$HOST_OS" == "FreeBSD" ]] && command -v gmake >/dev/null 2>&1; then
+  MAKE_CMD="gmake"
+else
+  MAKE_CMD="make"
+fi
 
 if command -v nproc >/dev/null 2>&1; then
   DEFAULT_JOBS="$(nproc)"
@@ -15,6 +24,7 @@ JOBS="$DEFAULT_JOBS"
 QUICK_MODE=0
 BOOTSTRAP_OPENZFS=0
 SKIP_UI_INSTALL=0
+OPENZFS_DEBUG=1
 
 print_usage() {
   cat <<'EOF'
@@ -22,11 +32,13 @@ Usage: build/build.sh [options]
 
 Options:
   --quick                Fast local loop:
-                         (cd native && make clean && make)
+                         (cd native && $MAKE clean && $MAKE)
                          (cd backend && cargo build)
                          (cd ui && npm run build)
   --bootstrap-openzfs    Build/install vendored OpenZFS userland into _deps/openzfs first
   --skip-ui-install      Skip npm install (useful when node_modules is already present)
+  --openzfs-debug        Build vendored OpenZFS with debug enabled (default)
+  --openzfs-release      Build vendored OpenZFS with debug disabled
   --jobs N               Parallel jobs for OpenZFS make
   -h, --help             Show this help
 
@@ -34,12 +46,32 @@ Examples:
   build/build.sh
   build/build.sh --quick
   build/build.sh --bootstrap-openzfs --jobs 16
+  build/build.sh --bootstrap-openzfs --openzfs-release
+
+Environment:
+  MAKE                   Override make tool (default: gmake on FreeBSD, make otherwise)
 EOF
 }
 
 log_step() {
   echo
   echo "==> $*"
+}
+
+append_env_once() {
+  local var_name="$1"
+  local token="$2"
+  local current="${!var_name:-}"
+  if [[ -z "$current" ]]; then
+    printf -v "$var_name" "%s" "$token"
+    export "$var_name"
+    return
+  fi
+  if [[ " $current " == *" $token "* ]]; then
+    return
+  fi
+  printf -v "$var_name" "%s %s" "$current" "$token"
+  export "$var_name"
 }
 
 version_gt() {
@@ -111,8 +143,43 @@ ensure_openzfs_submodule() {
   fi
 }
 
+ensure_make_tool() {
+  if ! command -v "$MAKE_CMD" >/dev/null 2>&1; then
+    echo "error: build tool '$MAKE_CMD' not found in PATH." >&2
+    if [[ "$HOST_OS" == "FreeBSD" ]]; then
+      echo "hint: install gmake (sudo pkg install -y gmake) or set MAKE=<tool>." >&2
+    else
+      echo "hint: install make/build-essential or set MAKE=<tool>." >&2
+    fi
+    exit 1
+  fi
+}
+
+apply_host_build_defaults() {
+  if [[ "$HOST_OS" != "FreeBSD" ]]; then
+    return
+  fi
+
+  append_env_once CPPFLAGS "-I/usr/local/include"
+  append_env_once LDFLAGS "-L/usr/local/lib"
+  append_env_once LIBS "-lintl"
+
+  if [[ -z "${LIBCLANG_PATH:-}" ]]; then
+    local found
+    found="$(
+      find /usr/local -maxdepth 6 -type f \( -name 'libclang.so' -o -name 'libclang.so.*' \) \
+        2>/dev/null | sort | tail -n1 || true
+    )"
+    if [[ -n "$found" ]]; then
+      export LIBCLANG_PATH
+      LIBCLANG_PATH="$(dirname "$found")"
+    fi
+  fi
+}
+
 bootstrap_openzfs() {
   ensure_openzfs_submodule
+  ensure_make_tool
 
   log_step "Bootstrapping vendored OpenZFS userland"
   cd "$OPENZFS_SRC_DIR"
@@ -136,7 +203,6 @@ bootstrap_openzfs() {
   ./configure \
     --prefix="$OPENZFS_PREFIX_DIR" \
     --with-config=user \
-    --enable-debug \
     --with-dracutdir="$local_dracutdir" \
     --with-udevdir="$local_udevdir" \
     --with-udevruledir="$local_udevruledir" \
@@ -144,20 +210,22 @@ bootstrap_openzfs() {
     --with-systemdunitdir="$local_systemdunitdir" \
     --with-systemdpresetdir="$local_systemdpresetdir" \
     --with-systemdmodulesloaddir="$local_systemdmodulesloaddir" \
-    --with-systemdgeneratordir="$local_systemdgeneratordir"
-  make -j"$JOBS"
-  make install \
+    --with-systemdgeneratordir="$local_systemdgeneratordir" \
+    "$([ "$OPENZFS_DEBUG" -eq 1 ] && echo --enable-debug || echo --disable-debug)"
+  "$MAKE_CMD" -j"$JOBS"
+  "$MAKE_CMD" install \
     i_tdir="$local_initramfsdir" \
     initconfdir="$local_initconfdir" \
     bashcompletiondir="$local_bashcompletiondir"
 }
 
 build_native() {
+  ensure_make_tool
   log_step "Building native library"
   cd "$ROOT_DIR/native"
   # Always rebuild native artifacts to avoid stale .so reuse across hosts.
-  make clean
-  make
+  "$MAKE_CMD" clean
+  "$MAKE_CMD"
 }
 
 build_backend() {
@@ -189,6 +257,12 @@ while [[ $# -gt 0 ]]; do
     --skip-ui-install)
       SKIP_UI_INSTALL=1
       ;;
+    --openzfs-debug)
+      OPENZFS_DEBUG=1
+      ;;
+    --openzfs-release)
+      OPENZFS_DEBUG=0
+      ;;
     --jobs)
       shift
       if [[ $# -eq 0 ]]; then
@@ -215,6 +289,7 @@ if [[ "$BOOTSTRAP_OPENZFS" -eq 1 ]]; then
 fi
 
 ensure_openzfs_submodule
+apply_host_build_defaults
 check_openzfs_glibc_compat
 
 build_native
