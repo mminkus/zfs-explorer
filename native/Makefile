@@ -20,6 +20,8 @@ endif
 ZDX_GIT_SHA := $(shell git -C $(ZFS_SRC) rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
 # Include paths - use source tree for headers, prefix for libs
+# zfs_config.h is generated at the source root.
+CPPFLAGS += -I$(ZFS_SRC)
 CPPFLAGS += -I$(ZFS_SRC)/include
 CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include
 CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include/os/$(ZFS_OS)
@@ -27,6 +29,10 @@ CPPFLAGS += -I$(ZFS_SRC)/lib/libzpool/include
 CPPFLAGS += -Iinclude
 CPPFLAGS += -D_GNU_SOURCE
 CPPFLAGS += -DZDX_GIT_SHA=\"$(ZDX_GIT_SHA)\"
+# OpenZFS forces libzpool users to compile with ZFS_DEBUG as well.
+# Keep native shim ABI-compatible with vendored libzpool regardless of
+# configure --enable-debug/--disable-debug mode.
+CPPFLAGS += -DDEBUG -UNDEBUG -DZFS_DEBUG
 
 # Warning flags
 WARNFLAGS = -Wall -Wextra -Wshadow -Wformat=2 -Wstrict-prototypes -Wno-cast-qual

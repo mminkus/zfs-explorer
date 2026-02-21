@@ -163,6 +163,7 @@ apply_host_build_defaults() {
   append_env_once CPPFLAGS "-I/usr/local/include"
   append_env_once LDFLAGS "-L/usr/local/lib"
   append_env_once LIBS "-lintl"
+  append_env_once MAKE "$MAKE_CMD"
 
   if [[ -z "${LIBCLANG_PATH:-}" ]]; then
     local found
@@ -284,12 +285,12 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+apply_host_build_defaults
 if [[ "$BOOTSTRAP_OPENZFS" -eq 1 ]]; then
   bootstrap_openzfs
 fi
 
 ensure_openzfs_submodule
-apply_host_build_defaults
 check_openzfs_glibc_compat
 
 build_native
