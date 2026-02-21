@@ -153,7 +153,7 @@ zdx_objset_list_objects(zdx_pool_t *pool, uint64_t objset_id, int type_filter,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_list_objects: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -325,7 +325,7 @@ zdx_objset_root(zdx_pool_t *pool, uint64_t objset_id)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_root: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -387,7 +387,7 @@ zdx_objset_dir_entries(zdx_pool_t *pool, uint64_t objset_id,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_dir_entries: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -582,9 +582,22 @@ zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id, const char *path)
         goto out;
     }
 
+    /*
+     * Some exported/offline datasets can legitimately have a hole rootbp.
+     * Calling dmu_objset_from_ds() on those can trigger fragile error paths
+     * in certain userland/libzpool combinations. Short-circuit first.
+     */
+    const blkptr_t *head_bp = dsl_dataset_get_blkptr(ds);
+    if (head_bp == NULL || BP_IS_HOLE(head_bp)) {
+        result = make_error(ENOENT,
+            "objset_walk: dataset %llu has no objset (hole rootbp)",
+            (unsigned long long)objset_id);
+        goto out;
+    }
+
     err = dmu_objset_from_ds(ds, &os);
     if (err != 0) {
-        result = make_error(err, "dmu_objset_from_ds failed: %s",
+        result = make_error(err, "objset_walk: dmu_objset_from_ds failed: %s",
             strerror(err));
         goto out;
     }
@@ -839,7 +852,7 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
 
     err = dmu_objset_from_ds(ds, &os);
     if (err != 0) {
-        result = make_error(err, "dmu_objset_from_ds failed: %s",
+        result = make_error(err, "objset_stat: dmu_objset_from_ds failed: %s",
             strerror(err));
         goto out;
     }
@@ -997,7 +1010,7 @@ zdx_objset_get_object(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_get_object: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1136,7 +1149,7 @@ zdx_objset_get_blkptrs(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_get_blkptrs: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1285,7 +1298,7 @@ zdx_objset_zap_info(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_zap_info: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1377,7 +1390,7 @@ zdx_objset_zap_entries(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_zap_entries: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1816,7 +1829,7 @@ zdx_objset_read_data(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_read_data: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 

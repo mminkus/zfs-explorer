@@ -127,33 +127,27 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
     if (!pool || !pool->spa)
         return make_error(EINVAL, "pool not open");
 
+    dsl_pool_t *dp = pool->spa->spa_dsl_pool;
     objset_t *mos = spa_meta_objset(pool->spa);
     if (!mos)
         return make_error(EINVAL, "failed to access MOS");
 
-    dnode_t *dn = NULL;
-    int err = dnode_hold(mos, objid, FTAG, &dn);
+    dsl_dir_t *dd = NULL;
+    int err;
+    dsl_pool_config_enter(dp, FTAG);
+    err = dsl_dir_hold_obj(dp, objid, NULL, FTAG, &dd);
     if (err != 0)
-        return make_error(err, "dnode_hold failed for object %llu",
-            (unsigned long long)objid);
+        goto out_unlock;
 
-    dmu_object_info_t doi;
-    dmu_object_info_from_dnode(dn, &doi);
-
-    if (doi.doi_bonus_type != DMU_OT_DSL_DIR ||
-        dn->dn_bonuslen < sizeof (dsl_dir_phys_t)) {
-        dnode_rele(dn, FTAG);
-        return make_error(EINVAL, "object %llu is not DSL dir",
-            (unsigned long long)objid);
-    }
-
-    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dn->dn_phys);
-    uint64_t zapobj = dd->dd_child_dir_zapobj;
-    dnode_rele(dn, FTAG);
+    uint64_t zapobj = dsl_dir_phys(dd)->dd_child_dir_zapobj;
+    dsl_dir_rele(dd, FTAG);
+    dd = NULL;
 
     char *array = json_array_start();
-    if (!array)
-        return make_error(ENOMEM, "failed to allocate JSON array");
+    if (!array) {
+        err = ENOMEM;
+        goto out_unlock;
+    }
     int count = 0;
 
     if (zapobj != 0) {
@@ -163,7 +157,8 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
         if (!attrp) {
             zap_cursor_fini(&zc);
             free(array);
-            return make_error(ENOMEM, "failed to allocate zap attribute");
+            err = ENOMEM;
+            goto out_unlock;
         }
 
         while ((err = zap_cursor_retrieve(&zc, attrp)) == 0) {
@@ -174,37 +169,32 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
                     8, 1, &child_obj);
             }
 
-            // Skip entries with invalid object IDs
+            /* Skip entries with invalid object IDs. */
             if (child_obj == 0) {
                 zap_cursor_advance(&zc);
                 continue;
             }
 
-            // Validate that the child object exists and is a DSL directory
-            dnode_t *child_dn = NULL;
-            int child_err = dnode_hold(mos, child_obj, FTAG, &child_dn);
+            /*
+             * Validate child as a real DSL dir via dsl_dir_hold_obj() while
+             * config lock is held.
+             */
+            dsl_dir_t *child_dd = NULL;
+            int child_err = dsl_dir_hold_obj(dp, child_obj, NULL, FTAG,
+                &child_dd);
             if (child_err != 0) {
-                // Skip non-existent objects
                 zap_cursor_advance(&zc);
                 continue;
             }
-
-            dmu_object_info_t child_doi;
-            dmu_object_info_from_dnode(child_dn, &child_doi);
-            dnode_rele(child_dn, FTAG);
-
-            // Skip if not a DSL directory
-            if (child_doi.doi_bonus_type != DMU_OT_DSL_DIR) {
-                zap_cursor_advance(&zc);
-                continue;
-            }
+            dsl_dir_rele(child_dd, FTAG);
 
             char *name_json = json_string(attrp->za_name);
             if (!name_json) {
                 zap_attribute_free(attrp);
                 zap_cursor_fini(&zc);
                 free(array);
-                return make_error(ENOMEM, "failed to allocate name");
+                err = ENOMEM;
+                goto out_unlock;
             }
 
             char *item = json_format(
@@ -216,7 +206,8 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
                 zap_attribute_free(attrp);
                 zap_cursor_fini(&zc);
                 free(array);
-                return make_error(ENOMEM, "failed to allocate JSON item");
+                err = ENOMEM;
+                goto out_unlock;
             }
 
             char *new_array = json_array_append(array, item);
@@ -225,7 +216,8 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
                 zap_attribute_free(attrp);
                 zap_cursor_fini(&zc);
                 free(array);
-                return make_error(ENOMEM, "failed to append JSON item");
+                err = ENOMEM;
+                goto out_unlock;
             }
             free(array);
             array = new_array;
@@ -238,18 +230,21 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
             zap_attribute_free(attrp);
             zap_cursor_fini(&zc);
             free(array);
-            return make_error(err, "zap_cursor_retrieve failed: %s",
-                strerror(err));
+            goto out_unlock;
         }
 
         zap_attribute_free(attrp);
         zap_cursor_fini(&zc);
+    } else {
+        err = 0;
     }
 
     char *children_json = json_array_end(array, count > 0);
     free(array);
-    if (!children_json)
-        return make_error(ENOMEM, "failed to finalize JSON array");
+    if (!children_json) {
+        err = ENOMEM;
+        goto out_unlock;
+    }
 
     char *result = json_format(
         "{"
@@ -262,10 +257,29 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
         children_json);
     free(children_json);
 
-    if (!result)
-        return make_error(ENOMEM, "failed to allocate JSON result");
+    if (!result) {
+        err = ENOMEM;
+        goto out_unlock;
+    }
 
+    dsl_pool_config_exit(dp, FTAG);
     return make_success(result);
+
+out_unlock:
+    if (dd != NULL)
+        dsl_dir_rele(dd, FTAG);
+    dsl_pool_config_exit(dp, FTAG);
+    if (err == EINVAL)
+        return make_error(err, "object %llu is not DSL dir",
+            (unsigned long long)objid);
+    if (err == ENOMEM)
+        return make_error(err, "failed to allocate JSON result");
+    if (err == ENOENT)
+        return make_error(err, "dsl_dir_children lookup failed: %s",
+            strerror(err));
+    if (err != 0)
+        return make_error(err, "dsl_dir_children failed: %s", strerror(err));
+    return make_error(EFAULT, "dsl_dir_children failed");
 }
 
 /*
@@ -277,28 +291,22 @@ zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid)
     if (!pool || !pool->spa)
         return make_error(EINVAL, "pool not open");
 
-    objset_t *mos = spa_meta_objset(pool->spa);
-    if (!mos)
-        return make_error(EINVAL, "failed to access MOS");
+    dsl_pool_t *dp = pool->spa->spa_dsl_pool;
+    dsl_dir_t *dd = NULL;
+    int err;
+    uint64_t head;
 
-    dnode_t *dn = NULL;
-    int err = dnode_hold(mos, objid, FTAG, &dn);
-    if (err != 0)
-        return make_error(err, "dnode_hold failed for object %llu",
-            (unsigned long long)objid);
-
-    dmu_object_info_t doi;
-    dmu_object_info_from_dnode(dn, &doi);
-    if (doi.doi_bonus_type != DMU_OT_DSL_DIR ||
-        dn->dn_bonuslen < sizeof (dsl_dir_phys_t)) {
-        dnode_rele(dn, FTAG);
-        return make_error(EINVAL, "object %llu is not DSL dir",
+    dsl_pool_config_enter(dp, FTAG);
+    err = dsl_dir_hold_obj(dp, objid, NULL, FTAG, &dd);
+    if (err != 0) {
+        dsl_pool_config_exit(dp, FTAG);
+        return make_error(err, "dsl_dir_hold_obj failed for object %llu",
             (unsigned long long)objid);
     }
 
-    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)DN_BONUS(dn->dn_phys);
-    uint64_t head = dd->dd_head_dataset_obj;
-    dnode_rele(dn, FTAG);
+    head = dsl_dir_phys(dd)->dd_head_dataset_obj;
+    dsl_dir_rele(dd, FTAG);
+    dsl_pool_config_exit(dp, FTAG);
 
     char *result = json_format(
         "{\"dir_objid\":%llu,\"head_dataset_obj\":%llu}",
@@ -320,34 +328,27 @@ zdx_dsl_root_dir(zdx_pool_t *pool)
     if (!pool || !pool->spa)
         return make_error(EINVAL, "pool not open");
 
-    objset_t *mos = spa_meta_objset(pool->spa);
-    if (!mos)
-        return make_error(EINVAL, "failed to access MOS");
-
-    // Note: DMU_POOL_ROOT_DATASET actually points to the root *directory* object,
-    // not a dataset. This is confusing OpenZFS naming.
+    dsl_pool_t *dp = pool->spa->spa_dsl_pool;
     uint64_t root_dir = 0;
-    int err = zap_lookup(mos, DMU_POOL_DIRECTORY_OBJECT,
-        DMU_POOL_ROOT_DATASET, 8, 1, &root_dir);
+    uint64_t root_dataset = 0;
+    int err;
+    dsl_dir_t *root_dd = NULL;
+
+    dsl_pool_config_enter(dp, FTAG);
+    /*
+     * Resolve the pool root directory by name under dp_config_rwlock.
+     * This is more robust across on-disk layout/version differences than
+     * relying solely on a raw MOS zap lookup.
+     */
+    err = dsl_dir_hold(dp, spa_name(pool->spa), FTAG, &root_dd, NULL);
     if (err != 0)
-        return make_error(err, "failed to lookup root_dataset: %s",
-            strerror(err));
+        goto out_unlock;
 
-    // Read the directory's head_dataset_obj to get the actual root dataset
-    dmu_buf_t *db = NULL;
-    err = dmu_bonus_hold(mos, root_dir, FTAG, &db);
-    if (err != 0)
-        return make_error(err, "dmu_bonus_hold failed for root dir %llu",
-            (unsigned long long)root_dir);
-
-    if (db->db_size < sizeof (dsl_dir_phys_t)) {
-        dmu_buf_rele(db, FTAG);
-        return make_error(EINVAL, "root dir bonus too small");
-    }
-
-    dsl_dir_phys_t *dd = (dsl_dir_phys_t *)db->db_data;
-    uint64_t root_dataset = dd->dd_head_dataset_obj;
-    dmu_buf_rele(db, FTAG);
+    root_dir = root_dd->dd_object;
+    root_dataset = dsl_dir_phys(root_dd)->dd_head_dataset_obj;
+    dsl_dir_rele(root_dd, FTAG);
+    root_dd = NULL;
+    dsl_pool_config_exit(dp, FTAG);
 
     char *result = json_format(
         "{"
@@ -357,6 +358,61 @@ zdx_dsl_root_dir(zdx_pool_t *pool)
         (unsigned long long)root_dataset,
         (unsigned long long)root_dir);
 
+    if (!result)
+        return make_error(ENOMEM, "failed to allocate JSON result");
+
+    return make_success(result);
+
+out_unlock:
+    if (root_dd != NULL)
+        dsl_dir_rele(root_dd, FTAG);
+    dsl_pool_config_exit(dp, FTAG);
+    return make_error(err, "failed to resolve root dir: %s", strerror(err));
+}
+
+/*
+ * Resolve DSL directory metadata by dataset name.
+ */
+zdx_result_t
+zdx_dsl_dir_by_name(zdx_pool_t *pool, const char *name)
+{
+    if (!pool || !pool->spa)
+        return make_error(EINVAL, "pool not open");
+    if (!name || name[0] == '\0')
+        return make_error(EINVAL, "dataset name is empty");
+
+    dsl_pool_t *dp = pool->spa->spa_dsl_pool;
+    dsl_dir_t *dd = NULL;
+    int err;
+    uint64_t dir_obj = 0;
+    uint64_t head_obj = 0;
+
+    dsl_pool_config_enter(dp, FTAG);
+    err = dsl_dir_hold(dp, name, FTAG, &dd, NULL);
+    if (err != 0) {
+        dsl_pool_config_exit(dp, FTAG);
+        return make_error(err, "dsl_dir_hold failed for '%s': %s",
+            name, strerror(err));
+    }
+
+    dir_obj = dd->dd_object;
+    head_obj = dsl_dir_phys(dd)->dd_head_dataset_obj;
+    dsl_dir_rele(dd, FTAG);
+    dsl_pool_config_exit(dp, FTAG);
+
+    char *name_json = json_string(name);
+    if (!name_json)
+        return make_error(ENOMEM, "failed to encode dataset name");
+    char *result = json_format(
+        "{"
+        "\"name\":%s,"
+        "\"dir_objid\":%llu,"
+        "\"head_dataset_obj\":%llu"
+        "}",
+        name_json,
+        (unsigned long long)dir_obj,
+        (unsigned long long)head_obj);
+    free(name_json);
     if (!result)
         return make_error(ENOMEM, "failed to allocate JSON result");
 
