@@ -673,7 +673,6 @@ zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj)
 
     spa_t *spa = pool->spa;
     dsl_dataset_t *ds = NULL;
-    objset_t *os = NULL;
     int err;
 
     dsl_pool_config_enter(spa->spa_dsl_pool, FTAG);
@@ -713,15 +712,14 @@ zdx_dataset_objset(zdx_pool_t *pool, uint64_t dsobj)
             (unsigned long long)dsobj);
     }
 
-    err = dmu_objset_from_ds(ds, &os);
-    if (err != 0) {
-        dsl_dataset_rele(ds, FTAG);
-        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
-            strerror(err));
-    }
-
-    uint64_t objset_id = dmu_objset_id(os);
+    /*
+     * In OpenZFS the objset ID equals the DSL dataset object ID.
+     * Avoid dmu_objset_from_ds() entirely: opening the objset triggers
+     * background eviction activity (dbu_evict) that can assert in
+     * bpobj_iterate_impl on some Linux environments (Ubuntu 24.04).
+     * We never use the objset_t pointer here, so skip it.
+     */
+    uint64_t objset_id = dsobj;
 
     dsl_dataset_rele(ds, FTAG);
     dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
