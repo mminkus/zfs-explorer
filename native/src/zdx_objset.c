@@ -18,6 +18,70 @@ master_node_key_is_object_ref(const char *name)
 }
 
 /*
+ * Hold a dataset-backed objset by dataset object ID.
+ *
+ * On success: returns 0, sets *dsp and *osp, and leaves the DSL pool config lock
+ * held.  The caller MUST release both the dataset and the config lock when
+ * done:
+ *
+ *   dsl_dataset_rele(*dsp, FTAG);
+ *   dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
+ *
+ * Keeping the config lock held through the operation (and through
+ * dsl_dataset_rele) is required by OpenZFS internals: releasing a dataset
+ * hold without the config lock can race with background threads
+ * (e.g. dbu_evict / dsl_deadlist_move_bpobj) and trigger assertion failures.
+ *
+ * On failure: the dataset hold and config lock are already released; the
+ * caller receives only the error code.
+ */
+static int
+zdx_hold_objset_by_dsobj(spa_t *spa, uint64_t dsobj, dsl_dataset_t **dsp,
+    objset_t **osp, const void *tag)
+{
+    dsl_dataset_t *ds = NULL;
+    int err;
+
+    if (spa == NULL || dsp == NULL || osp == NULL)
+        return EINVAL;
+
+    *dsp = NULL;
+    *osp = NULL;
+
+    /*
+     * Use the caller-supplied tag for the config lock so that the
+     * caller's dsl_pool_config_exit() call (which also uses the
+     * caller's FTAG) can find the matching TSD node.  dp_config_rwlock
+     * is initialized with track_all=TRUE, so enter and exit MUST use
+     * the same tag pointer.
+     */
+    dsl_pool_config_enter(spa->spa_dsl_pool, tag);
+    err = dsl_dataset_hold_obj(spa->spa_dsl_pool, dsobj, FTAG, &ds);
+    if (err != 0) {
+        dsl_pool_config_exit(spa->spa_dsl_pool, tag);
+        return err;
+    }
+
+    const blkptr_t *head_bp = dsl_dataset_get_blkptr(ds);
+    if (head_bp == NULL || BP_IS_HOLE(head_bp)) {
+        dsl_dataset_rele(ds, FTAG);
+        dsl_pool_config_exit(spa->spa_dsl_pool, tag);
+        return ENOENT;
+    }
+
+    err = dmu_objset_from_ds(ds, osp);
+    if (err != 0) {
+        dsl_dataset_rele(ds, FTAG);
+        dsl_pool_config_exit(spa->spa_dsl_pool, tag);
+        return err;
+    }
+
+    /* Config lock remains held; caller is responsible for releasing it. */
+    *dsp = ds;
+    return 0;
+}
+
+/*
  * Convert blkptr to JSON object.
  * Kept local to objset inspector paths so we can decode ZPL object blkptrs.
  */
@@ -153,7 +217,7 @@ zdx_objset_list_objects(zdx_pool_t *pool, uint64_t objset_id, int type_filter,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_list_objects: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -325,7 +389,7 @@ zdx_objset_root(zdx_pool_t *pool, uint64_t objset_id)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_root: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -387,7 +451,7 @@ zdx_objset_dir_entries(zdx_pool_t *pool, uint64_t objset_id,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_dir_entries: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -563,7 +627,6 @@ zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id, const char *path)
     dsl_dataset_t *ds = NULL;
     objset_t *os = NULL;
     int err;
-    int config_entered = 0;
     zdx_result_t result;
     char *resolved = NULL;
     char *remaining = NULL;
@@ -573,18 +636,9 @@ zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id, const char *path)
     char *error_json = NULL;
     const char *error_kind = NULL;
 
-    dsl_pool_config_enter(spa->spa_dsl_pool, FTAG);
-    config_entered = 1;
-    err = dsl_dataset_hold_obj(spa->spa_dsl_pool, objset_id, FTAG, &ds);
+    err = zdx_hold_objset_by_dsobj(spa, objset_id, &ds, &os, FTAG);
     if (err != 0) {
-        result = make_error(err, "dsl_dataset_hold_obj failed: %s",
-            strerror(err));
-        goto out;
-    }
-
-    err = dmu_objset_from_ds(ds, &os);
-    if (err != 0) {
-        result = make_error(err, "dmu_objset_from_ds failed: %s",
+        result = make_error(err, "objset_walk: failed to hold objset: %s",
             strerror(err));
         goto out;
     }
@@ -797,10 +851,10 @@ zdx_objset_walk(zdx_pool_t *pool, uint64_t objset_id, const char *path)
     result = make_success(json);
 
 out:
-    if (ds)
+    if (ds) {
         dsl_dataset_rele(ds, FTAG);
-    if (config_entered)
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
+    }
     free(resolved);
     free(remaining);
     free(path_json);
@@ -823,23 +877,12 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     dsl_dataset_t *ds = NULL;
     objset_t *os = NULL;
     int err;
-    int config_entered = 0;
     zdx_result_t result;
     sa_attr_type_t *sa_table = NULL;
-    boolean_t sa_setup_done = B_FALSE;
 
-    dsl_pool_config_enter(spa->spa_dsl_pool, FTAG);
-    config_entered = 1;
-    err = dsl_dataset_hold_obj(spa->spa_dsl_pool, objset_id, FTAG, &ds);
+    err = zdx_hold_objset_by_dsobj(spa, objset_id, &ds, &os, FTAG);
     if (err != 0) {
-        result = make_error(err, "dsl_dataset_hold_obj failed: %s",
-            strerror(err));
-        goto out;
-    }
-
-    err = dmu_objset_from_ds(ds, &os);
-    if (err != 0) {
-        result = make_error(err, "dmu_objset_from_ds failed: %s",
+        result = make_error(err, "objset_stat: failed to hold objset: %s",
             strerror(err));
         goto out;
     }
@@ -855,7 +898,6 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
         result = make_error(err, "sa_setup failed: %s", strerror(err));
         goto out;
     }
-    sa_setup_done = B_TRUE;
 
     sa_handle_t *hdl = NULL;
     err = sa_handle_get(os, objid, NULL, SA_HDL_PRIVATE, &hdl);
@@ -961,12 +1003,15 @@ zdx_objset_stat(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     result = make_success(result_json);
 
 out:
-    if (sa_setup_done && os && os->os_sa != NULL)
-        sa_tear_down(os);
-    if (ds)
+    /*
+     * sa_setup() attaches per-objset SA state and returns an existing table
+     * on subsequent calls. Do not tear it down on per-request exit.
+     * Tearing down while the objset remains cached can race internal users.
+     */
+    if (ds) {
         dsl_dataset_rele(ds, FTAG);
-    if (config_entered)
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
+    }
     return result;
 }
 
@@ -997,7 +1042,7 @@ zdx_objset_get_object(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_get_object: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1136,7 +1181,7 @@ zdx_objset_get_blkptrs(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_get_blkptrs: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1285,7 +1330,7 @@ zdx_objset_zap_info(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid)
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_zap_info: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1377,7 +1422,7 @@ zdx_objset_zap_entries(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
     if (err != 0) {
         dsl_dataset_rele(ds, FTAG);
         dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_zap_entries: dmu_objset_from_ds failed: %s",
             strerror(err));
     }
 
@@ -1803,36 +1848,25 @@ zdx_objset_read_data(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
     uint64_t max_offset = 0;
     uint64_t read_size = 0;
     boolean_t eof = B_TRUE;
+    zdx_result_t result;
 
-    dsl_pool_config_enter(spa->spa_dsl_pool, FTAG);
-    err = dsl_dataset_hold_obj(spa->spa_dsl_pool, objset_id, FTAG, &ds);
+    err = zdx_hold_objset_by_dsobj(spa, objset_id, &ds, &os, FTAG);
     if (err != 0) {
-        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dsl_dataset_hold_obj failed: %s",
-            strerror(err));
-    }
-
-    err = dmu_objset_from_ds(ds, &os);
-    if (err != 0) {
-        dsl_dataset_rele(ds, FTAG);
-        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_objset_from_ds failed: %s",
+        return make_error(err, "objset_read_data: failed to hold objset: %s",
             strerror(err));
     }
 
     if (dmu_objset_type(os) != DMU_OST_ZFS) {
-        dsl_dataset_rele(ds, FTAG);
-        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(EINVAL, "objset is not ZFS (type %d)",
+        result = make_error(EINVAL, "objset is not ZFS (type %d)",
             dmu_objset_type(os));
+        goto out;
     }
 
     err = dmu_object_info(os, objid, &doi);
     if (err != 0) {
-        dsl_dataset_rele(ds, FTAG);
-        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(err, "dmu_object_info failed for object %llu: %s",
+        result = make_error(err, "dmu_object_info failed for object %llu: %s",
             (unsigned long long)objid, strerror(err));
+        goto out;
     }
 
     max_offset = doi.doi_max_offset;
@@ -1847,33 +1881,31 @@ zdx_objset_read_data(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
     if (read_size > 0) {
         buf = malloc((size_t)read_size);
         if (!buf) {
-            dsl_dataset_rele(ds, FTAG);
-            dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-            return make_error(ENOMEM, "failed to allocate read buffer");
+            result = make_error(ENOMEM, "failed to allocate read buffer");
+            goto out;
         }
 
         err = dmu_read(os, objid, offset, read_size, buf, 0);
         if (err != 0) {
             free(buf);
-            dsl_dataset_rele(ds, FTAG);
-            dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-            return make_error(err, "dmu_read failed for object %llu: %s",
+            buf = NULL;
+            result = make_error(err, "dmu_read failed for object %llu: %s",
                 (unsigned long long)objid, strerror(err));
+            goto out;
         }
 
         hex = bytes_to_hex((const uint8_t *)buf, (size_t)read_size);
         free(buf);
+        buf = NULL;
         if (!hex) {
-            dsl_dataset_rele(ds, FTAG);
-            dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-            return make_error(ENOMEM, "failed to encode read buffer to hex");
+            result = make_error(ENOMEM, "failed to encode read buffer to hex");
+            goto out;
         }
     } else {
         hex = strdup("");
         if (!hex) {
-            dsl_dataset_rele(ds, FTAG);
-            dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-            return make_error(ENOMEM, "failed to allocate empty hex string");
+            result = make_error(ENOMEM, "failed to allocate empty hex string");
+            goto out;
         }
     }
 
@@ -1881,10 +1913,10 @@ zdx_objset_read_data(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
 
     hex_json = json_string(hex);
     free(hex);
+    hex = NULL;
     if (!hex_json) {
-        dsl_dataset_rele(ds, FTAG);
-        dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-        return make_error(ENOMEM, "failed to encode data hex JSON");
+        result = make_error(ENOMEM, "failed to encode data hex JSON");
+        goto out;
     }
 
     result_json = json_format(
@@ -1907,11 +1939,20 @@ zdx_objset_read_data(zdx_pool_t *pool, uint64_t objset_id, uint64_t objid,
         eof ? "true" : "false",
         hex_json);
     free(hex_json);
+    hex_json = NULL;
+
+    if (!result_json) {
+        result = make_error(ENOMEM, "failed to allocate JSON result");
+        goto out;
+    }
+
+    result = make_success(result_json);
+
+out:
+    free(buf);
+    free(hex);
+    free(hex_json);
     dsl_dataset_rele(ds, FTAG);
     dsl_pool_config_exit(spa->spa_dsl_pool, FTAG);
-
-    if (!result_json)
-        return make_error(ENOMEM, "failed to allocate JSON result");
-
-    return make_success(result_json);
+    return result;
 }

@@ -6,9 +6,19 @@
 mod bindings;
 
 use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::sync::{Mutex, Once};
 
 pub use bindings::*;
+
+/*
+ * Compatibility declaration for symbols that may lag in generated bindings
+ * if the target host has not refreshed bindgen output yet.
+ */
+unsafe extern "C" {
+    #[link_name = "zdx_dsl_dir_by_name"]
+    fn zdx_dsl_dir_by_name_compat(pool: *mut zdx_pool_t, name: *const c_char) -> zdx_result_t;
+}
 
 /// Global mutex around all FFI calls (per plan's concurrency model)
 static FFI_MUTEX: Mutex<()> = Mutex::new(());
@@ -272,6 +282,14 @@ pub fn dsl_root_dir(pool: *mut zdx_pool_t) -> ZdxResult {
     let _lock = FFI_MUTEX.lock().unwrap();
     let raw = unsafe { zdx_dsl_root_dir(pool) };
     ZdxResult::from_raw(raw)
+}
+
+/// Resolve a DSL directory by full dataset name
+pub fn dsl_dir_by_name(pool: *mut zdx_pool_t, name: &str) -> Result<ZdxResult, String> {
+    let c_name = CString::new(name).map_err(|_| "dataset name contains NUL".to_string())?;
+    let _lock = FFI_MUTEX.lock().unwrap();
+    let raw = unsafe { zdx_dsl_dir_by_name_compat(pool, c_name.as_ptr()) };
+    Ok(ZdxResult::from_raw(raw))
 }
 
 /// Dataset -> objset mapping

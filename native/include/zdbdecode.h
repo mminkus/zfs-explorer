@@ -64,6 +64,7 @@ zdx_result_t zdx_read_block(zdx_pool_t *pool, uint64_t vdev,
 zdx_result_t zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid);
 zdx_result_t zdx_dsl_root_dir(zdx_pool_t *pool);
+zdx_result_t zdx_dsl_dir_by_name(zdx_pool_t *pool, const char *name);
 
 /* === Dataset / Objset === */
 zdx_result_t zdx_dataset_snapshots(zdx_pool_t *pool, uint64_t dir_obj);
