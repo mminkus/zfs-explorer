@@ -3,6 +3,7 @@ mod ffi;
 
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber;
@@ -25,6 +26,17 @@ pub struct AppState {
     pub pool: Arc<Mutex<Option<ffi::PoolHandle>>>,
     pub pool_open: Arc<Mutex<PoolOpenConfig>>,
 }
+
+const REPO_URL: &str = "https://github.com/mminkus/zfs-explorer";
+const ZFS_SPA_VERSION: u64 = 5000;
+const ZFS_ZPL_VERSION: u64 = 5;
+const EXPLORER_BUILD_VERSION: &str = match option_env!("ZFS_EXPLORER_BUILD_VERSION") {
+    Some(v) => v,
+    None => match option_env!("ZFS_EXPLORER_GIT_SHA") {
+        Some(sha) => sha,
+        None => env!("CARGO_PKG_VERSION"),
+    },
+};
 
 fn parse_pool_open_mode() -> Result<PoolOpenMode, String> {
     let raw = std::env::var("ZFS_EXPLORER_POOL_MODE").unwrap_or_else(|_| "live".to_string());
@@ -61,6 +73,50 @@ fn env_truthy(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn read_trimmed_file(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_kernel_module_version() -> (Option<String>, &'static str) {
+    if let Some(version) = read_trimmed_file("/sys/module/zfs/version") {
+        return (Some(version), "loaded module");
+    }
+    if let Some(version) = command_output("modinfo", &["-F", "version", "zfs"]) {
+        return (Some(version), "modinfo");
+    }
+    (None, "unavailable")
+}
+
+#[cfg(target_os = "freebsd")]
+fn detect_kernel_module_version() -> (Option<String>, &'static str) {
+    if let Some(version) = command_output("sysctl", &["-n", "vfs.zfs.version.module"]) {
+        return (Some(version), "sysctl");
+    }
+    (None, "unavailable")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn detect_kernel_module_version() -> (Option<String>, &'static str) {
+    (None, "unsupported OS")
 }
 
 #[cfg(unix)]
@@ -119,12 +175,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let offline_pool_names = parse_offline_pool_names();
     check_runtime_privileges(mode)?;
 
+    let (kernel_module_version, kernel_module_source) = detect_kernel_module_version();
+    tracing::info!(
+        "ZFS Explorer ({}), OpenZFS ({}) userland, starting...",
+        EXPLORER_BUILD_VERSION,
+        ffi::version()
+    );
+    tracing::info!("{}", REPO_URL);
+
     // Initialize ZFS
     tracing::info!("Initializing ZFS library...");
     ffi::init()?;
 
-    let version = ffi::version();
-    tracing::info!("ZFS Explorer starting (OpenZFS {})", version);
+    match kernel_module_version {
+        Some(version) => tracing::info!(
+            "Kernel module {}: {}, ZFS pool version {}, ZFS filesystem version {}",
+            kernel_module_source,
+            version,
+            ZFS_SPA_VERSION,
+            ZFS_ZPL_VERSION
+        ),
+        None => tracing::info!(
+            "Kernel module {} (not found), ZFS pool version {}, ZFS filesystem version {}",
+            kernel_module_source,
+            ZFS_SPA_VERSION,
+            ZFS_ZPL_VERSION
+        ),
+    }
 
     match mode {
         PoolOpenMode::Live => {

@@ -20,6 +20,24 @@ fn git_short_sha() -> String {
     }
 }
 
+fn git_build_version() -> String {
+    let output = Command::new("git")
+        .args(["-C", "..", "describe", "--tags", "--dirty", "--always"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if version.is_empty() {
+                git_short_sha()
+            } else {
+                version
+            }
+        }
+        _ => git_short_sha(),
+    }
+}
+
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "linux".to_string());
 
@@ -35,6 +53,10 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rustc-env=ZFS_EXPLORER_GIT_SHA={}", git_short_sha());
+    println!(
+        "cargo:rustc-env=ZFS_EXPLORER_BUILD_VERSION={}",
+        git_build_version()
+    );
 
     // Link to native library
     println!("cargo:rustc-link-search=native={}", libzdbdecode_path);

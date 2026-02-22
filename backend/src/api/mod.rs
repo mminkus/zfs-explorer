@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,14 +36,66 @@ const OBJSET_DATA_MAX_LIMIT: u64 = 1 << 20;
 const ZPL_DOWNLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const BACKEND_NAME: &str = env!("CARGO_PKG_NAME");
 const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BACKEND_BUILD_VERSION: &str = match option_env!("ZFS_EXPLORER_BUILD_VERSION") {
+    Some(v) => v,
+    None => BUILD_GIT_SHA,
+};
 const BUILD_GIT_SHA: &str = match option_env!("ZFS_EXPLORER_GIT_SHA") {
     Some(v) => v,
     None => "unknown",
 };
+const REPO_URL: &str = "https://github.com/mminkus/zfs-explorer";
+const ZFS_SPA_VERSION: u64 = 5000;
+const ZFS_ZPL_VERSION: u64 = 5;
 const ARCSTATS_PATH: &str = "/proc/spl/kstat/zfs/arcstats";
 const TXGS_PATH: &str = "/proc/spl/kstat/zfs/txgs";
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
+
+fn read_trimmed_file(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_kernel_module_version() -> (Option<String>, &'static str) {
+    if let Some(version) = read_trimmed_file("/sys/module/zfs/version") {
+        return (Some(version), "loaded module");
+    }
+    if let Some(version) = command_output("modinfo", &["-F", "version", "zfs"]) {
+        return (Some(version), "modinfo");
+    }
+    (None, "unavailable")
+}
+
+#[cfg(target_os = "freebsd")]
+fn detect_kernel_module_version() -> (Option<String>, &'static str) {
+    if let Some(version) = command_output("sysctl", &["-n", "vfs.zfs.version.module"]) {
+        return (Some(version), "sysctl");
+    }
+    (None, "unavailable")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn detect_kernel_module_version() -> (Option<String>, &'static str) {
+    (None, "unsupported OS")
+}
 
 fn host_cli_command(program: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
@@ -340,15 +393,24 @@ fn pool_open_config(state: &AppState) -> crate::PoolOpenConfig {
 }
 
 fn build_version_payload(pool_open: &crate::PoolOpenConfig) -> Value {
+    let (kernel_module_version, kernel_module_source) = detect_kernel_module_version();
     json!({
         "project": "zfs-explorer",
+        "project_url": REPO_URL,
         "backend": {
             "name": BACKEND_NAME,
             "version": BACKEND_VERSION,
             "git_sha": BUILD_GIT_SHA,
+            "build_version": BACKEND_BUILD_VERSION,
         },
         "openzfs": {
             "commit": crate::ffi::version(),
+            "spa_version": ZFS_SPA_VERSION,
+            "zpl_version": ZFS_ZPL_VERSION,
+            "kernel_module": {
+                "version": kernel_module_version,
+                "source": kernel_module_source,
+            },
         },
         "runtime": {
             "os": std::env::consts::OS,
@@ -3840,10 +3902,15 @@ mod tests {
             offline_pool_names: Vec::new(),
         });
         assert_eq!(payload["project"], "zfs-explorer");
+        assert_eq!(payload["project_url"], REPO_URL);
         assert_eq!(payload["backend"]["name"], BACKEND_NAME);
         assert_eq!(payload["backend"]["version"], BACKEND_VERSION);
         assert!(payload["backend"]["git_sha"].as_str().is_some());
+        assert!(payload["backend"]["build_version"].as_str().is_some());
         assert!(payload["openzfs"]["commit"].as_str().is_some());
+        assert_eq!(payload["openzfs"]["spa_version"], ZFS_SPA_VERSION);
+        assert_eq!(payload["openzfs"]["zpl_version"], ZFS_ZPL_VERSION);
+        assert!(payload["openzfs"]["kernel_module"]["source"].as_str().is_some());
         assert_eq!(payload["runtime"]["os"], std::env::consts::OS);
         assert_eq!(payload["runtime"]["arch"], std::env::consts::ARCH);
         assert_eq!(payload["pool_open"]["mode"], "live");
