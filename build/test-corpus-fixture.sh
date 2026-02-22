@@ -182,15 +182,28 @@ echo "==> Starting backend for checksum validation"
 PID="$!"
 
 echo "==> Waiting for backend readiness at $BASE_URL"
+READY=0
 for _ in $(seq 1 60); do
+  if ! kill -0 "$PID" >/dev/null 2>&1; then
+    echo "error: backend exited before readiness (possible port conflict at $BASE_URL)" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+  fi
   if curl -sS "$BASE_URL/api/version" >/dev/null 2>&1; then
+    READY=1
     break
   fi
   sleep 0.25
 done
 
-if ! curl -sS "$BASE_URL/api/version" >/dev/null 2>&1; then
+if [[ "$READY" -ne 1 ]]; then
   echo "error: backend did not become ready" >&2
+  cat "$LOG_FILE" >&2
+  exit 1
+fi
+
+if ! kill -0 "$PID" >/dev/null 2>&1; then
+  echo "error: backend process exited after readiness check (possible existing service on $BASE_URL)" >&2
   cat "$LOG_FILE" >&2
   exit 1
 fi
