@@ -17,8 +17,10 @@ Options:
   --layout <type>      Vdev layout: single|mirror|raidz1|raidz2|raidz3
                        (default: mirror)
   --profile <name>     Feature profile:
-                       baseline|dedup|embedded-zstd|encryption-no-key|
-                       encryption-with-key|degraded-missing-vdev
+                       baseline|dedup|embedded-zstd|embedded-data|
+                       large-dnode|block-cloning|zvol|bookmarks|
+                       encryption-no-key|encryption-with-key|
+                       degraded-missing-vdev
                        (default: baseline)
   --root <path>        Corpus root directory (default: fixtures/corpus)
   --size <value>       Per-vdev image size for truncate (default: 512M)
@@ -91,7 +93,7 @@ case "$LAYOUT" in
 esac
 
 case "$PROFILE" in
-  baseline|dedup|embedded-zstd|encryption-no-key|encryption-with-key|degraded-missing-vdev) ;;
+  baseline|dedup|embedded-zstd|embedded-data|large-dnode|block-cloning|zvol|bookmarks|encryption-no-key|encryption-with-key|degraded-missing-vdev) ;;
   *)
     echo "error: unsupported profile '$PROFILE'" >&2
     exit 2
@@ -207,12 +209,18 @@ sudo zfs create "$POOL/data/media"
 compression="lz4"
 recordsize="128K"
 dedup="off"
+dnodesize="legacy"
 encrypted_dataset=""
 encrypted_keyfile=""
 encrypted_mode="none"
 degrade_missing_vdev=0
 missing_vdev_path=""
 missing_vdev_shadow=""
+block_clone_mode="none"
+large_dnode_xattrs=0
+zvol_dataset=""
+zvol_size=""
+bookmark_names=()
 
 case "$PROFILE" in
   baseline)
@@ -228,6 +236,34 @@ case "$PROFILE" in
   embedded-zstd)
     compression="zstd-5"
     recordsize="16K"
+    dedup="off"
+    ;;
+  embedded-data)
+    compression="lz4"
+    recordsize="16K"
+    dedup="off"
+    ;;
+  large-dnode)
+    compression="lz4"
+    recordsize="128K"
+    dedup="off"
+    dnodesize="auto"
+    ;;
+  block-cloning)
+    compression="lz4"
+    recordsize="1M"
+    dedup="off"
+    ;;
+  zvol)
+    compression="lz4"
+    recordsize="128K"
+    dedup="off"
+    zvol_dataset="$POOL/vol0"
+    zvol_size="64M"
+    ;;
+  bookmarks)
+    compression="lz4"
+    recordsize="128K"
     dedup="off"
     ;;
   encryption-no-key)
@@ -262,6 +298,7 @@ fi
 sudo zfs set compression="$compression" "$POOL/data"
 sudo zfs set recordsize="$recordsize" "$POOL/data"
 sudo zfs set dedup="$dedup" "$POOL/data"
+sudo zfs set dnodesize="$dnodesize" "$POOL/data"
 sudo zfs set atime=off "$POOL/data"
 sudo zfs set xattr=sa "$POOL/data"
 
@@ -281,6 +318,82 @@ fi
 
 sudo sh -c "echo 'zfs-explorer corpus fixture (${LAYOUT}/${PROFILE})' > '$MNT/$POOL/data/docs/readme.txt'"
 sudo dd if=/dev/urandom of="$MNT/$POOL/data/media/seed.bin" bs=1M count=8 status=none
+
+if [[ "$PROFILE" == "embedded-data" ]]; then
+  sudo sh -c "printf 'tiny-embedded-payload-0123456789abcdef' > '$MNT/$POOL/data/docs/embedded.txt'"
+fi
+
+if [[ "$PROFILE" == "large-dnode" ]]; then
+  large_dnode_file="$MNT/$POOL/data/docs/large-dnode.txt"
+  sudo sh -c "printf 'large dnode fixture payload\\n' > '$large_dnode_file'"
+  large_dnode_xattrs="$(
+    sudo "$PYTHON_BIN" - "$large_dnode_file" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+payload = b"x" * 300
+count = 0
+
+if hasattr(os, "setxattr"):
+    def set_attr(idx: int) -> None:
+        os.setxattr(path, f"user.zdx{idx}", payload)
+elif hasattr(os, "extattr_set_file"):
+    namespace = getattr(os, "EXTATTR_NAMESPACE_USER", None)
+
+    def set_attr(idx: int) -> None:
+        attr = f"zdx{idx}"
+        attempts = []
+        if namespace is not None:
+            attempts.append((path, namespace, attr, payload))
+        attempts.append((path, f"user.{attr}", payload))
+        attempts.append((path, attr, payload))
+
+        last_type_error = None
+        for args in attempts:
+            try:
+                os.extattr_set_file(*args)
+                return
+            except TypeError as exc:
+                last_type_error = exc
+
+        if last_type_error is not None:
+            raise last_type_error
+else:
+    print(0)
+    sys.exit(0)
+
+for idx in range(128):
+    try:
+        set_attr(idx)
+        count += 1
+    except OSError:
+        break
+
+print(count)
+PY
+  )"
+  large_dnode_xattrs="${large_dnode_xattrs//$'\n'/}"
+  if [[ "$large_dnode_xattrs" == "0" ]]; then
+    echo "warning: large-dnode xattrs unavailable on this host; proceeding with dnodesize=auto only" >&2
+  fi
+fi
+
+if [[ "$PROFILE" == "block-cloning" ]]; then
+  clone_target="$MNT/$POOL/data/media/clone-reflink.bin"
+  if sudo cp --reflink=always "$MNT/$POOL/data/media/seed.bin" "$clone_target" 2>/dev/null; then
+    block_clone_mode="reflink"
+  else
+    sudo cp "$MNT/$POOL/data/media/seed.bin" "$clone_target"
+    block_clone_mode="copy"
+  fi
+fi
+
+if [[ -n "$zvol_dataset" ]]; then
+  echo "==> Creating zvol '$zvol_dataset' ($zvol_size)"
+  sudo zfs create -V "$zvol_size" -o volblocksize=8K "$zvol_dataset"
+fi
+
 if [[ -n "$encrypted_dataset" ]]; then
   sudo sh -c "echo 'encrypted fixture payload' > '$MNT/$encrypted_dataset/secret.txt'"
 fi
@@ -297,6 +410,14 @@ if [[ "$encrypted_mode" == "no-key" && -n "$encrypted_dataset" ]]; then
 fi
 
 sudo zfs snapshot "$POOL/data@seed"
+
+if [[ "$PROFILE" == "bookmarks" ]]; then
+  sudo sh -c "echo 'bookmark fixture payload' > '$MNT/$POOL/data/docs/bookmark.txt'"
+  sudo zfs snapshot "$POOL/data@bookmark-a"
+  sudo zfs bookmark "$POOL/data@seed" "$POOL/data#seed-bm"
+  sudo zfs bookmark "$POOL/data@bookmark-a" "$POOL/data#bookmark-a-bm"
+  bookmark_names=("$POOL/data#seed-bm" "$POOL/data#bookmark-a-bm")
+fi
 
 known_lines_file="$(mktemp /tmp/zdx-corpus-known.XXXXXX)"
 feature_lines_file="$(mktemp /tmp/zdx-corpus-features.XXXXXX)"
@@ -329,6 +450,18 @@ add_known_file "$POOL/data/media/seed.bin" "$MNT/$POOL/data/media/seed.bin"
 if [[ "$PROFILE" == "dedup" ]]; then
   add_known_file "$POOL/data/media/clone-1.bin" "$MNT/$POOL/data/media/clone-1.bin"
 fi
+if [[ "$PROFILE" == "embedded-data" ]]; then
+  add_known_file "$POOL/data/docs/embedded.txt" "$MNT/$POOL/data/docs/embedded.txt"
+fi
+if [[ "$PROFILE" == "large-dnode" ]]; then
+  add_known_file "$POOL/data/docs/large-dnode.txt" "$MNT/$POOL/data/docs/large-dnode.txt"
+fi
+if [[ "$PROFILE" == "block-cloning" ]]; then
+  add_known_file "$POOL/data/media/clone-reflink.bin" "$MNT/$POOL/data/media/clone-reflink.bin"
+fi
+if [[ "$PROFILE" == "bookmarks" ]]; then
+  add_known_file "$POOL/data/docs/bookmark.txt" "$MNT/$POOL/data/docs/bookmark.txt"
+fi
 if [[ "$encrypted_mode" == "with-key" ]]; then
   add_known_file "$encrypted_dataset/secret.txt" "$MNT/$encrypted_dataset/secret.txt"
 fi
@@ -356,8 +489,12 @@ if [[ "$degrade_missing_vdev" -eq 1 ]]; then
   mv "$missing_vdev_path" "$missing_vdev_shadow"
 fi
 
+BOOKMARK_NAMES_CSV="$(IFS=,; echo "${bookmark_names[*]}")"
+
 export POOL LAYOUT PROFILE SIZE FIXTURE_DIR MANIFEST compression recordsize dedup pool_guid ddt_entries encrypted_dataset
 export encrypted_mode degrade_missing_vdev missing_vdev_path
+export dnodesize block_clone_mode large_dnode_xattrs zvol_dataset
+export BOOKMARK_NAMES_CSV
 export KNOWN_LINES_FILE="$known_lines_file"
 export FEATURE_LINES_FILE="$feature_lines_file"
 
@@ -375,12 +512,19 @@ manifest_path = os.environ["MANIFEST"]
 compression = os.environ["compression"]
 recordsize = os.environ["recordsize"]
 dedup = os.environ["dedup"]
+dnodesize = os.environ.get("dnodesize", "legacy")
 pool_guid = os.environ["pool_guid"]
 ddt_entries = int(os.environ["ddt_entries"])
 encrypted_dataset = os.environ.get("encrypted_dataset", "")
 encrypted_mode = os.environ.get("encrypted_mode", "none")
 degrade_missing_vdev = os.environ.get("degrade_missing_vdev", "0") == "1"
 missing_vdev_path = os.environ.get("missing_vdev_path", "")
+block_clone_mode = os.environ.get("block_clone_mode", "none")
+large_dnode_xattrs = int(os.environ.get("large_dnode_xattrs", "0") or "0")
+zvol_dataset = os.environ.get("zvol_dataset", "")
+bookmark_names = [
+    item for item in os.environ.get("BOOKMARK_NAMES_CSV", "").split(",") if item
+]
 
 known_files = []
 with open(os.environ["KNOWN_LINES_FILE"], "r", encoding="utf-8") as fh:
@@ -418,6 +562,7 @@ manifest = {
         "compression": compression,
         "recordsize": recordsize,
         "dedup": dedup,
+        "dnodesize": dnodesize,
         "atime": "off",
         "xattr": "sa",
     },
@@ -445,6 +590,18 @@ if degrade_missing_vdev:
     if missing_vdev_path:
         missing_name = os.path.basename(missing_vdev_path)
         manifest["fixture"]["missing_vdev_images"] = [missing_name]
+
+if block_clone_mode != "none":
+    manifest["invariants"]["block_clone_mode"] = block_clone_mode
+
+if large_dnode_xattrs > 0:
+    manifest["invariants"]["large_dnode_xattrs"] = large_dnode_xattrs
+
+if zvol_dataset:
+    manifest["invariants"]["zvol_dataset"] = zvol_dataset
+
+if bookmark_names:
+    manifest["invariants"]["bookmarks"] = bookmark_names
 
 with open(manifest_path, "w", encoding="utf-8") as fh:
     json.dump(manifest, fh, indent=2)

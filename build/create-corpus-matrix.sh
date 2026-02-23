@@ -13,6 +13,11 @@ PROFILES=(
   baseline
   dedup
   embedded-zstd
+  embedded-data
+  large-dnode
+  block-cloning
+  zvol
+  bookmarks
   encryption-no-key
   encryption-with-key
   degraded-missing-vdev
@@ -29,8 +34,10 @@ Options:
   --layouts <csv>      Layouts: single,mirror,raidz1,raidz2,raidz3
                        (default: all)
   --profiles <csv>     Profiles:
-                       baseline,dedup,embedded-zstd,encryption-no-key,
-                       encryption-with-key,degraded-missing-vdev
+                       baseline,dedup,embedded-zstd,embedded-data,
+                       large-dnode,block-cloning,zvol,bookmarks,
+                       encryption-no-key,encryption-with-key,
+                       degraded-missing-vdev
                        (default: all)
   --pool-prefix <str>  Pool name prefix (default: zdx)
   --root <path>        Corpus root directory (default: fixtures/corpus)
@@ -73,7 +80,7 @@ validate_layout() {
 
 validate_profile() {
   case "$1" in
-    baseline|dedup|embedded-zstd|encryption-no-key|encryption-with-key|degraded-missing-vdev) ;;
+    baseline|dedup|embedded-zstd|embedded-data|large-dnode|block-cloning|zvol|bookmarks|encryption-no-key|encryption-with-key|degraded-missing-vdev) ;;
     *)
       echo "error: unsupported profile '$1'" >&2
       exit 2

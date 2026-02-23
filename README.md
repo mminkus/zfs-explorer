@@ -135,7 +135,7 @@ FreeBSD:
 
 ```bash
 build/bootstrap-freebsd.sh
-env MAKE=gmake build/build.sh --bootstrap-openzfs
+build/build.sh --bootstrap-openzfs
 ```
 
 Notes:
@@ -294,7 +294,7 @@ sudo build/test-corpus-fixture.sh \
 sudo build/test-corpus-subset.sh --list
 sudo build/test-corpus-subset.sh
 
-# create the full layout/profile matrix (20 combinations)
+# create the full layout/profile matrix (54 combinations by default)
 build/create-corpus-matrix.sh --list
 build/create-corpus-matrix.sh --force
 
