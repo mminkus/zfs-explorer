@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="release"
 VERSION_LABEL="auto"
+LOCAL_GIT_SHA=""
 OUTPUT_ROOT="$ROOT_DIR/dist/releases/$(date -u +%Y%m%dT%H%M%SZ)"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 SKIP_LINUX=0
@@ -286,32 +287,53 @@ build_linux_target() {
 run_freebsd_build() {
   local log_file="$OUTPUT_ROOT/logs/freebsd.log"
   local target_out_dir="$OUTPUT_ROOT/freebsd"
+  local remote_worktree="$FREEBSD_REPO_PATH/.zdx-package-matrix-$LOCAL_GIT_SHA"
+  local build_rc=0
   mkdir -p "$target_out_dir"
   mkdir -p "$(dirname "$log_file")"
 
   log "Building/package on FreeBSD host: $FREEBSD_HOST"
+
+  if ! ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" \
+    "cd '$FREEBSD_REPO_PATH' && git fetch --all --tags --prune && git rev-parse --verify --quiet '$LOCAL_GIT_SHA' >/dev/null" \
+    >>"$log_file" 2>&1; then
+    echo "error: FreeBSD host repo does not contain commit $LOCAL_GIT_SHA." >&2
+    echo "hint: push your branch/commit, then retry package-matrix." >&2
+    return 1
+  fi
+
   {
-    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git submodule update --init --recursive"
-    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && env MAKE=gmake ./build/build.sh --bootstrap-openzfs --openzfs-release"
-    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && env MAKE=gmake ./build/package.sh --profile '$PROFILE' --version-label '$VERSION_LABEL'"
-  } >"$log_file" 2>&1
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree remove --force '$remote_worktree' >/dev/null 2>&1 || true"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree add --detach --force '$remote_worktree' '$LOCAL_GIT_SHA'"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && git submodule update --init --recursive"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && env MAKE=gmake ./build/build.sh --bootstrap-openzfs --openzfs-release"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && env MAKE=gmake ./build/package.sh --profile '$PROFILE' --version-label '$VERSION_LABEL'"
+  } >"$log_file" 2>&1 || build_rc=$?
+
+  if [[ "$build_rc" -ne 0 ]]; then
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree remove --force '$remote_worktree' >/dev/null 2>&1 || true" >>"$log_file" 2>&1 || true
+    return "$build_rc"
+  fi
 
   local remote_backend_tar
-  remote_backend_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && ls -1 dist/zfs-explorer-zdx-api-*-${PROFILE}-*.tar.gz 2>/dev/null | head -n1" || true)"
+  remote_backend_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && ls -1 dist/zfs-explorer-zdx-api-*-${PROFILE}-*.tar.gz 2>/dev/null | head -n1" || true)"
   if [[ -z "$remote_backend_tar" ]]; then
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree remove --force '$remote_worktree' >/dev/null 2>&1 || true" >>"$log_file" 2>&1 || true
     echo "error: no FreeBSD backend tarball found (see $log_file)" >&2
     return 1
   fi
 
   local local_backend_name
   local_backend_name="$(basename "$remote_backend_tar")"
-  scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$FREEBSD_REPO_PATH/$remote_backend_tar" "$target_out_dir/$local_backend_name" >>"$log_file" 2>&1
+  scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$remote_worktree/$remote_backend_tar" "$target_out_dir/$local_backend_name" >>"$log_file" 2>&1
 
   local remote_webui_tar
-  remote_webui_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && ls -1 dist/zfs-explorer-webui-*.tar.gz 2>/dev/null | head -n1" || true)"
+  remote_webui_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && ls -1 dist/zfs-explorer-webui-*.tar.gz 2>/dev/null | head -n1" || true)"
   if [[ -n "$remote_webui_tar" && ! -f "$OUTPUT_ROOT/$(basename "$remote_webui_tar")" ]]; then
-    scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$FREEBSD_REPO_PATH/$remote_webui_tar" "$OUTPUT_ROOT/$(basename "$remote_webui_tar")" >>"$log_file" 2>&1 || true
+    scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$remote_worktree/$remote_webui_tar" "$OUTPUT_ROOT/$(basename "$remote_webui_tar")" >>"$log_file" 2>&1 || true
   fi
+
+  ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree remove --force '$remote_worktree' >/dev/null 2>&1 || true" >>"$log_file" 2>&1 || true
 
   log "Completed FreeBSD -> $local_backend_name"
 }
@@ -383,6 +405,12 @@ fi
 VERSION_LABEL="$(sanitize_version_label "$VERSION_LABEL")"
 if [[ -z "$VERSION_LABEL" ]]; then
   echo "error: computed empty version label" >&2
+  exit 2
+fi
+
+LOCAL_GIT_SHA="$(git -C "$ROOT_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
+if [[ "$SKIP_FREEBSD" -eq 0 && -z "$LOCAL_GIT_SHA" ]]; then
+  echo "error: unable to resolve local git HEAD SHA for FreeBSD commit parity." >&2
   exit 2
 fi
 
