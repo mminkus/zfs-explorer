@@ -98,9 +98,23 @@ for readability; click any image to open the full-resolution PNG.
 
 ## Architecture
 
+ZFS Explorer is a monorepo with layered deliverables:
+
+- `zfs-explorer-ui`: the React web application (typically port `8080`)
+- `zdx-api` (internal backend layer): Rust HTTP API service (typically port `9000`)
+- `libzdbdecode.so`: native read-only decode layer over vendored OpenZFS userland
+
+Data flow:
+
 ```
-React UI (port 8080) -> Rust API (port 9000) -> libzdbdecode.so -> ZFS Libraries
+zfs-explorer-ui -> zdx-api -> libzdbdecode.so -> OpenZFS userland
 ```
+
+API stability note:
+
+- The API is currently internal-but-documented (`docs/API_REFERENCE.md`).
+- Endpoint and payload churn is still expected before a formal stability
+  contract (targeting post-v1.0 hardening).
 
 ## What's Implemented (Milestones 0-6)
 
@@ -277,7 +291,48 @@ curl -fL \
   -H "Range: bytes=0-1048575" \
   "http://127.0.0.1:9000/api/pools/testpool/zpl/path/testpool/myds/path/file.bin" \
   -o chunk-0.bin
+
+# Objset-scoped download (works for dataset heads and snapshots)
+curl -fL -o recovered.bin \
+  "http://127.0.0.1:9000/api/pools/testpool/objset/72/zpl/path/data/docs/readme.txt"
 ```
+
+Recursive dataset/snapshot recovery (CLI-first):
+
+```bash
+# Recover an entire dataset subtree
+python tools/recover-files.py \
+  --backend http://127.0.0.1:9000 \
+  --filesystem zpool/data \
+  --path /docs \
+  --destination /tmp/recovered-docs
+
+# Recover from a snapshot
+python tools/recover-files.py \
+  --backend http://127.0.0.1:9000 \
+  --filesystem zpool/data@snap-2026-02-20 \
+  --destination /tmp/recovered-snapshot
+
+# Force streaming ZPL download for dataset heads
+python tools/recover-files.py \
+  --backend http://127.0.0.1:9000 \
+  --filesystem zpool/data \
+  --destination /tmp/recovered \
+  --download-method zpl
+
+# Auto-start backend if needed (operator-supplied command)
+python tools/recover-files.py \
+  --backend http://127.0.0.1:9000 \
+  --filesystem zpool/data \
+  --destination /tmp/recovered \
+  --start-backend-if-needed \
+  --start-backend-cmd "sudo ./run-backend.sh"
+```
+
+By default, the tool writes:
+- per-file NDJSON manifest: `<destination>/recover-manifest.ndjson`
+- run summary JSON: `<destination>/recover-summary.json`
+- `<file>.FAILED.json` sidecars for files that could not be recovered
 
 Optional parity check workflow (live vs offline responses):
 

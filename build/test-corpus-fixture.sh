@@ -26,6 +26,7 @@ Optional:
 Runs:
   1) Offline API smoke checks
   2) Direct ZPL download checksum checks for manifest known_files
+  3) Scoped download API parity checks (/objset/.../zpl/path and /snapshot/.../zpl/path)
 EOF
 }
 
@@ -306,6 +307,9 @@ if [[ "$known_count" -eq 0 ]]; then
   echo "warning: manifest has no known_files; skipping checksum checks"
 else
   failures=0
+  dataset_tree_cache=""
+  snapshot_scoped_checked=0
+
   while IFS= read -r row; do
     path="$(jq -r '.path' <<<"$row")"
     expected="$(jq -r '.sha256' <<<"$row")"
@@ -348,6 +352,150 @@ else
       failures=$((failures + 1))
     else
       echo "OK: $path"
+    fi
+
+    scoped_objset_id="$(
+      awk -F': ' 'tolower($1)=="x-zfs-objset-id" {print $2; exit}' "$tmp_headers" \
+        | tr -d '\r'
+    )"
+    scoped_relpath="$(
+      awk -F': ' 'tolower($1)=="x-zfs-relpath" {print $2; exit}' "$tmp_headers" \
+        | tr -d '\r'
+    )"
+    scoped_dataset="$(
+      awk -F': ' 'tolower($1)=="x-zfs-dataset" {print $2; exit}' "$tmp_headers" \
+        | tr -d '\r'
+    )"
+    if [[ -z "$scoped_objset_id" || -z "$scoped_relpath" ]]; then
+      echo "FAIL: missing scoped download headers for $path (x-zfs-objset-id / x-zfs-relpath)" >&2
+      failures=$((failures + 1))
+      rm -f "$tmp_file" "$tmp_headers"
+      continue
+    fi
+
+    scoped_url="$BASE_URL/api/pools/$POOL/objset/$scoped_objset_id/zpl/path/$scoped_relpath"
+    scoped_tmp_file="$(mktemp /tmp/zdx-corpus-scoped-file.XXXXXX.bin)"
+    scoped_tmp_headers="$(mktemp /tmp/zdx-corpus-scoped-headers.XXXXXX.txt)"
+    scoped_status="$(
+      curl -sS --path-as-is -D "$scoped_tmp_headers" -o "$scoped_tmp_file" -w "%{http_code}" "$scoped_url" || true
+    )"
+    if [[ "$scoped_status" != "200" && "$scoped_status" != "206" ]]; then
+      echo "FAIL: scoped objset download failed for $path (HTTP $scoped_status)" >&2
+      echo "      url: $scoped_url" >&2
+      if [[ -s "$scoped_tmp_file" ]]; then
+        echo "      response:" >&2
+        sed -n '1,6p' "$scoped_tmp_file" >&2 || true
+      fi
+      failures=$((failures + 1))
+      rm -f "$scoped_tmp_file" "$scoped_tmp_headers" "$tmp_file" "$tmp_headers"
+      continue
+    fi
+
+    scoped_got="$(hash_file_sha256 "$scoped_tmp_file")"
+    if [[ "$scoped_got" != "$expected" ]]; then
+      echo "FAIL: scoped objset checksum mismatch for $path" >&2
+      echo "      expected: $expected" >&2
+      echo "      got:      $scoped_got" >&2
+      failures=$((failures + 1))
+    fi
+
+    scoped_size_bytes="$(wc -c <"$scoped_tmp_file" | tr -d '[:space:]')"
+    if [[ "$scoped_size_bytes" =~ ^[0-9]+$ && "$scoped_size_bytes" -gt 0 ]]; then
+      scoped_range_end=$((scoped_size_bytes > 63 ? 63 : scoped_size_bytes - 1))
+      scoped_range_len=$((scoped_range_end + 1))
+      scoped_expected_hex="$(
+        od -An -tx1 -N "$scoped_range_len" "$scoped_tmp_file" | tr -d ' \n'
+      )"
+
+      scoped_range_file="$(mktemp /tmp/zdx-corpus-scoped-range.XXXXXX.bin)"
+      scoped_range_headers="$(mktemp /tmp/zdx-corpus-scoped-range-headers.XXXXXX.txt)"
+      scoped_range_status="$(
+        curl -sS --path-as-is \
+          -H "Range: bytes=0-$scoped_range_end" \
+          -D "$scoped_range_headers" \
+          -o "$scoped_range_file" \
+          -w "%{http_code}" \
+          "$scoped_url" || true
+      )"
+      if [[ "$scoped_range_status" != "206" ]]; then
+        echo "FAIL: scoped objset range request failed for $path (expected 206, got $scoped_range_status)" >&2
+        failures=$((failures + 1))
+      else
+        scoped_content_range="$(
+          awk -F': ' 'tolower($1)=="content-range" {print $2; exit}' "$scoped_range_headers" \
+            | tr -d '\r'
+        )"
+        scoped_expected_content_range="bytes 0-$scoped_range_end/$scoped_size_bytes"
+        if [[ -z "$scoped_content_range" || "$scoped_content_range" != "$scoped_expected_content_range" ]]; then
+          echo "FAIL: scoped objset Content-Range mismatch for $path" >&2
+          echo "      expected: $scoped_expected_content_range" >&2
+          echo "      got:      ${scoped_content_range:-<empty>}" >&2
+          failures=$((failures + 1))
+        fi
+
+        scoped_got_hex="$(od -An -tx1 "$scoped_range_file" | tr -d ' \n')"
+        if [[ "$scoped_got_hex" != "$scoped_expected_hex" ]]; then
+          echo "FAIL: scoped objset range payload mismatch for $path (bytes 0-$scoped_range_end)" >&2
+          failures=$((failures + 1))
+        fi
+      fi
+      rm -f "$scoped_range_file" "$scoped_range_headers"
+    fi
+
+    if [[ "$snapshot_scoped_checked" -eq 0 && -n "$scoped_dataset" ]]; then
+      if [[ -z "$dataset_tree_cache" ]]; then
+        dataset_tree_cache="$(curl -fsS "$BASE_URL/api/pools/$POOL/datasets/tree" || true)"
+      fi
+      if [[ -n "$dataset_tree_cache" ]]; then
+        scoped_dsl_obj="$(
+          jq -r --arg target "$scoped_dataset" '
+            def walk($prefix):
+              . as $node
+              | ($prefix + [$node.name]) as $parts
+              | ({full: ($parts | join("/")), dsl: $node.dsl_dir_obj}),
+                ($node.children[]? | walk($parts));
+            .root
+            | walk([])
+            | select(.full == $target)
+            | .dsl
+            | tostring
+          ' <<<"$dataset_tree_cache" | head -n 1
+        )"
+
+        if [[ -n "$scoped_dsl_obj" && "$scoped_dsl_obj" != "null" ]]; then
+          snapshots_json="$(curl -fsS "$BASE_URL/api/pools/$POOL/dataset/$scoped_dsl_obj/snapshots" || true)"
+          seed_dsobj="$(jq -r '.entries[]? | select(.name=="seed") | .dsobj // empty' <<<"$snapshots_json" | head -n 1)"
+          if [[ -n "$seed_dsobj" ]]; then
+            snap_url="$BASE_URL/api/pools/$POOL/snapshot/$seed_dsobj/zpl/path/$scoped_relpath"
+            snap_tmp_file="$(mktemp /tmp/zdx-corpus-snap-file.XXXXXX.bin)"
+            snap_tmp_headers="$(mktemp /tmp/zdx-corpus-snap-headers.XXXXXX.txt)"
+            snap_status="$(
+              curl -sS --path-as-is -D "$snap_tmp_headers" -o "$snap_tmp_file" -w "%{http_code}" "$snap_url" || true
+            )"
+            if [[ "$snap_status" != "200" && "$snap_status" != "206" ]]; then
+              echo "FAIL: snapshot scoped download failed for $path (HTTP $snap_status)" >&2
+              echo "      url: $snap_url" >&2
+              if [[ -s "$snap_tmp_file" ]]; then
+                echo "      response:" >&2
+                sed -n '1,6p' "$snap_tmp_file" >&2 || true
+              fi
+              failures=$((failures + 1))
+            else
+              snap_got="$(hash_file_sha256 "$snap_tmp_file")"
+              if [[ "$snap_got" != "$expected" ]]; then
+                echo "FAIL: snapshot scoped checksum mismatch for $path" >&2
+                echo "      expected: $expected" >&2
+                echo "      got:      $snap_got" >&2
+                failures=$((failures + 1))
+              else
+                echo "OK: snapshot scoped endpoint for seed snapshot ($scoped_dataset@seed)"
+              fi
+            fi
+            rm -f "$snap_tmp_file" "$snap_tmp_headers"
+            snapshot_scoped_checked=1
+          fi
+        fi
+      fi
     fi
 
     # Protocol checks: Content-Length / Content-Type / Range support.
@@ -429,12 +577,17 @@ else
       rm -f "$range_file" "$range_headers"
     fi
 
-    rm -f "$tmp_file" "$tmp_headers"
+    rm -f "$scoped_tmp_file" "$scoped_tmp_headers" "$tmp_file" "$tmp_headers"
   done < <(jq -c '.known_files[]' "$MANIFEST")
+
+  if [[ "$snapshot_scoped_checked" -eq 0 ]]; then
+    echo "FAIL: snapshot scoped endpoint was not exercised (no suitable dataset@seed candidate found)" >&2
+    failures=$((failures + 1))
+  fi
 
   if [[ "$failures" -ne 0 ]]; then
     echo
-    echo "Corpus validation failed: $failures checksum mismatches." >&2
+    echo "Corpus validation failed: $failures download validation failures." >&2
     exit 1
   fi
 fi

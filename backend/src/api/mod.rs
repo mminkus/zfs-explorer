@@ -2591,6 +2591,15 @@ struct ZplPathContext {
     filename: String,
 }
 
+#[derive(Debug, Clone)]
+struct ObjsetScopedZplPathContext {
+    objset_id: u64,
+    rel_path: String,
+    objid: u64,
+    file_size: u64,
+    filename: String,
+}
+
 fn decode_hex_bytes(data_hex: &str) -> Result<Vec<u8>, ApiError> {
     let trimmed = data_hex.trim();
     if trimmed.is_empty() {
@@ -2738,9 +2747,9 @@ fn resolve_pool_root_dir_obj(
 
     let head_result = crate::ffi::dsl_dir_head(pool_ptr, root_dir_obj);
     if head_result.is_ok() {
-        let head_json = head_result
-            .json()
-            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+        let head_json = head_result.json().ok_or_else(|| {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result")
+        })?;
         let head_value = parse_json_value(head_json)?;
         let head_obj = head_value["head_dataset_obj"].as_u64().unwrap_or(0);
         if head_obj != 0 {
@@ -2885,8 +2894,11 @@ fn resolve_zpl_path_context(
     let normalized_path = trimmed.trim_start_matches('/').to_string();
 
     let (dataset_name, rel_path, objset_id) = if prefer_dsl_resolution {
-        let dsl_candidates =
-            resolve_dataset_candidates_from_pool_path_via_dsl(pool_ptr, pool_name, &normalized_path)?;
+        let dsl_candidates = resolve_dataset_candidates_from_pool_path_via_dsl(
+            pool_ptr,
+            pool_name,
+            &normalized_path,
+        )?;
         if dsl_candidates.is_empty() {
             return Err(api_error_with(
                 StatusCode::BAD_REQUEST,
@@ -2906,7 +2918,11 @@ pool/dataset/file)."
             if candidate_objset_id == 0 {
                 continue;
             }
-            resolved = Some((candidate_dataset_name, candidate_rel_path, candidate_objset_id));
+            resolved = Some((
+                candidate_dataset_name,
+                candidate_rel_path,
+                candidate_objset_id,
+            ));
             break;
         }
 
@@ -2920,28 +2936,28 @@ pool/dataset/file)."
         }
     } else {
         match load_dataset_catalog(pool_ptr) {
-        Ok(catalog) => {
-            let mut candidates: Vec<(usize, String, String)> = Vec::new();
-            for entry in catalog
-                .iter()
-                .filter(|entry| entry.dataset_type == "filesystem")
-            {
-                if let Some(rel) = dataset_path_match(&entry.name, &normalized_path) {
-                    candidates.push((entry.name.len(), entry.name.clone(), rel));
-                }
+            Ok(catalog) => {
+                let mut candidates: Vec<(usize, String, String)> = Vec::new();
+                for entry in catalog
+                    .iter()
+                    .filter(|entry| entry.dataset_type == "filesystem")
+                {
+                    if let Some(rel) = dataset_path_match(&entry.name, &normalized_path) {
+                        candidates.push((entry.name.len(), entry.name.clone(), rel));
+                    }
 
-                if let Some(mountpoint) = entry.mountpoint.as_deref() {
-                    if entry.mounted != Some(false) {
-                        if let Some(rel) = mountpoint_path_match(mountpoint, &absolute_path) {
-                            candidates.push((mountpoint.len(), entry.name.clone(), rel));
+                    if let Some(mountpoint) = entry.mountpoint.as_deref() {
+                        if entry.mounted != Some(false) {
+                            if let Some(rel) = mountpoint_path_match(mountpoint, &absolute_path) {
+                                candidates.push((mountpoint.len(), entry.name.clone(), rel));
+                            }
                         }
                     }
                 }
-            }
 
-            candidates.sort_by(|a, b| b.0.cmp(&a.0));
-            if candidates.is_empty() {
-                return Err(api_error_with(
+                candidates.sort_by(|a, b| b.0.cmp(&a.0));
+                if candidates.is_empty() {
+                    return Err(api_error_with(
                     StatusCode::BAD_REQUEST,
                     "DATASET_PATH_UNRESOLVED",
                     format!("could not resolve dataset for path '{zpl_path}'"),
@@ -2952,67 +2968,71 @@ like pool/dataset/file."
                     ),
                     true,
                 ));
-            }
+                }
 
-            let mut resolved: Option<(String, String, u64)> = None;
+                let mut resolved: Option<(String, String, u64)> = None;
 
-            for (_, candidate_dataset_name, candidate_rel_path) in candidates {
-                let candidate_objset_id =
-                    match resolve_dataset_dir_obj_by_name(pool_ptr, pool_name, &candidate_dataset_name)
-                    {
+                for (_, candidate_dataset_name, candidate_rel_path) in candidates {
+                    let candidate_objset_id = match resolve_dataset_dir_obj_by_name(
+                        pool_ptr,
+                        pool_name,
+                        &candidate_dataset_name,
+                    ) {
                         Ok(value) => value,
                         Err(_) => continue,
                     };
 
-                if candidate_objset_id == 0 {
-                    continue;
+                    if candidate_objset_id == 0 {
+                        continue;
+                    }
+                    resolved = Some((
+                        candidate_dataset_name,
+                        candidate_rel_path,
+                        candidate_objset_id,
+                    ));
+                    break;
                 }
-                resolved = Some((
-                    candidate_dataset_name,
-                    candidate_rel_path,
-                    candidate_objset_id,
-                ));
-                break;
-            }
 
-            if let Some(result) = resolved {
-                result
-            } else {
-                return Err(api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to resolve dataset candidates for path '{zpl_path}'"),
-                ));
-            }
-        }
-        Err(catalog_err) => {
-            let dsl_candidates = resolve_dataset_candidates_from_pool_path_via_dsl(
-                pool_ptr,
-                pool_name,
-                &normalized_path,
-            )?;
-            if dsl_candidates.is_empty() {
-                return Err(catalog_err);
-            }
-
-            let mut resolved: Option<(String, String, u64)> = None;
-            for (candidate_dataset_name, candidate_rel_path, candidate_objset_id) in dsl_candidates {
-                if candidate_objset_id == 0 {
-                    continue;
+                if let Some(result) = resolved {
+                    result
+                } else {
+                    return Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to resolve dataset candidates for path '{zpl_path}'"),
+                    ));
                 }
-                resolved = Some((
-                    candidate_dataset_name,
-                    candidate_rel_path,
-                    candidate_objset_id,
-                ));
-                break;
             }
+            Err(catalog_err) => {
+                let dsl_candidates = resolve_dataset_candidates_from_pool_path_via_dsl(
+                    pool_ptr,
+                    pool_name,
+                    &normalized_path,
+                )?;
+                if dsl_candidates.is_empty() {
+                    return Err(catalog_err);
+                }
 
-            if let Some(result) = resolved {
-                result
-            } else {
-                return Err(catalog_err);
+                let mut resolved: Option<(String, String, u64)> = None;
+                for (candidate_dataset_name, candidate_rel_path, candidate_objset_id) in
+                    dsl_candidates
+                {
+                    if candidate_objset_id == 0 {
+                        continue;
+                    }
+                    resolved = Some((
+                        candidate_dataset_name,
+                        candidate_rel_path,
+                        candidate_objset_id,
+                    ));
+                    break;
+                }
+
+                if let Some(result) = resolved {
+                    result
+                } else {
+                    return Err(catalog_err);
+                }
             }
-        }
         }
     };
 
@@ -3110,6 +3130,167 @@ like pool/dataset/file."
         objid: walk.objid,
         file_size: stat.size,
         filename,
+    })
+}
+
+fn normalize_objset_zpl_path(zpl_path: &str) -> Result<String, ApiError> {
+    let trimmed = zpl_path.trim();
+    if trimmed.is_empty() {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PATH",
+            "path is empty",
+            Some("Provide a file path rooted at the selected objset.".to_string()),
+            true,
+        ));
+    }
+
+    let parts = split_clean_path(trimmed);
+    if parts.is_empty() {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PATH",
+            "path is empty",
+            Some("Provide a file path rooted at the selected objset.".to_string()),
+            true,
+        ));
+    }
+
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn resolve_objset_scoped_zpl_path_context(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    objset_id: u64,
+    zpl_path: &str,
+) -> Result<ObjsetScopedZplPathContext, ApiError> {
+    let walk_path = normalize_objset_zpl_path(zpl_path)?;
+
+    let walk_result = crate::ffi::objset_walk(pool_ptr, objset_id, &walk_path)
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, err))?;
+    if !walk_result.is_ok() {
+        let err_msg = walk_result.error_msg().unwrap_or("Unknown error");
+        let status = if err_msg.contains("No such file or directory") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        let code = if status == StatusCode::NOT_FOUND {
+            "PATH_NOT_FOUND"
+        } else {
+            "ZPL_WALK_FAILED"
+        };
+        return Err(api_error_with(
+            status,
+            code,
+            format!("failed to walk path '{walk_path}': {err_msg}"),
+            Some("Verify the requested objset id and file path.".to_string()),
+            true,
+        ));
+    }
+
+    let walk_json = walk_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let walk_value = parse_json_value(walk_json)?;
+    let walk = serde_json::from_value::<ObjsetWalkPayload>(walk_value).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse walk payload: {err}"),
+        )
+    })?;
+
+    if !walk.found || !walk.remaining.is_empty() {
+        return Err(api_error_with(
+            StatusCode::NOT_FOUND,
+            "PATH_NOT_FOUND",
+            format!("path '{walk_path}' could not be fully resolved"),
+            Some("The requested file may not exist in the selected objset.".to_string()),
+            true,
+        ));
+    }
+
+    let stat_result = crate::ffi::objset_stat(pool_ptr, objset_id, walk.objid);
+    if !stat_result.is_ok() {
+        let err_msg = stat_result.error_msg().unwrap_or("Unknown error");
+        let status = if is_objset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error_with(
+            status,
+            "OBJSET_STAT_FAILED",
+            format!("failed to stat object {}: {}", walk.objid, err_msg),
+            None,
+            status.is_client_error(),
+        ));
+    }
+
+    let stat_json = stat_result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let stat_value = parse_json_value(stat_json)?;
+    let stat = serde_json::from_value::<ObjsetStatPayload>(stat_value).map_err(|err| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse stat payload: {err}"),
+        )
+    })?;
+
+    if stat.type_name != "file" {
+        return Err(api_error_with(
+            StatusCode::BAD_REQUEST,
+            "NOT_A_FILE",
+            format!(
+                "resolved path '{walk_path}' is a {} object, not a file",
+                stat.type_name
+            ),
+            Some("Use this endpoint only for file paths.".to_string()),
+            true,
+        ));
+    }
+
+    let rel_path = walk_path.trim_start_matches('/').to_string();
+    let filename = split_clean_path(&walk_path)
+        .last()
+        .map(|segment| (*segment).to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("objset-{objset_id}-obj-{}", walk.objid));
+
+    Ok(ObjsetScopedZplPathContext {
+        objset_id,
+        rel_path,
+        objid: walk.objid,
+        file_size: stat.size,
+        filename,
+    })
+}
+
+fn resolve_snapshot_objset_id(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
+    dsobj: u64,
+) -> Result<u64, ApiError> {
+    let result = crate::ffi::dataset_objset(pool_ptr, dsobj);
+    if !result.is_ok() {
+        let err_msg = result.error_msg().unwrap_or("Unknown error");
+        let status = if is_dataset_user_input_error(err_msg) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(api_error(status, err_msg.to_string()));
+    }
+
+    let json_str = result
+        .json()
+        .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Missing JSON in result"))?;
+    let value = parse_json_value(json_str)?;
+    value["objset_id"].as_u64().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot objset payload missing objset_id",
+        )
     })
 }
 
@@ -3337,24 +3518,23 @@ fn sanitize_download_filename(raw: &str) -> String {
     cleaned
 }
 
-/// GET /api/pools/{pool}/zpl/path/{*zpl_path}
-/// (supports single HTTP Range request)
-pub async fn zpl_path_download(
-    State(state): State<AppState>,
-    Path((pool, zpl_path)): Path<(String, String)>,
+fn build_file_download_response(
+    pool_ptr: *mut crate::ffi::zdx_pool_t,
     headers: HeaderMap,
+    objset_id: u64,
+    objid: u64,
+    file_size: u64,
+    filename_raw: &str,
+    rel_path: &str,
+    dataset_name: Option<&str>,
 ) -> Result<Response<Body>, ApiError> {
-    let pool_ptr = ensure_pool(&state, &pool)?;
-    let pool_open = pool_open_config(&state);
-    let ctx = resolve_zpl_path_context(
-        pool_ptr,
-        &pool,
-        &zpl_path,
-        matches!(pool_open.mode, crate::PoolOpenMode::Offline),
-    )?;
+    let filename = sanitize_download_filename(filename_raw);
+    let content_type = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
 
-    if ctx.file_size == 0 {
-        let filename = sanitize_download_filename(&ctx.filename);
+    if file_size == 0 {
         let content_type = mime_guess::from_path(&filename)
             .first_or_octet_stream()
             .essence_str()
@@ -3377,16 +3557,25 @@ pub async fn zpl_path_download(
             HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
                 .unwrap_or(HeaderValue::from_static("attachment")),
         );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-zfs-objset-id"),
+            HeaderValue::from_str(&objset_id.to_string()).unwrap_or(HeaderValue::from_static("0")),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-zfs-relpath"),
+            HeaderValue::from_str(rel_path).unwrap_or(HeaderValue::from_static("/")),
+        );
+        if let Some(dataset_name) = dataset_name {
+            response.headers_mut().insert(
+                HeaderName::from_static("x-zfs-dataset"),
+                HeaderValue::from_str(dataset_name).unwrap_or(HeaderValue::from_static("unknown")),
+            );
+        }
         return Ok(response);
     }
 
-    let (start, end, partial) = parse_range_header(&headers, ctx.file_size)?;
-    let bytes = read_objset_bytes(pool_ptr, ctx.objset_id, ctx.objid, start, end)?;
-    let filename = sanitize_download_filename(&ctx.filename);
-    let content_type = mime_guess::from_path(&filename)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
+    let (start, end, partial) = parse_range_header(&headers, file_size)?;
+    let bytes = read_objset_bytes(pool_ptr, objset_id, objid, start, end)?;
 
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = if partial {
@@ -3414,22 +3603,104 @@ pub async fn zpl_path_download(
             .unwrap_or(HeaderValue::from_static("attachment")),
     );
     response.headers_mut().insert(
-        HeaderName::from_static("x-zfs-dataset"),
-        HeaderValue::from_str(&ctx.dataset_name).unwrap_or(HeaderValue::from_static("unknown")),
+        HeaderName::from_static("x-zfs-objset-id"),
+        HeaderValue::from_str(&objset_id.to_string()).unwrap_or(HeaderValue::from_static("0")),
     );
     response.headers_mut().insert(
         HeaderName::from_static("x-zfs-relpath"),
-        HeaderValue::from_str(&ctx.rel_path).unwrap_or(HeaderValue::from_static("/")),
+        HeaderValue::from_str(rel_path).unwrap_or(HeaderValue::from_static("/")),
     );
+    if let Some(dataset_name) = dataset_name {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-zfs-dataset"),
+            HeaderValue::from_str(dataset_name).unwrap_or(HeaderValue::from_static("unknown")),
+        );
+    }
 
     if partial {
         response.headers_mut().insert(
             CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes {start}-{end}/{}", ctx.file_size))
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{file_size}"))
                 .unwrap_or(HeaderValue::from_static("bytes */0")),
         );
     }
 
+    Ok(response)
+}
+
+/// GET /api/pools/{pool}/zpl/path/{*zpl_path}
+/// (supports single HTTP Range request)
+pub async fn zpl_path_download(
+    State(state): State<AppState>,
+    Path((pool, zpl_path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, ApiError> {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let pool_open = pool_open_config(&state);
+    let ctx = resolve_zpl_path_context(
+        pool_ptr,
+        &pool,
+        &zpl_path,
+        matches!(pool_open.mode, crate::PoolOpenMode::Offline),
+    )?;
+
+    build_file_download_response(
+        pool_ptr,
+        headers,
+        ctx.objset_id,
+        ctx.objid,
+        ctx.file_size,
+        &ctx.filename,
+        &ctx.rel_path,
+        Some(&ctx.dataset_name),
+    )
+}
+
+/// GET /api/pools/{pool}/objset/{objset_id}/zpl/path/{*zpl_path}
+/// (supports single HTTP Range request)
+pub async fn objset_zpl_path_download(
+    State(state): State<AppState>,
+    Path((pool, objset_id, zpl_path)): Path<(String, u64, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, ApiError> {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let ctx = resolve_objset_scoped_zpl_path_context(pool_ptr, objset_id, &zpl_path)?;
+    build_file_download_response(
+        pool_ptr,
+        headers,
+        ctx.objset_id,
+        ctx.objid,
+        ctx.file_size,
+        &ctx.filename,
+        &ctx.rel_path,
+        None,
+    )
+}
+
+/// GET /api/pools/{pool}/snapshot/{dsobj}/zpl/path/{*zpl_path}
+/// (supports single HTTP Range request)
+pub async fn snapshot_zpl_path_download(
+    State(state): State<AppState>,
+    Path((pool, dsobj, zpl_path)): Path<(String, u64, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, ApiError> {
+    let pool_ptr = ensure_pool(&state, &pool)?;
+    let objset_id = resolve_snapshot_objset_id(pool_ptr, dsobj)?;
+    let ctx = resolve_objset_scoped_zpl_path_context(pool_ptr, objset_id, &zpl_path)?;
+    let mut response = build_file_download_response(
+        pool_ptr,
+        headers,
+        ctx.objset_id,
+        ctx.objid,
+        ctx.file_size,
+        &ctx.filename,
+        &ctx.rel_path,
+        None,
+    )?;
+    response.headers_mut().insert(
+        HeaderName::from_static("x-zfs-snapshot-dsobj"),
+        HeaderValue::from_str(&dsobj.to_string()).unwrap_or(HeaderValue::from_static("0")),
+    );
     Ok(response)
 }
 
@@ -3910,7 +4181,9 @@ mod tests {
         assert!(payload["openzfs"]["commit"].as_str().is_some());
         assert_eq!(payload["openzfs"]["spa_version"], ZFS_SPA_VERSION);
         assert_eq!(payload["openzfs"]["zpl_version"], ZFS_ZPL_VERSION);
-        assert!(payload["openzfs"]["kernel_module"]["source"].as_str().is_some());
+        assert!(payload["openzfs"]["kernel_module"]["source"]
+            .as_str()
+            .is_some());
         assert_eq!(payload["runtime"]["os"], std::env::consts::OS);
         assert_eq!(payload["runtime"]["arch"], std::env::consts::ARCH);
         assert_eq!(payload["pool_open"]["mode"], "live");

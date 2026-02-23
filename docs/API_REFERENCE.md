@@ -5,7 +5,7 @@ This document lists every backend API route currently registered in
 
 - Base URL: `http://127.0.0.1:9000`
 - Content type: JSON for all endpoints except file download endpoint
-  (`/api/pools/{pool}/zpl/path/{*zpl_path}`)
+  (`/api/pools/{pool}/zpl/path/{*zpl_path}` and scoped variants)
 - Error format: JSON envelope with fields like
   `code`, `error`, `message`, `hint`, and `recoverable`
 
@@ -103,6 +103,8 @@ These return `400` in offline mode.
 | `GET` | `/api/pools/{pool}/objset/{objset_id}/obj/{objid}/zap?cursor=&limit=` | ZAP entries |
 | `GET` | `/api/pools/{pool}/objset/{objset_id}/obj/{objid}/data?offset=&limit=` | Hex payload slice for object data |
 | `GET` | `/api/pools/{pool}/zpl/path/{*zpl_path}` | File download by dataset/path; supports single HTTP `Range` |
+| `GET` | `/api/pools/{pool}/objset/{objset_id}/zpl/path/{*zpl_path}` | File download scoped to explicit objset/path; supports single HTTP `Range` |
+| `GET` | `/api/pools/{pool}/snapshot/{dsobj}/zpl/path/{*zpl_path}` | File download scoped to snapshot dataset object/path; supports single HTTP `Range` |
 
 ## Spacemap and Raw Block Endpoints
 
@@ -117,8 +119,12 @@ These return `400` in offline mode.
 
 - Internal DSL datasets like `$FREE`, `$MOS`, and `$ORIGIN` are not
   filesystem-browseable via ZPL path endpoints.
-- `/api/pools/{pool}/zpl/path/{*zpl_path}` returns bytes directly and
-  sets response headers such as `Content-Type`, `Content-Disposition`,
-  `Accept-Ranges`, `X-Zfs-Dataset`, and `X-Zfs-Relpath`.
+- Download routes return bytes directly and set response headers such as
+  `Content-Type`, `Content-Disposition`, `Accept-Ranges`,
+  `X-Zfs-Objset-Id`, and `X-Zfs-Relpath`.
+- Dataset-path download route also emits `X-Zfs-Dataset`.
+- Snapshot-scoped download route also emits `X-Zfs-Snapshot-Dsobj`.
+- For scoped download routes, pass path relative to the selected scope
+  (for example `data/docs/readme.txt` within that objset or snapshot).
 - `graph/from` currently serves a one-hop graph slice; the `depth`
   query parameter is accepted for forward compatibility.

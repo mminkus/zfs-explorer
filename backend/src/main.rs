@@ -352,6 +352,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(api::zpl_path_download),
         )
         .route(
+            "/api/pools/{pool}/objset/{objset_id}/zpl/path/{*zpl_path}",
+            get(api::objset_zpl_path_download),
+        )
+        .route(
+            "/api/pools/{pool}/snapshot/{dsobj}/zpl/path/{*zpl_path}",
+            get(api::snapshot_zpl_path_download),
+        )
+        .route(
             "/api/pools/{pool}/spacemap/{objid}/summary",
             get(api::spacemap_summary),
         )
