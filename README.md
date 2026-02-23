@@ -22,9 +22,9 @@ The design is intentionally **read-only**. Long-term goals include supporting
 analysis of **unimported or damaged pools**, enabling forensic inspection and
 file recovery without ever importing the pool.
 
-Current mode disclaimer: default operation is **live imported pools only**.
-Experimental offline/exported pool analysis can be enabled explicitly via env
-configuration (see **Offline Mode (Experimental)** below).
+Current mode disclaimer: default operation is **live imported pools**.
+Offline/exported pool analysis is supported and can be enabled explicitly via
+env configuration or `GET/PUT /api/mode` (see **Offline Mode** below).
 
 You can think of this project as:
 
@@ -149,54 +149,85 @@ Notes:
 If your UI runs in a container/VM without ZFS access, run the backend on a host
 that can see `/dev/zfs`, then tunnel the ports.
 
-### 1. Build on your dev machine
+Recommended workflow: package the backend once, copy a tarball to the ZFS host,
+and run only the backend there. The UI can stay on your local machine.
+
+### 1. Build a portable backend bundle on your dev machine
 
 ```bash
-# Build native + backend
-cd native
-make clean && make
-cd ../backend
-cargo build
+# Use release for normal usage; use default profile for faster debug builds.
+./build/package.sh --profile release
 ```
 
-### 2. Copy to the ZFS host (optional)
+### 2. Copy the tarball to the ZFS host
 
 ```bash
-# Adjust USER/HOST/PATH to your environment
-rsync -av ./native ./_deps ./backend/target USER@HOST:/path/to/zfs-explorer/
+# Adjust OS/arch/USER/HOST to your environment.
+OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH_NAME="$(uname -m)"
+TARBALL="dist/zfs-explorer-release-${OS_NAME}-${ARCH_NAME}.tar.gz"
+scp "$TARBALL" USER@HOST:/tmp/
 ```
 
-### 3. Run the backend on the ZFS host
+### 3. Unpack and run backend on the ZFS host
 
 ```bash
 ssh USER@HOST
-cd /path/to/zfs-explorer/backend
-sudo ./target/debug/zfs-explorer
+mkdir -p ~/zfs-explorer
+tar -xzf /tmp/zfs-explorer-release-*.tar.gz -C ~/zfs-explorer --strip-components=1
+cd ~/zfs-explorer
+sudo ./run-backend.sh
 ```
 
 Expected output:
 ```
 INFO zfs_explorer: Initializing ZFS library...
-INFO zfs_explorer: ZFS Explorer starting (OpenZFS 21bbe7cb6)
+INFO zfs_explorer: ZFS Explorer (...)
 INFO zfs_explorer: API server listening on 127.0.0.1:9000
 ```
 
-### 4. Run the UI
+### 4. Choose UI + tunnel topology
+
+#### A) UI runs on your local machine (common)
 
 ```bash
+# Terminal 1: local -> ZFS host backend
+ssh -L 9000:127.0.0.1:9000 USER_ZFS@ZFS_HOST
+
+# Terminal 2: run UI locally
 cd ui
 npm run dev
+# Open http://127.0.0.1:8080
 ```
 
-### 5. Tunnel ports (if UI and backend are on different hosts)
+#### B) UI runs on a separate build box, backend runs on ZFS host
 
 ```bash
-# From your local machine
-ssh -L 8080:127.0.0.1:8080 -L 9000:127.0.0.1:9000 USER@HOST
-# Open http://localhost:8080 in your browser
+# Terminal 1: local -> build box UI
+ssh -L 8080:127.0.0.1:8080 USER_BUILD@BUILD_HOST
+
+# Terminal 2: local -> ZFS host backend
+ssh -L 9000:127.0.0.1:9000 USER_ZFS@ZFS_HOST
+
+# Open http://127.0.0.1:8080 on your local machine
 ```
 
-## Offline Mode (Experimental)
+This works because the UI currently targets `http://localhost:9000`, so your
+browser reaches the backend through your local `9000` tunnel.
+
+#### C) Build box and ZFS host are the same machine
+
+```bash
+ssh -L 8080:127.0.0.1:8080 -L 9000:127.0.0.1:9000 USER@HOST
+# UI on localhost:8080, backend on localhost:9000
+```
+
+Tunnel reliability tip:
+
+- Keep long-lived tunnel sessions in `tmux` or `screen` so they survive local
+  terminal disconnects/restarts.
+
+## Offline Mode
 
 Backend startup now supports an explicit offline pool-open mode for exported
 pools. This mode is opt-in and remains read-only.
@@ -360,30 +391,20 @@ zfs-explorer/
         └── App.css
 ```
 
-## API Endpoints (Selected)
+## API Endpoints
+
+Full endpoint reference (all registered routes, params, and notes):
+
+- `docs/API_REFERENCE.md`
+
+Commonly used endpoints:
 
 - `GET /api/version` - Build/runtime/debug metadata (includes active pool-open mode)
-- `GET /api/mode` - Current runtime pool-open mode (`live`/`offline`)
-- `PUT /api/mode` - Switch runtime pool-open mode (`{ "mode": "live" | "offline" }`)
-- `GET /api/pools` - List all imported pools (returns JSON array of strings)
-- `GET /api/pools/:pool/summary` - Structured pool config summary (`pool`, `features_for_read`, `vdev_tree`, `uberblock`)
-- `GET /api/pools/:pool/errors?cursor=&limit=&resolve_paths=` - Persistent pool error log entries
-- `GET /api/pools/:pool/mos/objects?type=&start=&limit=` - List MOS objects
-- `GET /api/pools/:pool/obj/:objid` - MOS dnode metadata
-- `GET /api/pools/:pool/obj/:objid/blkptrs` - MOS block pointers
-- `GET /api/pools/:pool/obj/:objid/zap` - ZAP entries
-- `GET /api/pools/:pool/graph/from/:objid` - 1-hop graph slice
-- `GET /api/pools/:pool/datasets/tree` - Dataset tree
-- `GET /api/pools/:pool/dataset/:dsl_dir_obj/head` - Dataset -> objset
-- `GET /api/pools/:pool/dataset/:dsl_dir_obj/snapshots` - Snapshot list for a DSL dir
-- `GET /api/pools/:pool/snapshot/:dsobj/objset` - Snapshot dataset object -> objset
-- `GET /api/pools/:pool/snapshot/:dsobj/lineage?max_prev=&max_next=` - Bounded snapshot lineage chain
-- `GET /api/pools/:pool/objset/:objset_id/root` - ZPL root znode
-- `GET /api/pools/:pool/objset/:objset_id/dir/:dir_obj/entries` - Directory entries
-- `GET /api/pools/:pool/objset/:objset_id/walk?path=/a/b` - Path walk
-- `GET /api/pools/:pool/objset/:objset_id/stat/:objid` - ZPL stat
-- `GET /api/pools/:pool/zpl/path/<path>` - File download by ZPL path (supports single `Range` request)
-- `GET /api/pools/:pool/block?vdev=&offset=&asize=` - Raw block hex dump
+- `GET /api/pools` - List pools visible in current mode
+- `GET /api/pools/{pool}/summary` - Structured pool config summary
+- `GET /api/pools/{pool}/datasets/tree` - Dataset hierarchy for a pool
+- `GET /api/pools/{pool}/objset/{objset_id}/walk?path=/a/b` - Path walk within objset
+- `GET /api/pools/{pool}/zpl/path/{*zpl_path}` - File download by ZPL path (single `Range` supported)
 
 ## Build from Scratch
 
@@ -619,7 +640,8 @@ See `docs/PACKAGING_STATIC_FEASIBILITY.md` for the current packaging decision.
 - Offline mode is explicit and uses read-only import plumbing for analysis.
 - Native runtime guardrails reject pool access if read-only mode is not active.
 - API bind address is localhost-only by default (`127.0.0.1:9000`).
-- Offline/exported mode is experimental and opt-in via env vars.
+- Offline/exported mode is supported and can be selected via env vars or
+  `GET/PUT /api/mode`.
 
 This project is intended for inspection and debugging, not mutation.
 
@@ -629,10 +651,9 @@ Known caveats and expected failure modes are tracked in:
 
 - `docs/KNOWN_LIMITATIONS.md`
 
-## Portability Roadmap
+## FreeBSD Notes
 
-FreeBSD portability is tracked as an explicit milestone. Current audit and
-abstraction plan:
+FreeBSD development and validation notes:
 
 - `docs/PORTABILITY_FREEBSD.md`
 
@@ -685,3 +706,8 @@ For repeatable milestone/release verification, use:
 ## References
 
 - OpenZFS commit: [21bbe7cb6](https://github.com/openzfs/zfs/commit/21bbe7cb6)
+- Additional background resources: `docs/RESOURCES.md`
+- ZFS on disk format for modern day OpenZFS:
+  [mminkus/zfs-ondiskformat](https://github.com/mminkus/zfs-ondiskformat/)
+- Understanding the OpenZFS Codebase: A Guided Walkthrough for Engineers:
+  [mminkus/zfs-codebase](https://github.com/mminkus/zfs-codebase/)

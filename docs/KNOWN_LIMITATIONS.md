@@ -1,44 +1,66 @@
 # Known Limitations and Failure Modes
 
-This document captures current constraints for `zfs-explorer` (live imported-pool mode).
+This document tracks practical constraints that still apply to
+`zfs-explorer` in both live and offline modes.
 
-## Scope and Mode Limits
+## Access and Privilege Constraints
 
-- Live mode only: pool must already be imported on the host.
-- Offline/exported pool inspection is not implemented yet.
-- Backend requires sufficient privileges to access ZFS internals (commonly root).
+- Backend typically needs elevated privileges (commonly root) to reliably
+  inspect pools, vdev images, and kernel ZFS telemetry.
+- Running as non-root may work for some metadata paths, but pool access can
+  be partial or fail depending on host permissions.
 
-## Encryption and Access Limits
+## Read-Only Scope
 
-- Encrypted datasets may expose metadata while payload-level traversal can be limited.
-- If keys are unavailable/locked, some object/directory paths can fail or appear incomplete.
+- `zfs-explorer` is intentionally read-only.
+- No repair, mutation, property updates, or pool-management write APIs are
+  exposed.
 
-## Pool/Layout/Feature Caveats
+## Live vs Offline Behavior Differences
 
-- Advanced pool layouts and feature combinations may have partial decoding coverage.
-- Behavior can vary on pools with uncommon feature usage, large metadata fan-out, or edge-case object types.
+- Runtime telemetry endpoints are live-mode only and return `400` in
+  offline mode:
+  - `/api/perf/arc`
+  - `/api/perf/vdev_iostat`
+  - `/api/perf/txg`
+  - `/api/pools/{pool}/dedup`
+  - `/api/pools/{pool}/space-amplification`
+- Offline mode depends on explicit pool names/search paths and exported media
+  visibility on disk.
+- Offline open can fail when pools are simultaneously active/imported on the
+  host namespace.
 
-## Performance and Scaling Limits
+## Dataset and Encryption Caveats
 
-- UI and API use pagination/caps to avoid runaway traversal.
-- Very large directories, ZAPs, or graph neighborhoods can still feel heavy and require iterative loading.
-- Graph exploration is intentionally bounded (1-hop plus explicit expansions) to reduce explosion.
+- Internal DSL datasets (for example `$FREE`, `$MOS`, `$ORIGIN`) are not
+  filesystem-browseable via ZPL path traversal.
+- Encrypted datasets can expose metadata while data reads require keys.
+  Locked/unavailable keys can produce partial traversal or read failures.
 
-## Expected “No Data” Object Cases
+## Corruption and Degraded Pool Expectations
 
-Some objects naturally have little/no readable payload in a given view. This is expected for cases like:
+- Degraded/missing-vdev pools are supported for read-only inspection, but
+  behavior is best-effort and object reads may still fail by design.
+- Corrupt objects/blocks may produce traversal/read errors that are
+  diagnostic, not necessarily backend regressions.
 
-- holes/unallocated objects
-- `maxblkid = 0` objects
-- objects with empty or metadata-only payload patterns
-- entries that resolve to structure-only metadata without user payload bytes
+## Performance and Scale Boundaries
 
-## DVA/Block Read Caveats
+- Pagination and traversal caps are intentionally enforced to prevent runaway
+  scans (MOS listing, ZAP listing, block trees, spacemap ranges/bins).
+- Very large directories, ZAPs, and graph neighborhoods can still be heavy
+  and may require iterative loading.
+- Graph endpoint is currently one-hop focused with bounded include expansion.
 
-- `"No readable DVA found"` can be expected for holes, unallocated objects, or objects without addressable payload blocks.
-- Raw block reads are bounded by request limits and may return truncated results by design.
+## Data Read / Download Limits
+
+- ZPL download endpoint supports a single HTTP `Range` header value.
+- Objset raw-data reads and block reads are size-capped for safety.
+- Some objects naturally return little/no payload (holes, metadata-only,
+  sparse regions).
 
 ## Error Surface Notes
 
-- API errors are returned as JSON envelopes with an `error` field for UI/debug tooling.
-- FFI/library errors can still be backend-originated (for example, pool/object traversal failures) and should be treated as diagnostic signals, not always fatal corruption indicators.
+- API errors are returned as structured JSON envelopes.
+- Native/FFI errors can still originate from pool state, unsupported object
+  patterns, missing keys, or host/runtime compatibility issues.

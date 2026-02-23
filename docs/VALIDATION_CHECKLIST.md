@@ -1,61 +1,101 @@
 # Validation Checklist
 
-Use this checklist before closing a milestone or preparing a release candidate.
+Use this checklist before merging major backend/native changes or preparing a
+release candidate.
 
-## 1. Build + Test
+## 0. Preflight
 
-- [ ] Backend unit tests pass:
+- [ ] Confirm no stale backend process is already bound to `127.0.0.1:9000`.
+
+Linux example:
+
+```bash
+ss -ltnp | rg ':9000' || true
+```
+
+FreeBSD example:
+
+```bash
+sockstat -4 -l | rg ':9000' || true
+```
+
+## 1. Build and Unit-Level Validation
+
+- [ ] Native library build succeeds.
+
+Linux:
+
+```bash
+cd native && make -j"$(nproc)"
+```
+
+FreeBSD:
+
+```bash
+cd native && gmake -j"$(sysctl -n hw.ncpu)"
+```
+
+- [ ] Backend tests succeed.
 
 ```bash
 cd backend
 LD_LIBRARY_PATH=../native:../_deps/openzfs/lib cargo test
 ```
 
-- [ ] UI production build passes:
+- [ ] UI production build succeeds.
 
 ```bash
 cd ui
 npm run build
 ```
 
-## 2. API Smoke Checks
+## 2. Backend Smoke Checks
 
-- [ ] Pools endpoint responds:
-
-```bash
-curl -sS http://127.0.0.1:9000/api/pools
-```
-
-- [ ] DMU type endpoint responds:
+- [ ] Start backend and confirm startup banner includes backend/OpenZFS/version
+      metadata.
+- [ ] Core endpoints respond:
 
 ```bash
-curl -sS http://127.0.0.1:9000/api/mos/types
+curl -sS http://127.0.0.1:9000/api/version | jq
+curl -sS http://127.0.0.1:9000/api/mode | jq
+curl -sS http://127.0.0.1:9000/api/pools | jq
+curl -sS http://127.0.0.1:9000/api/mos/types | jq
 ```
 
-- [ ] Dataset tree endpoint responds for a selected pool:
+## 3. Offline Fixture Validation
+
+- [ ] Regenerate corpus fixtures (or targeted subset) if fixture logic changed.
 
 ```bash
-curl -sS "http://127.0.0.1:9000/api/pools/<pool>/datasets/tree?depth=4&limit=500"
+build/create-corpus-matrix.sh --keep-going
 ```
 
-## 3. Manual Browser Validation
+- [ ] Run corpus validation matrix.
 
-- [ ] Datasets -> FS -> MOS handoff works from both directions.
-- [ ] FS navigation can `cd` through multiple levels without full-page reload.
-- [ ] MOS list pagination works beyond first page (`Load more` repeatedly).
-- [ ] Browser back/forward works in MOS and FS flows.
-- [ ] Inspector long values do not overflow cards (dataset name, mount path, object labels).
-- [ ] `Raw` tab opens and hex view loads for readable DVAs.
-- [ ] `Open as object` from FS selection jumps to matching MOS object.
-- [ ] `Open in FS` from DSL dataset inspector opens the expected dataset root.
+```bash
+sudo build/test-corpus-matrix.sh --keep-going
+```
 
-## 4. Error Handling Spot Checks
+- [ ] Confirm summary reports all passes for selected combinations.
 
-- [ ] Trigger a known bad request (e.g., invalid object id) and confirm UI shows backend JSON error text.
-- [ ] Confirm no silent hangs in browser Network tab (requests should settle with response or clear error).
+## 4. Manual UI Sanity (Targeted)
 
-## 5. Optional Regression Notes
+- [ ] Dataset tree renders and navigation is stable.
+- [ ] Objset walk/stat/object inspector flows work on at least one fixture.
+- [ ] ZPL path download works for known files.
+- [ ] Error responses are visible and actionable in UI (no silent hangs).
 
-- [ ] Record pool(s) used for manual validation.
-- [ ] Record commit hash tested.
-- [ ] Record any known non-blocking issues.
+## 5. Optional Cross-Host Verification
+
+Run when changing native/OpenZFS integration or portability-sensitive code.
+
+- [ ] Debian host run completed.
+- [ ] Ubuntu host run completed.
+- [ ] FreeBSD host run completed.
+- [ ] Record matrix summaries in PR notes.
+
+## 6. Release Notes Inputs
+
+- [ ] Record tested commit hash.
+- [ ] Record OpenZFS submodule commit hash.
+- [ ] Record any known non-blocking issues and workarounds.

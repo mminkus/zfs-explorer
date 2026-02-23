@@ -1,71 +1,65 @@
-# Offline Mode Design (Milestone O.1)
+# Offline Mode Design and Status
+
+## Current Status
+
+Offline mode is implemented and used in regular fixture validation.
+
+- Backend supports runtime pool-open modes: `live` and `offline`.
+- Offline open uses read-only userland OpenZFS import/open plumbing.
+- Existing MOS/DSL/ZAP/objset/ZPL APIs run on offline-opened pools.
+- Corpus validation currently passes across Debian, Ubuntu, and FreeBSD
+  test hosts (local matrix runs).
 
 ## Goal
-Enable read-only exploration of **exported/non-imported** pools without requiring a kernel import on the host system.
+
+Enable read-only exploration of exported/non-imported pools without requiring
+kernel import of the target pool.
 
 ## Safety Model
-- Offline mode is strictly read-only.
-- No dataset/property mutation APIs are exposed in native or backend.
-- Open/import operations use read-only userland OpenZFS plumbing.
-- UI and API must clearly show mode (`live` vs `offline`).
-- Default bind remains `127.0.0.1`; no remote exposure by default.
+
+- Offline mode is read-only.
+- No dataset/property mutation APIs are exposed.
+- Backend binds localhost by default (`127.0.0.1`).
+- Mode is visible via startup logs and `/api/mode` / `/api/version`.
 
 ## Architecture
 
-### Live mode (current)
-- Open by pool name with `spa_open()` against imported pools.
-- Uses MOS/DSL/ZAP traversal through existing native APIs.
+### Live mode
 
-### Offline mode (target)
-- Discover pool config from supplied device/file search paths using `libzutil` (`zpool_find_config`).
-- Import pool in-process with `spa_import(..., ZFS_IMPORT_SKIP_MMP)`.
-- Open with `spa_open()` and reuse existing MOS/DSL/ZAP traversal APIs.
-- On handle close, export in-process import when we imported it.
+- Uses imported pools visible to host ZFS.
+- Includes runtime telemetry endpoints (`/api/perf/*`, dedup, space-amplification).
 
-## Offline open primitive (added in O.2)
-- C API: `zdx_pool_open_offline(name, search_paths, err)`
-- `search_paths` format: colon-separated directories/devices/files.
-- `search_paths == NULL` uses OpenZFS default import search paths.
+### Offline mode
 
-## Failure/edge handling
-- Return errno-style errors for import/open failures.
-- Support already-imported namespace case (`EEXIST`/`EALREADY`) by continuing with `spa_open()`.
-- If import succeeded but open/alloc fails, attempt cleanup export.
+- Resolves pool config from supplied search paths.
+- Imports/opens pools in-process for analysis using userland OpenZFS.
+- Reuses the same traversal APIs (MOS/DSL/ZAP/objset/ZPL).
+- Does not expose write/repair operations.
 
-## v1 Compatibility Matrix
+## Primary Interfaces
 
-| Area | v1 Target | Status | Notes |
-|---|---|---|---|
-| Exported pool import | Yes | In progress | Primitive added; backend runtime mode wired |
-| MOS object browse | Yes | In progress | Runtime mode can open pools via offline primitive |
-| DSL traversal | Yes | Planned | Same APIs after offline open |
-| ZAP decode | Yes | Planned | Same APIs after offline open |
-| FS navigator | Yes | Planned | Depends on objset traversal parity |
-| Checkpoint rewind policies | Optional | Not in v1 | Design reserved for later |
-| Encrypted datasets (locked) | Partial | Expected limitation | Metadata visibility depends on key state |
-| Damaged/missing devices | Partial | Expected limitation | Graceful errors; no recovery tooling in v1 |
-| RAIDZ/dRAID/special vdevs | Best effort | Planned | Depends on imported config quality and labels |
+- Native primitive: `zdx_pool_open_offline(name, search_paths, err)`
+- Backend controls:
+  - env: `ZFS_EXPLORER_POOL_MODE=offline`
+  - env: `ZFS_EXPLORER_OFFLINE_POOLS=<csv>`
+  - env: `ZFS_EXPLORER_OFFLINE_PATHS=<colon-separated paths>`
+  - API: `GET /api/mode`, `PUT /api/mode`
 
-## Implementation sequence
-1. Native primitive (done): offline open by search paths.
-2. Backend mode-aware pool handle management (done via env-config runtime mode).
-3. API parameterization (`mode=live|offline`, optional search paths).
-4. DSL/ZAP parity checks against live mode (scripted baseline added).
-5. UI mode selector + mode badge and warnings.
-6. Test fixtures and regression coverage.
+## Validation Tooling
 
-## Current validation helper (O.2)
+- `build/test-corpus-fixture.sh`
+- `build/test-corpus-matrix.sh`
+- `build/check-offline-parity.sh`
 
-- Script: `build/check-offline-parity.sh`
-- Purpose: compare normalized JSON output from a live-mode backend and an
-  offline-mode backend for selected MOS/DSL/ZAP endpoints.
-- Typical usage:
-  - Run live backend at `:9000`
-  - Run offline backend at `:9001`
-  - Execute:
-    `LIVE_BASE_URL=http://127.0.0.1:9000 OFFLINE_BASE_URL=http://127.0.0.1:9001 build/check-offline-parity.sh <pool> 1 32 34`
+## Known Offline Constraints
 
-## Out of scope for O.1/O.2
-- Automatic damaged-pool recovery workflows.
-- Write operations or repair actions.
-- FreeBSD portability work (tracked in Milestone P).
+- Telemetry endpoints are unavailable in offline mode.
+- Encrypted datasets may require keys for payload-level reads.
+- Pools active/imported in host namespace can conflict with offline open.
+- Degraded/corrupt pools are best-effort inspection only.
+
+## Out of Scope
+
+- Automatic recovery workflows.
+- Any write/repair actions.
+- Remote-by-default exposure (service remains localhost-bound by default).
