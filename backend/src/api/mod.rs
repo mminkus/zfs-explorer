@@ -1458,9 +1458,43 @@ pub async fn list_pool_datasets(
     State(state): State<AppState>,
     Path(pool): Path<String>,
 ) -> ApiResult {
-    let pool_ptr = ensure_pool(&state, &pool)?;
-    let result = crate::ffi::pool_datasets(pool_ptr);
-    json_from_result(result)
+    let fallback_reason = {
+        let pool_ptr = ensure_pool(&state, &pool)?;
+        let result = crate::ffi::pool_datasets(pool_ptr);
+        if result.is_ok() {
+            return json_from_result(result);
+        }
+
+        let err_msg = result.error_msg().unwrap_or("Unknown error").to_string();
+        let pool_open = pool_open_config(&state);
+        let libzfs_unavailable = err_msg.contains("Failed to initialize the libzfs library")
+            || err_msg.contains("failed to open dataset root");
+        if !(matches!(pool_open.mode, crate::PoolOpenMode::Offline) && libzfs_unavailable) {
+            return json_from_result(result);
+        }
+
+        err_msg
+    };
+
+    tracing::warn!(
+        "falling back to DSL dataset tree for {} because libzfs dataset listing failed: {}",
+        pool,
+        fallback_reason
+    );
+    let tree = dataset_tree(
+        State(state.clone()),
+        Path(pool.clone()),
+        Query(DatasetTreeQuery {
+            depth: Some(64),
+            limit: Some(100_000),
+        }),
+    )
+    .await?;
+
+    let payload = tree.0;
+    let mut out = Vec::new();
+    append_dataset_catalog_from_tree(&payload["root"], None, &mut out);
+    Ok(Json(Value::Array(out)))
 }
 
 /// GET /api/pools/:pool/summary
@@ -1514,6 +1548,41 @@ fn normalize_limit(limit: Option<u64>) -> u64 {
 
 fn normalize_cursor_limit(cursor: Option<u64>, limit: Option<u64>) -> (u64, u64) {
     (cursor.unwrap_or(0), normalize_limit(limit))
+}
+
+fn append_dataset_catalog_from_tree(node: &Value, prefix: Option<&str>, out: &mut Vec<Value>) {
+    let Some(name) = node["name"].as_str() else {
+        return;
+    };
+
+    let full_name = if let Some(parent) = prefix {
+        if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        }
+    } else {
+        name.to_string()
+    };
+
+    let has_head = node["head_dataset_obj"]
+        .as_u64()
+        .map(|value| value != 0)
+        .unwrap_or(false);
+    if has_head && !name.starts_with('$') {
+        out.push(json!({
+            "name": full_name,
+            "type": "filesystem",
+            "mountpoint": null,
+            "mounted": null,
+        }));
+    }
+
+    if let Some(children) = node["children"].as_array() {
+        for child in children {
+            append_dataset_catalog_from_tree(child, Some(&full_name), out);
+        }
+    }
 }
 
 fn normalize_spacemap_limit(limit: Option<u64>) -> u64 {

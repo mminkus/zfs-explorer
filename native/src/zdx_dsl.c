@@ -14,6 +14,31 @@ typedef struct zdx_dsl_dataset_lineage_info {
     uint64_t unique_bytes;
 } zdx_dsl_dataset_lineage_info_t;
 
+/*
+ * Validate that a MOS object is a DSL dir object before passing it to
+ * dsl_dir_hold_obj(), which asserts on type mismatch in debug/assert builds.
+ */
+static int
+zdx_check_is_dsl_dir_obj(objset_t *mos, uint64_t objid)
+{
+    if (!mos || objid == 0)
+        return EINVAL;
+
+    dnode_t *dn = NULL;
+    int err = dnode_hold(mos, objid, FTAG, &dn);
+    if (err != 0)
+        return err;
+
+    dmu_object_info_t doi;
+    dmu_object_info_from_dnode(dn, &doi);
+    dnode_rele(dn, FTAG);
+
+    if (doi.doi_bonus_type != DMU_OT_DSL_DIR)
+        return EINVAL;
+
+    return 0;
+}
+
 static int
 zdx_read_dsl_dataset_lineage_info(objset_t *mos, uint64_t dsobj,
     zdx_dsl_dataset_lineage_info_t *info)
@@ -135,6 +160,11 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
     dsl_dir_t *dd = NULL;
     int err;
     dsl_pool_config_enter(dp, FTAG);
+
+    err = zdx_check_is_dsl_dir_obj(mos, objid);
+    if (err != 0)
+        goto out_unlock;
+
     err = dsl_dir_hold_obj(dp, objid, NULL, FTAG, &dd);
     if (err != 0)
         goto out_unlock;
@@ -163,6 +193,7 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
 
         while ((err = zap_cursor_retrieve(&zc, attrp)) == 0) {
             uint64_t child_obj = 0;
+            int child_err;
             if (attrp->za_integer_length == 8 &&
                 attrp->za_num_integers == 1) {
                 (void) zap_lookup(mos, zapobj, attrp->za_name,
@@ -175,12 +206,18 @@ zdx_dsl_dir_children(zdx_pool_t *pool, uint64_t objid)
                 continue;
             }
 
+            child_err = zdx_check_is_dsl_dir_obj(mos, child_obj);
+            if (child_err != 0) {
+                zap_cursor_advance(&zc);
+                continue;
+            }
+
             /*
              * Validate child as a real DSL dir via dsl_dir_hold_obj() while
              * config lock is held.
              */
             dsl_dir_t *child_dd = NULL;
-            int child_err = dsl_dir_hold_obj(dp, child_obj, NULL, FTAG,
+            child_err = dsl_dir_hold_obj(dp, child_obj, NULL, FTAG,
                 &child_dd);
             if (child_err != 0) {
                 zap_cursor_advance(&zc);
@@ -292,11 +329,21 @@ zdx_dsl_dir_head(zdx_pool_t *pool, uint64_t objid)
         return make_error(EINVAL, "pool not open");
 
     dsl_pool_t *dp = pool->spa->spa_dsl_pool;
+    objset_t *mos = spa_meta_objset(pool->spa);
+    if (!mos)
+        return make_error(EINVAL, "failed to access MOS");
     dsl_dir_t *dd = NULL;
     int err;
     uint64_t head;
 
     dsl_pool_config_enter(dp, FTAG);
+    err = zdx_check_is_dsl_dir_obj(mos, objid);
+    if (err != 0) {
+        dsl_pool_config_exit(dp, FTAG);
+        return make_error(EINVAL, "object %llu is not DSL dir",
+            (unsigned long long)objid);
+    }
+
     err = dsl_dir_hold_obj(dp, objid, NULL, FTAG, &dd);
     if (err != 0) {
         dsl_pool_config_exit(dp, FTAG);
