@@ -379,7 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind to localhost only (per security model in plan)
     let addr = SocketAddr::from(([127, 0, 0, 1], 9000));
-    tracing::info!("API server listening on {}", addr);
+    tracing::info!("ZDX API server listening on {}", addr);
 
     // Start the server
     let listener = tokio::net::TcpListener::bind(addr).await?;

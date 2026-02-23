@@ -35,6 +35,33 @@ You can think of this project as:
 
 **Current Status:** Active development (Milestones 0-6 complete; Release Readiness + Offline Mode work in progress)
 
+## End-User Quick Start (Prebuilt Releases)
+
+For most users, the recommended path is:
+
+1. Download release artifacts from GitHub Releases:
+   - `zfs-explorer-zdx-api-<profile>-<os>-<arch>.tar.gz` (backend)
+   - `zfs-explorer-webui.tar.gz` (optional static UI bundle)
+2. Run the backend on a host with ZFS access.
+3. Use either:
+   - the packaged UI bundle (`run-webui.sh`), or
+   - your own locally hosted UI that points to tunneled backend port `9000`.
+
+Latest releases:
+
+- https://github.com/mminkus/zfs-explorer/releases/latest
+
+Example backend startup from a release tarball:
+
+```bash
+tar -xzf zfs-explorer-zdx-api-release-<os>-<arch>.tar.gz
+cd zfs-explorer-zdx-api-release-<os>-<arch>
+sudo ./run-backend.sh
+```
+
+If you want to build from source or generate custom packages, see
+**Developer Guide** below.
+
 ## Guided Tour
 
 1. Start backend on the ZFS host (`sudo ./run-backend.sh` or `sudo ./target/debug/zfs-explorer`).
@@ -127,6 +154,11 @@ API stability note:
 - ✅ SPA history-friendly UI navigation, breadcrumbs, and object pinning
 - ✅ Packaging/build scripts and offline fixture + parity validation tooling
 
+## Developer Guide (Build from Source)
+
+This section is for contributors and operators building custom artifacts.
+End users should prefer release tarballs from GitHub Releases.
+
 ## Bootstrap (Fresh Host)
 
 Use the platform bootstrap script first, then run the normal build.
@@ -163,23 +195,29 @@ Notes:
 If your UI runs in a container/VM without ZFS access, run the backend on a host
 that can see `/dev/zfs`, then tunnel the ports.
 
-Recommended workflow: package the backend once, copy a tarball to the ZFS host,
-and run only the backend there. The UI can stay on your local machine.
+If you are an end user, use release tarballs from GitHub Releases instead of
+building with `build/package.sh`.
 
-### 1. Build a portable backend bundle on your dev machine
+Recommended workflow: package both deliverables once, copy only the backend
+tarball to the ZFS host, and run only the backend there. The UI can stay on
+your local machine (or another box).
+
+### 1. Build release bundles on your dev machine
 
 ```bash
-# Use release for normal usage; use default profile for faster debug builds.
+# Produces:
+# - dist/zfs-explorer-zdx-api-release-<os>-<arch>.tar.gz
+# - dist/zfs-explorer-webui.tar.gz
 ./build/package.sh --profile release
 ```
 
-### 2. Copy the tarball to the ZFS host
+### 2. Copy the backend tarball to the ZFS host
 
 ```bash
 # Adjust OS/arch/USER/HOST to your environment.
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_NAME="$(uname -m)"
-TARBALL="dist/zfs-explorer-release-${OS_NAME}-${ARCH_NAME}.tar.gz"
+TARBALL="dist/zfs-explorer-zdx-api-release-${OS_NAME}-${ARCH_NAME}.tar.gz"
 scp "$TARBALL" USER@HOST:/tmp/
 ```
 
@@ -188,7 +226,7 @@ scp "$TARBALL" USER@HOST:/tmp/
 ```bash
 ssh USER@HOST
 mkdir -p ~/zfs-explorer
-tar -xzf /tmp/zfs-explorer-release-*.tar.gz -C ~/zfs-explorer --strip-components=1
+tar -xzf /tmp/zfs-explorer-zdx-api-release-*.tar.gz -C ~/zfs-explorer --strip-components=1
 cd ~/zfs-explorer
 sudo ./run-backend.sh
 ```
@@ -469,7 +507,7 @@ Commonly used endpoints:
 
 ```bash
 # fresh clone
-git clone --recurse-submodules https://github.com/<you>/zfs-explorer.git
+git clone --recurse-submodules https://github.com/mminkus/zfs-explorer.git
 cd zfs-explorer
 
 # if you already cloned without submodules
@@ -633,7 +671,10 @@ make install
 
 ## Packaging for Remote Hosts
 
-Build a portable backend bundle (binary + required shared libraries):
+Build two bundles:
+
+- zdx-api backend bundle (binary + required shared libraries)
+- web UI static bundle
 
 ```bash
 # debug bundle
@@ -648,8 +689,18 @@ Build a portable backend bundle (binary + required shared libraries):
 
 Output:
 
-- Bundle directory: `dist/zfs-explorer-<profile>-<os>-<arch>/`
-- Tarball: `dist/zfs-explorer-<profile>-<os>-<arch>.tar.gz`
+- Backend directory: `dist/zfs-explorer-zdx-api-<profile>-<os>-<arch>/`
+- Backend tarball: `dist/zfs-explorer-zdx-api-<profile>-<os>-<arch>.tar.gz`
+- Web UI directory: `dist/zfs-explorer-webui/`
+- Web UI tarball: `dist/zfs-explorer-webui.tar.gz`
+
+Run the packaged web UI bundle with:
+
+```bash
+tar -xzf dist/zfs-explorer-webui.tar.gz -C /tmp
+cd /tmp/zfs-explorer-webui
+./run-webui.sh 8080
+```
 
 Run backend from the bundle with:
 
@@ -669,15 +720,52 @@ Typical remote-host flow:
 # on build machine
 ./build/package.sh --profile release
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-rsync -av dist/zfs-explorer-release-${OS_NAME}-$(uname -m).tar.gz USER@HOST:/tmp/
+rsync -av dist/zfs-explorer-zdx-api-release-${OS_NAME}-$(uname -m).tar.gz USER@HOST:/tmp/
 
 # on target host
 cd /opt
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-sudo tar -xzf /tmp/zfs-explorer-release-${OS_NAME}-$(uname -m).tar.gz
-cd zfs-explorer-release-${OS_NAME}-$(uname -m)
+sudo tar -xzf /tmp/zfs-explorer-zdx-api-release-${OS_NAME}-$(uname -m).tar.gz
+cd zfs-explorer-zdx-api-release-${OS_NAME}-$(uname -m)
 sudo ./run-backend.sh
 ```
+
+### Package Matrix Automation (Docker + FreeBSD SSH)
+
+Use `build/package-matrix.sh` to produce release artifacts for multiple
+platforms in one run:
+
+- Linux targets built in Docker:
+  `debian12`, `debian13`, `ubuntu2204`, `ubuntu2404`, `ubuntu2504`,
+  `rocky9`, `alma10`
+- FreeBSD target built via SSH on a remote host
+
+```bash
+# Default matrix:
+# - Linux: debian12, debian13, ubuntu2204, ubuntu2404, ubuntu2504, rocky9, alma10
+# - FreeBSD: skipped by default
+./build/package-matrix.sh
+
+# Linux + FreeBSD
+./build/package-matrix.sh --freebsd-host freebsd.example.net
+
+# FreeBSD only (explicit host required)
+./build/package-matrix.sh --skip-linux --freebsd-host freebsd.example.net
+```
+
+Outputs are written under `dist/releases/<utc-timestamp>/` and include:
+
+- distro-labeled backend tarballs under `linux/` and `freebsd/`
+- shared `zfs-explorer-webui.tar.gz`
+- `SHA256SUMS.txt` for generated tarballs
+
+Notes:
+
+- Linux matrix requires Docker on the host.
+- FreeBSD matrix is opt-in and requires `--freebsd-host`, passwordless
+  SSH/scp access, and the repo checked out at the same path
+  (or pass `--freebsd-repo`).
+- Linux matrix builds the UI once locally unless `--skip-ui-build` is used.
 
 Note: full static backend linking is not the primary target right now.
 See `docs/PACKAGING_STATIC_FEASIBILITY.md` for the current packaging decision.

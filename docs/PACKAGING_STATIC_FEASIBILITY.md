@@ -16,7 +16,7 @@ Full static linking is **not** the primary target right now.
 ## Recommended Artifact Shape
 
 ```
-zfs-explorer-<profile>-<os>-<arch>/
+zfs-explorer-zdx-api-<profile>-<os>-<arch>/
   bin/zfs-explorer
   lib/libzdbdecode.so
   lib/libzfs.so.*
