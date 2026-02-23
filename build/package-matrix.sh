@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="release"
+VERSION_LABEL="auto"
 OUTPUT_ROOT="$ROOT_DIR/dist/releases/$(date -u +%Y%m%dT%H%M%SZ)"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 SKIP_LINUX=0
@@ -25,6 +26,7 @@ Build release bundles for a distro matrix:
 
 Options:
   --profile <debug|release>     Package profile (default: release)
+  --version-label <value>       Version label in artifact names (default: auto)
   --output-root <path>          Output root (default: dist/releases/<utc-ts>)
   --linux-targets <csv>         Linux targets:
                                 debian12,debian13,ubuntu2204,ubuntu2404,
@@ -45,6 +47,7 @@ Options:
 Examples:
   build/package-matrix.sh
   build/package-matrix.sh --linux-targets debian13,ubuntu2404 --skip-freebsd
+  build/package-matrix.sh --version-label v1.0.0-rc1
   build/package-matrix.sh --freebsd-host freebsd.example.net
   build/package-matrix.sh --output-root dist/releases/rc1
 EOF
@@ -85,6 +88,20 @@ ensure_tool() {
     echo "error: required tool '$tool' not found in PATH" >&2
     exit 1
   fi
+}
+
+git_build_version() {
+  local version
+  version="$(git -C "$ROOT_DIR" describe --tags --dirty --always 2>/dev/null || true)"
+  if [[ -z "$version" ]]; then
+    version="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  fi
+  printf '%s\n' "$version"
+}
+
+sanitize_version_label() {
+  local raw="$1"
+  printf '%s\n' "$raw" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//'
 }
 
 ensure_docker_access() {
@@ -206,6 +223,7 @@ build_linux_target() {
       -e RUSTUP_HOME="/usr/local/rustup" \
       -e PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
       -e PROFILE="$PROFILE" \
+      -e VERSION_LABEL="$VERSION_LABEL" \
       -v "$ROOT_DIR:/workspace" \
       -w /workspace \
       "$image" \
@@ -233,13 +251,13 @@ build_linux_target() {
         fi
 
         ROOT_DIR="$WORK_DIR" PROFILE="$PROFILE" ./packaging/docker/build-release-backend.sh
-        (cd "$WORK_DIR" && ./build/package.sh --profile "$PROFILE" --skip-build --output-dir "$OUT_DIR")
+        (cd "$WORK_DIR" && ./build/package.sh --profile "$PROFILE" --version-label "$VERSION_LABEL" --skip-build --output-dir "$OUT_DIR")
         cp -a "$OUT_DIR/." "/workspace/dist/package-matrix/'"$target"'/raw/"
       '
   } >>"$log_file" 2>&1
 
   local backend_tar
-  backend_tar="$(find "$raw_dir" -maxdepth 1 -type f -name "zfs-explorer-zdx-api-${PROFILE}-*.tar.gz" | head -n1 || true)"
+  backend_tar="$(find "$raw_dir" -maxdepth 1 -type f -name "zfs-explorer-zdx-api-*-${PROFILE}-*.tar.gz" | head -n1 || true)"
   if [[ -z "$backend_tar" ]]; then
     echo "error: backend tarball not found for $target (see $log_file)" >&2
     return 1
@@ -250,9 +268,10 @@ build_linux_target() {
   local backend_out="$target_out_dir/${backend_base}-${label}.tar.gz"
   cp -f "$backend_tar" "$backend_out"
 
-  local webui_tar="$raw_dir/zfs-explorer-webui.tar.gz"
-  if [[ -f "$webui_tar" && ! -f "$OUTPUT_ROOT/zfs-explorer-webui.tar.gz" ]]; then
-    cp -f "$webui_tar" "$OUTPUT_ROOT/zfs-explorer-webui.tar.gz"
+  local webui_tar
+  webui_tar="$(find "$raw_dir" -maxdepth 1 -type f -name "zfs-explorer-webui-*.tar.gz" | head -n1 || true)"
+  if [[ -n "$webui_tar" && ! -f "$OUTPUT_ROOT/$(basename "$webui_tar")" ]]; then
+    cp -f "$webui_tar" "$OUTPUT_ROOT/$(basename "$webui_tar")"
   fi
 
   local version_file
@@ -274,11 +293,11 @@ run_freebsd_build() {
   {
     ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git submodule update --init --recursive"
     ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && env MAKE=gmake ./build/build.sh --bootstrap-openzfs --openzfs-release"
-    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && env MAKE=gmake ./build/package.sh --profile '$PROFILE'"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && env MAKE=gmake ./build/package.sh --profile '$PROFILE' --version-label '$VERSION_LABEL'"
   } >"$log_file" 2>&1
 
   local remote_backend_tar
-  remote_backend_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && ls -1 dist/zfs-explorer-zdx-api-${PROFILE}-*.tar.gz 2>/dev/null | head -n1" || true)"
+  remote_backend_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && ls -1 dist/zfs-explorer-zdx-api-*-${PROFILE}-*.tar.gz 2>/dev/null | head -n1" || true)"
   if [[ -z "$remote_backend_tar" ]]; then
     echo "error: no FreeBSD backend tarball found (see $log_file)" >&2
     return 1
@@ -288,9 +307,10 @@ run_freebsd_build() {
   local_backend_name="$(basename "$remote_backend_tar")"
   scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$FREEBSD_REPO_PATH/$remote_backend_tar" "$target_out_dir/$local_backend_name" >>"$log_file" 2>&1
 
-  local remote_webui_tar="dist/zfs-explorer-webui.tar.gz"
-  if [[ ! -f "$OUTPUT_ROOT/zfs-explorer-webui.tar.gz" ]]; then
-    scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$FREEBSD_REPO_PATH/$remote_webui_tar" "$OUTPUT_ROOT/zfs-explorer-webui.tar.gz" >>"$log_file" 2>&1 || true
+  local remote_webui_tar
+  remote_webui_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && ls -1 dist/zfs-explorer-webui-*.tar.gz 2>/dev/null | head -n1" || true)"
+  if [[ -n "$remote_webui_tar" && ! -f "$OUTPUT_ROOT/$(basename "$remote_webui_tar")" ]]; then
+    scp $FREEBSD_SSH_OPTS "$FREEBSD_HOST:$FREEBSD_REPO_PATH/$remote_webui_tar" "$OUTPUT_ROOT/$(basename "$remote_webui_tar")" >>"$log_file" 2>&1 || true
   fi
 
   log "Completed FreeBSD -> $local_backend_name"
@@ -301,6 +321,10 @@ while [[ $# -gt 0 ]]; do
     --profile)
       shift
       PROFILE="${1:-}"
+      ;;
+    --version-label)
+      shift
+      VERSION_LABEL="${1:-}"
       ;;
     --output-root)
       shift
@@ -350,6 +374,15 @@ done
 
 if [[ "$PROFILE" != "debug" && "$PROFILE" != "release" ]]; then
   echo "error: unsupported profile '$PROFILE' (expected debug or release)" >&2
+  exit 2
+fi
+
+if [[ "$VERSION_LABEL" == "auto" ]]; then
+  VERSION_LABEL="$(git_build_version)"
+fi
+VERSION_LABEL="$(sanitize_version_label "$VERSION_LABEL")"
+if [[ -z "$VERSION_LABEL" ]]; then
+  echo "error: computed empty version label" >&2
   exit 2
 fi
 
@@ -422,8 +455,8 @@ if [[ "$SKIP_FREEBSD" -eq 0 ]]; then
   fi
 fi
 
-if [[ ! -f "$OUTPUT_ROOT/zfs-explorer-webui.tar.gz" ]]; then
-  echo "warning: zfs-explorer-webui.tar.gz was not collected from any target" >&2
+if ! find "$OUTPUT_ROOT" -maxdepth 1 -type f -name 'zfs-explorer-webui-*.tar.gz' | grep -q .; then
+  echo "warning: no versioned zfs-explorer-webui tarball was collected from any target" >&2
 fi
 
 (

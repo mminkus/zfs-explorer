@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="debug"
 OUTPUT_DIR="$ROOT_DIR/dist"
 SKIP_BUILD=0
+VERSION_LABEL="auto"
 HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
 
 if [[ -n "${MAKE:-}" ]]; then
@@ -21,6 +22,7 @@ Usage: build/package.sh [options]
 
 Options:
   --profile <debug|release>   Backend build profile to package (default: debug)
+  --version-label <value>     Version label in artifact names (default: auto)
   --output-dir <path>         Output directory for bundles/tarballs (default: ./dist)
   --skip-build                Do not rebuild native/backend/ui before packaging
   -h, --help                  Show this help
@@ -28,6 +30,7 @@ Options:
 Examples:
   build/package.sh
   build/package.sh --profile release
+  build/package.sh --version-label v1.0.0-rc1
   build/package.sh --profile release --skip-build
 EOF
 }
@@ -65,6 +68,21 @@ ensure_make_tool() {
     echo "hint: install make/build-essential or set MAKE=<tool>." >&2
   fi
   exit 1
+}
+
+git_build_version() {
+  local version
+  version="$(git -C "$ROOT_DIR" describe --tags --dirty --always 2>/dev/null || true)"
+  if [[ -z "$version" ]]; then
+    version="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  fi
+  printf '%s\n' "$version"
+}
+
+sanitize_version_label() {
+  local raw="$1"
+  # Keep filename-safe characters only.
+  printf '%s\n' "$raw" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//'
 }
 
 version_gt() {
@@ -121,6 +139,11 @@ while [[ $# -gt 0 ]]; do
       [[ $# -gt 0 ]] || { echo "error: --profile requires a value" >&2; exit 1; }
       PROFILE="$1"
       ;;
+    --version-label)
+      shift
+      [[ $# -gt 0 ]] || { echo "error: --version-label requires a value" >&2; exit 1; }
+      VERSION_LABEL="$1"
+      ;;
     --output-dir)
       shift
       [[ $# -gt 0 ]] || { echo "error: --output-dir requires a value" >&2; exit 1; }
@@ -144,6 +167,15 @@ done
 
 if [[ "$PROFILE" != "debug" && "$PROFILE" != "release" ]]; then
   echo "error: unsupported profile '$PROFILE' (expected debug or release)" >&2
+  exit 1
+fi
+
+if [[ "$VERSION_LABEL" == "auto" ]]; then
+  VERSION_LABEL="$(git_build_version)"
+fi
+VERSION_LABEL="$(sanitize_version_label "$VERSION_LABEL")"
+if [[ -z "$VERSION_LABEL" ]]; then
+  echo "error: computed empty version label" >&2
   exit 1
 fi
 
@@ -187,11 +219,11 @@ fi
 
 ARCH="$(uname -m)"
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-BACKEND_BUNDLE_NAME="zfs-explorer-zdx-api-${PROFILE}-${OS_NAME}-${ARCH}"
+BACKEND_BUNDLE_NAME="zfs-explorer-zdx-api-${VERSION_LABEL}-${PROFILE}-${OS_NAME}-${ARCH}"
 BACKEND_BUNDLE_DIR="$OUTPUT_DIR/$BACKEND_BUNDLE_NAME"
 BACKEND_LIB_DIR="$BACKEND_BUNDLE_DIR/lib"
 BACKEND_BIN_DIR="$BACKEND_BUNDLE_DIR/bin"
-WEBUI_BUNDLE_NAME="zfs-explorer-webui"
+WEBUI_BUNDLE_NAME="zfs-explorer-webui-${VERSION_LABEL}"
 WEBUI_BUNDLE_DIR="$OUTPUT_DIR/$WEBUI_BUNDLE_NAME"
 
 echo "==> Preparing backend bundle at $BACKEND_BUNDLE_DIR"
@@ -215,6 +247,7 @@ GIT_SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown
 cat > "$BACKEND_BUNDLE_DIR/VERSION.txt" <<EOF
 bundle=$BACKEND_BUNDLE_NAME
 profile=$PROFILE
+version_label=$VERSION_LABEL
 git_sha=$GIT_SHA
 created_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EOF
@@ -243,6 +276,7 @@ chmod +x "$WEBUI_BUNDLE_DIR/run-webui.sh"
 
 cat > "$WEBUI_BUNDLE_DIR/VERSION.txt" <<EOF
 bundle=$WEBUI_BUNDLE_NAME
+version_label=$VERSION_LABEL
 git_sha=$GIT_SHA
 created_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EOF

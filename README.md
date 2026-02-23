@@ -40,8 +40,8 @@ You can think of this project as:
 For most users, the recommended path is:
 
 1. Download release artifacts from GitHub Releases:
-   - `zfs-explorer-zdx-api-<profile>-<os>-<arch>.tar.gz` (backend)
-   - `zfs-explorer-webui.tar.gz` (optional static UI bundle)
+   - `zfs-explorer-zdx-api-<version-label>-<profile>-<os>-<arch>.tar.gz` (backend)
+   - `zfs-explorer-webui-<version-label>.tar.gz` (optional static UI bundle)
 2. Run the backend on a host with ZFS access.
 3. Use either:
    - the packaged UI bundle (`run-webui.sh`), or
@@ -54,8 +54,8 @@ Latest releases:
 Example backend startup from a release tarball:
 
 ```bash
-tar -xzf zfs-explorer-zdx-api-release-<os>-<arch>.tar.gz
-cd zfs-explorer-zdx-api-release-<os>-<arch>
+tar -xzf zfs-explorer-zdx-api-<version-label>-release-<os>-<arch>.tar.gz
+cd zfs-explorer-zdx-api-<version-label>-release-<os>-<arch>
 sudo ./run-backend.sh
 ```
 
@@ -206,9 +206,12 @@ your local machine (or another box).
 
 ```bash
 # Produces:
-# - dist/zfs-explorer-zdx-api-release-<os>-<arch>.tar.gz
-# - dist/zfs-explorer-webui.tar.gz
+# - dist/zfs-explorer-zdx-api-<version-label>-release-<os>-<arch>.tar.gz
+# - dist/zfs-explorer-webui-<version-label>.tar.gz
 ./build/package.sh --profile release
+
+# Optional: pin an explicit label instead of auto git describe/sha.
+# ./build/package.sh --profile release --version-label v1.0.0-rc1
 ```
 
 ### 2. Copy the backend tarball to the ZFS host
@@ -217,7 +220,7 @@ your local machine (or another box).
 # Adjust OS/arch/USER/HOST to your environment.
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_NAME="$(uname -m)"
-TARBALL="dist/zfs-explorer-zdx-api-release-${OS_NAME}-${ARCH_NAME}.tar.gz"
+TARBALL="$(ls -1 dist/zfs-explorer-zdx-api-*-release-${OS_NAME}-${ARCH_NAME}.tar.gz | sort | tail -n1)"
 scp "$TARBALL" USER@HOST:/tmp/
 ```
 
@@ -226,7 +229,9 @@ scp "$TARBALL" USER@HOST:/tmp/
 ```bash
 ssh USER@HOST
 mkdir -p ~/zfs-explorer
-tar -xzf /tmp/zfs-explorer-zdx-api-release-*.tar.gz -C ~/zfs-explorer --strip-components=1
+OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
+BACKEND_TAR="$(ls -1 /tmp/zfs-explorer-zdx-api-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
+tar -xzf "$BACKEND_TAR" -C ~/zfs-explorer --strip-components=1
 cd ~/zfs-explorer
 sudo ./run-backend.sh
 ```
@@ -689,16 +694,17 @@ Build two bundles:
 
 Output:
 
-- Backend directory: `dist/zfs-explorer-zdx-api-<profile>-<os>-<arch>/`
-- Backend tarball: `dist/zfs-explorer-zdx-api-<profile>-<os>-<arch>.tar.gz`
-- Web UI directory: `dist/zfs-explorer-webui/`
-- Web UI tarball: `dist/zfs-explorer-webui.tar.gz`
+- Backend directory: `dist/zfs-explorer-zdx-api-<version-label>-<profile>-<os>-<arch>/`
+- Backend tarball: `dist/zfs-explorer-zdx-api-<version-label>-<profile>-<os>-<arch>.tar.gz`
+- Web UI directory: `dist/zfs-explorer-webui-<version-label>/`
+- Web UI tarball: `dist/zfs-explorer-webui-<version-label>.tar.gz`
 
 Run the packaged web UI bundle with:
 
 ```bash
-tar -xzf dist/zfs-explorer-webui.tar.gz -C /tmp
-cd /tmp/zfs-explorer-webui
+WEBUI_TAR="$(ls -1 dist/zfs-explorer-webui-*.tar.gz | sort | tail -n1)"
+tar -xzf "$WEBUI_TAR" -C /tmp
+cd /tmp/"$(basename "$WEBUI_TAR" .tar.gz)"
 ./run-webui.sh 8080
 ```
 
@@ -720,13 +726,15 @@ Typical remote-host flow:
 # on build machine
 ./build/package.sh --profile release
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-rsync -av dist/zfs-explorer-zdx-api-release-${OS_NAME}-$(uname -m).tar.gz USER@HOST:/tmp/
+BACKEND_TAR="$(ls -1 dist/zfs-explorer-zdx-api-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
+rsync -av "$BACKEND_TAR" USER@HOST:/tmp/
 
 # on target host
 cd /opt
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-sudo tar -xzf /tmp/zfs-explorer-zdx-api-release-${OS_NAME}-$(uname -m).tar.gz
-cd zfs-explorer-zdx-api-release-${OS_NAME}-$(uname -m)
+BACKEND_TAR="$(ls -1 /tmp/zfs-explorer-zdx-api-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
+sudo tar -xzf "$BACKEND_TAR"
+cd "$(basename "$BACKEND_TAR" .tar.gz)"
 sudo ./run-backend.sh
 ```
 
@@ -756,7 +764,7 @@ platforms in one run:
 Outputs are written under `dist/releases/<utc-timestamp>/` and include:
 
 - distro-labeled backend tarballs under `linux/` and `freebsd/`
-- shared `zfs-explorer-webui.tar.gz`
+- shared `zfs-explorer-webui-<version-label>.tar.gz`
 - `SHA256SUMS.txt` for generated tarballs
 
 Notes:
