@@ -25,6 +25,9 @@ This document tracks practical constraints that still apply to
   - `/api/perf/txg`
   - `/api/pools/{pool}/dedup`
   - `/api/pools/{pool}/space-amplification`
+- On FreeBSD, ARC/TXG runtime telemetry currently remains Linux-only in the
+  backend implementation (the UI now shows a platform note instead of
+  surfacing those errors as primary runtime failures).
 - Offline mode depends on explicit pool names/search paths and exported media
   visibility on disk.
 - Offline open can fail when pools are simultaneously active/imported on the

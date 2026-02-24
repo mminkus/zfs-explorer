@@ -24,6 +24,12 @@ const RUNTIME_POLL_SECONDS = 5
 const RUNTIME_CHART_MAX_POINTS = 180
 const BLOCK_TREE_DEFAULT_DEPTH = 4
 const BLOCK_TREE_DEFAULT_NODES = 2000
+const THEME_STORAGE_KEY = 'zdx-ui-theme'
+const SCREENSHOT_MODE_STORAGE_KEY = 'zdx-ui-screenshot-mode'
+
+type UiTheme = 'dark' | 'light'
+
+let screenshotRedactionEnabled = false
 
 type ApiErrorPayload = {
   error?: string
@@ -92,7 +98,92 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     const message = await parseApiErrorMessage(response)
     throw new Error(`HTTP ${response.status}: ${message ?? response.statusText}`)
   }
-  return (await response.json()) as T
+  const parsed = (await response.json()) as unknown
+  if (screenshotRedactionEnabled) {
+    redactJsonValue(parsed)
+  }
+  return parsed as T
+}
+
+function readStoredTheme(): UiTheme {
+  if (typeof window === 'undefined') {
+    return 'dark'
+  }
+  const stored = window.localStorage.getItem(THEME_STORAGE_KEY)
+  return stored === 'light' ? 'light' : 'dark'
+}
+
+function readStoredScreenshotMode(): boolean {
+  if (typeof window === 'undefined') {
+    return false
+  }
+  return window.localStorage.getItem(SCREENSHOT_MODE_STORAGE_KEY) === '1'
+}
+
+function setScreenshotRedactionEnabled(enabled: boolean): void {
+  screenshotRedactionEnabled = enabled
+}
+
+function fnv1a64(input: string | number): bigint {
+  const text = String(input)
+  let hash = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= BigInt(text.charCodeAt(i))
+    hash = (hash * prime) & 0xffffffffffffffffn
+  }
+  return hash
+}
+
+function redactStringForKey(key: string, value: string): string {
+  const keyLc = key.toLowerCase()
+  if (keyLc === 'hostname') {
+    return `host-${(Number(fnv1a64(value) & 0xffffffffn) >>> 0).toString(16).padStart(8, '0')}`
+  }
+  if (keyLc === 'path' || keyLc === 'devid' || keyLc === 'phys_path') {
+    return `redacted-${(Number(fnv1a64(value) & 0xffffffffn) >>> 0).toString(16).padStart(8, '0')}`
+  }
+  if (keyLc.includes('guid')) {
+    return `guid-${(fnv1a64(value) & 0xffffffffffffffffn).toString(16).padStart(16, '0')}`
+  }
+  return value
+}
+
+function redactNumberForKey(key: string, value: number): number {
+  const keyLc = key.toLowerCase()
+  if (keyLc === 'hostid') {
+    return Number(fnv1a64(value) & 0xffffffffn) >>> 0
+  }
+  if (keyLc.includes('guid')) {
+    return Number(fnv1a64(value) & 0x1fffffffffffffn)
+  }
+  return value
+}
+
+function redactJsonValue(value: unknown, keyHint?: string): void {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      redactJsonValue(item, keyHint)
+    }
+    return
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof child === 'string') {
+        ;(value as Record<string, unknown>)[key] = redactStringForKey(key, child)
+      } else if (typeof child === 'number') {
+        ;(value as Record<string, unknown>)[key] = redactNumberForKey(key, child)
+      } else {
+        redactJsonValue(child, key)
+      }
+    }
+    return
+  }
+
+  if (keyHint && typeof value === 'string') {
+    redactStringForKey(keyHint, value)
+  }
 }
 
 type DmuType = {
@@ -252,6 +343,7 @@ type ApiVersionResponse = {
     name: string
     version: string
     git_sha: string
+    build_version?: string
   }
   openzfs: {
     commit: string
@@ -1190,8 +1282,12 @@ function App() {
   const [debugCopied, setDebugCopied] = useState(false)
   const [debugCopyError, setDebugCopyError] = useState<string | null>(null)
   const [apiVersionInfo, setApiVersionInfo] = useState<ApiVersionResponse | null>(null)
+  const [uiTheme, setUiTheme] = useState<UiTheme>(() => readStoredTheme())
   const [modeSwitching, setModeSwitching] = useState(false)
   const [modeError, setModeError] = useState<string | null>(null)
+  const [screenshotMode, setScreenshotMode] = useState<boolean>(() => readStoredScreenshotMode())
+  const [showReadOnlyBanner, setShowReadOnlyBanner] = useState(true)
+  const [showScreenshotBanner, setShowScreenshotBanner] = useState(true)
   const [poolSummary, setPoolSummary] = useState<PoolSummaryResponse | null>(null)
   const [poolSummaryLoading, setPoolSummaryLoading] = useState(false)
   const [poolSummaryError, setPoolSummaryError] = useState<string | null>(null)
@@ -1290,6 +1386,7 @@ function App() {
   const fsObjectZapRequestKey = useRef<string | null>(null)
   const fsFilterRef = useRef<HTMLInputElement | null>(null)
   const fsAutoMetaKey = useRef<string | null>(null)
+  const selectedPoolRef = useRef<string | null>(selectedPool)
   const snapshotRequestKey = useRef<string | null>(null)
   const mosListRequestKey = useRef<string | null>(null)
   const objsetListRequestKey = useRef<string | null>(null)
@@ -1330,6 +1427,10 @@ function App() {
     activeObjects.forEach(obj => map.set(obj.id, obj.type_name))
     return map
   }, [activeObjects])
+
+  useEffect(() => {
+    selectedPoolRef.current = selectedPool
+  }, [selectedPool])
 
   const datasetIndex = useMemo(() => {
     const nodeById = new Map<number, DatasetTreeNode>()
@@ -1992,8 +2093,17 @@ function App() {
   const scopedError = isMosScope ? mosError : objsetError
   const poolMode = apiVersionInfo?.pool_open?.mode === 'offline' ? 'offline' : 'live'
   const poolModeLabel = poolMode === 'offline' ? 'Offline' : 'Live'
+  const runtimeOs = apiVersionInfo?.runtime?.os?.toLowerCase() ?? null
+  const runtimeArcSupported = runtimeOs !== 'freebsd'
+  const runtimeTxgSupported = runtimeOs !== 'freebsd'
   const offlinePoolNames = apiVersionInfo?.pool_open?.offline_pools ?? []
   const modeToggleDisabled = modeSwitching || !apiVersionInfo
+  const backendBuildLabel =
+    apiVersionInfo?.backend.build_version ??
+    apiVersionInfo?.backend.git_sha ??
+    apiVersionInfo?.backend.version ??
+    'unknown'
+  const openzfsCommitLabel = apiVersionInfo?.openzfs.commit ?? 'unknown'
   const runtimeWindowPoints = Math.max(
     1,
     Math.floor((runtimeWindowMinutes * 60) / RUNTIME_POLL_SECONDS)
@@ -2047,6 +2157,16 @@ function App() {
   }, [])
 
   useEffect(() => {
+    document.documentElement.setAttribute('data-theme', uiTheme)
+    window.localStorage.setItem(THEME_STORAGE_KEY, uiTheme)
+  }, [uiTheme])
+
+  useEffect(() => {
+    window.localStorage.setItem(SCREENSHOT_MODE_STORAGE_KEY, screenshotMode ? '1' : '0')
+    setScreenshotRedactionEnabled(screenshotMode)
+  }, [screenshotMode])
+
+  useEffect(() => {
     fetchJson<string[]>(`${API_BASE}/api/pools`)
       .then(data => {
         setPools(data)
@@ -2068,9 +2188,12 @@ function App() {
 
   useEffect(() => {
     const runtimeActive = centerView === 'performance' && performanceTab === 'runtime'
-    if (!runtimeActive || poolMode !== 'live') {
+    if (!runtimeActive || poolMode !== 'live' || !runtimeArcSupported) {
       setPerfArcLoading(false)
       setPerfArcError(null)
+      if (!runtimeArcSupported) {
+        setPerfArc(null)
+      }
       return
     }
 
@@ -2122,7 +2245,7 @@ function App() {
         window.clearInterval(intervalId)
       }
     }
-  }, [centerView, performanceTab, poolMode])
+  }, [centerView, performanceTab, poolMode, runtimeArcSupported])
 
   useEffect(() => {
     const runtimeActive = centerView === 'performance' && performanceTab === 'runtime'
@@ -2184,9 +2307,12 @@ function App() {
 
   useEffect(() => {
     const runtimeActive = centerView === 'performance' && performanceTab === 'runtime'
-    if (!runtimeActive || poolMode !== 'live') {
+    if (!runtimeActive || poolMode !== 'live' || !runtimeTxgSupported) {
       setPerfTxgLoading(false)
       setPerfTxgError(null)
+      if (!runtimeTxgSupported) {
+        setPerfTxg(null)
+      }
       return
     }
 
@@ -2198,7 +2324,10 @@ function App() {
         setPerfTxgLoading(true)
       }
       try {
-        const data = await fetchJson<PerfTxgResponse>(`${API_BASE}/api/perf/txg`)
+        const txgUrl = selectedPool
+          ? `${API_BASE}/api/perf/txg?pool=${encodeURIComponent(selectedPool)}`
+          : `${API_BASE}/api/perf/txg`
+        const data = await fetchJson<PerfTxgResponse>(txgUrl)
         if (cancelled) return
         setPerfTxg(data)
         setPerfTxgError(null)
@@ -2232,7 +2361,7 @@ function App() {
         window.clearInterval(intervalId)
       }
     }
-  }, [centerView, performanceTab, poolMode])
+  }, [centerView, performanceTab, poolMode, selectedPool, runtimeTxgSupported])
 
   useEffect(() => {
     if (initialHistoryApplied.current) return
@@ -2370,7 +2499,7 @@ function App() {
     if (pending.length === 0) return
 
     const batch = pending.slice(0, 24)
-    let cancelled = false
+    const poolAtStart = selectedPool
 
     setSnapshotCountLoadingByDir(prev => {
       const next = { ...prev }
@@ -2384,7 +2513,7 @@ function App() {
     const workerCount = Math.min(4, queue.length)
 
     const worker = async () => {
-      while (!cancelled && queue.length > 0) {
+      while (queue.length > 0) {
         const dirObj = queue.shift()
         if (dirObj === undefined) break
 
@@ -2394,16 +2523,22 @@ function App() {
               selectedPool
             )}/dataset/${dirObj}/snapshot-count`
           )
-          if (cancelled) return
+          if (selectedPoolRef.current !== poolAtStart) {
+            continue
+          }
           setSnapshotCountsByDir(prev => ({
             ...prev,
             [dirObj]: Number.isFinite(data.count) ? data.count : null,
           }))
         } catch {
-          if (cancelled) return
+          if (selectedPoolRef.current !== poolAtStart) {
+            continue
+          }
           setSnapshotCountsByDir(prev => ({ ...prev, [dirObj]: null }))
         } finally {
-          if (cancelled) return
+          if (selectedPoolRef.current !== poolAtStart) {
+            continue
+          }
           setSnapshotCountLoadingByDir(prev => {
             const next = { ...prev }
             delete next[dirObj]
@@ -2414,10 +2549,6 @@ function App() {
     }
 
     void Promise.all(Array.from({ length: workerCount }, () => worker()))
-
-    return () => {
-      cancelled = true
-    }
   }, [
     datasetTree,
     selectedPool,
@@ -4133,6 +4264,11 @@ function App() {
     } finally {
       setModeSwitching(false)
     }
+  }
+
+  const switchScreenshotMode = async (enabled: boolean) => {
+    if (enabled === screenshotMode) return
+    setScreenshotMode(enabled)
   }
 
   useEffect(() => {
@@ -6563,6 +6699,12 @@ function App() {
             <p className="muted">
               Currently observed runtime telemetry is sampled from the live system.
             </p>
+            {!runtimeDisabled && runtimeOs === 'freebsd' && (
+              <div className="hint">
+                FreeBSD note: ARC and TXG runtime telemetry are currently Linux-only in zfs-explorer.
+                Per-vdev runtime counters are still available.
+              </div>
+            )}
             <div className="runtime-window-controls">
               <span>Window</span>
               {[1, 5, 15].map(windowMinutes => (
@@ -6584,7 +6726,7 @@ function App() {
             ) : (
               <>
                 {perfArcLoading && !perfArc && <p className="muted">Loading ARC telemetry…</p>}
-                {perfArcError && (
+                {runtimeArcSupported && perfArcError && (
                   <div className="error">
                     <strong>ARC telemetry:</strong> {perfArcError}
                   </div>
@@ -6594,7 +6736,7 @@ function App() {
                     <strong>Vdev telemetry:</strong> {perfVdevError}
                   </div>
                 )}
-                {perfTxgError && (
+                {runtimeTxgSupported && perfTxgError && (
                   <div className="error">
                     <strong>TXG telemetry:</strong> {perfTxgError}
                   </div>
@@ -6755,7 +6897,7 @@ function App() {
                   !perfArc &&
                   !perfVdevIostat &&
                   !perfTxg && (
-                  <div className="hint">No ARC telemetry sample yet.</div>
+                  <div className="hint">No runtime telemetry sample yet.</div>
                 )}
               </>
             )}
@@ -7702,6 +7844,8 @@ function App() {
         frontend: {
           api_base: API_BASE,
           user_agent: navigator.userAgent,
+          theme: uiTheme,
+          screenshot_mode: screenshotMode,
           left_pane_tab: leftPaneTab,
           format_mode: formatMode,
           selected_pool: selectedPool,
@@ -7887,9 +8031,51 @@ function App() {
       <header className="topbar">
         <div>
           <strong>ZFS Explorer</strong>
-          <p className="subtitle">Milestone 7: Advanced Forensics Views</p>
+          <p className="subtitle">Release Candidate 1</p>
         </div>
         <div className="status">
+          <div className="status-item">
+            <span>Screenshot</span>
+            <div className="format-toggle">
+              <button
+                type="button"
+                className={!screenshotMode ? 'toggle active' : 'toggle'}
+                onClick={() => switchScreenshotMode(false)}
+                title="Disable local screenshot redaction"
+              >
+                Off
+              </button>
+              <button
+                type="button"
+                className={screenshotMode ? 'toggle active' : 'toggle'}
+                onClick={() => switchScreenshotMode(true)}
+                title="Enable local screenshot redaction"
+              >
+                On
+              </button>
+            </div>
+          </div>
+          <div className="status-item">
+            <span>Theme</span>
+            <div className="format-toggle">
+              <button
+                type="button"
+                className={uiTheme === 'dark' ? 'toggle active' : 'toggle'}
+                onClick={() => setUiTheme('dark')}
+                title="Use dark theme"
+              >
+                Dark
+              </button>
+              <button
+                type="button"
+                className={uiTheme === 'light' ? 'toggle active' : 'toggle'}
+                onClick={() => setUiTheme('light')}
+                title="Use light theme"
+              >
+                Light
+              </button>
+            </div>
+          </div>
           <div className="status-item">
             <span>Format</span>
             <div className="format-toggle">
@@ -7906,10 +8092,6 @@ function App() {
                 HEX
               </button>
             </div>
-          </div>
-          <div className="status-item">
-            <span>Backend</span>
-            <code>localhost:9000</code>
           </div>
           <div className="status-item">
             <span>Mode</span>
@@ -7935,6 +8117,10 @@ function App() {
             </div>
           </div>
           <div className="status-item">
+            <span>Backend</span>
+            <code>localhost:9000</code>
+          </div>
+          <div className="status-item">
             <span>Pool</span>
             {selectedPool ? (
               <button
@@ -7952,15 +8138,46 @@ function App() {
         </div>
       </header>
 
-      <div className="safety-banner" role="status" aria-live="polite">
-        <strong>Read-only mode:</strong>{' '}
-        {poolMode === 'offline'
-          ? 'offline/exported pool analysis (experimental).'
-          : 'live imported pools only.'}
-        {poolMode === 'offline' && offlinePoolNames.length > 0 && (
-          <> Configured pools: {offlinePoolNames.join(', ')}.</>
-        )}
-      </div>
+      {showReadOnlyBanner && (
+        <div className="safety-banner" role="status" aria-live="polite">
+          <span className="safety-banner-text">
+            <strong>Read-only mode:</strong>{' '}
+            {poolMode === 'offline'
+              ? 'offline/exported pool analysis (experimental).'
+              : 'live imported pools only.'}
+            {poolMode === 'offline' && offlinePoolNames.length > 0 && (
+              <> Configured pools: {offlinePoolNames.join(', ')}.</>
+            )}
+          </span>
+          <button
+            type="button"
+            className="banner-dismiss"
+            onClick={() => setShowReadOnlyBanner(false)}
+            title="Dismiss read-only banner"
+            aria-label="Dismiss read-only banner"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {screenshotMode && showScreenshotBanner && (
+        <div className="safety-banner screenshot-banner" role="status" aria-live="polite">
+          <span className="safety-banner-text">
+            <strong>Screenshot mode:</strong> hostname, GUID, hostid, and device path fields are
+            anonymized in UI-rendered JSON and copied debug payloads.
+          </span>
+          <button
+            type="button"
+            className="banner-dismiss"
+            onClick={() => setShowScreenshotBanner(false)}
+            title="Dismiss screenshot banner"
+            aria-label="Dismiss screenshot banner"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {modeError && (
         <div className="safety-banner error-banner" role="alert">
@@ -8998,13 +9215,14 @@ function App() {
                       {!snapshotLineageLoading && snapshotLineage && (
                         <div className="fs-table snapshot-table">
                           <div className="fs-row fs-header snapshot-header">
-                            <div>Name</div>
-                            <div>Snapshot Obj</div>
-                            <div>Creation TXG</div>
-                            <div>Creation Time</div>
-                            <div className="align-right">Referenced</div>
-                            <div className="align-right">Unique</div>
-                            <div>Actions</div>
+                            <div className="snapshot-header-name">Name</div>
+                            <div className="snapshot-header-details">Snapshot Details</div>
+                            <div className="snapshot-header-actions">Actions</div>
+                            <div className="snapshot-header-obj">Obj</div>
+                            <div className="snapshot-header-txg">Creation TXG</div>
+                            <div className="snapshot-header-time">Creation Time</div>
+                            <div className="snapshot-header-ref">Referenced</div>
+                            <div className="snapshot-header-uniq">Unique</div>
                           </div>
                           {snapshotLineage.entries.map(entry => {
                             const rowLike: SnapshotRecord = {
@@ -9018,19 +9236,23 @@ function App() {
                             }
                             return (
                               <div key={`lineage-${entry.dsobj}`} className="fs-row snapshot-row">
-                                <div className="fs-name">
+                                <div className="fs-name snapshot-row-name">
                                   {snapshotDatasetLabel(entry.dsobj)}
                                   {entry.is_start && <span className="muted"> (anchor)</span>}
                                 </div>
-                                <div className="fs-obj">#{entry.dsobj}</div>
-                                <div>{entry.creation_txg}</div>
-                                <div>
+                                <div className="snapshot-row-obj fs-obj">#{entry.dsobj}</div>
+                                <div className="snapshot-row-txg">{entry.creation_txg}</div>
+                                <div className="snapshot-row-time">
                                   {entry.creation_time
                                     ? new Date(entry.creation_time * 1000).toLocaleString()
                                     : '—'}
                                 </div>
-                                <div className="fs-size">{formatBytes(entry.referenced_bytes)}</div>
-                                <div className="fs-size">{formatBytes(entry.unique_bytes)}</div>
+                                <div className="snapshot-row-ref fs-size">
+                                  {formatBytes(entry.referenced_bytes)}
+                                </div>
+                                <div className="snapshot-row-uniq fs-size">
+                                  {formatBytes(entry.unique_bytes)}
+                                </div>
                                 <div className="snapshot-actions">
                                   <button
                                     type="button"
@@ -9050,7 +9272,7 @@ function App() {
                                     }}
                                     disabled={snapshotOpeningDsobj === entry.dsobj}
                                   >
-                                    {snapshotOpeningDsobj === entry.dsobj ? 'Opening…' : 'Open in FS'}
+                                    {snapshotOpeningDsobj === entry.dsobj ? 'Opening…' : 'Open FS'}
                                   </button>
                                   <button
                                     type="button"
@@ -9183,28 +9405,29 @@ function App() {
                     <div className="fs-center-list">
                       <div className="fs-table snapshot-table">
                         <div className="fs-row fs-header snapshot-header">
-                          <div>Name</div>
-                          <div>Snapshot Obj</div>
-                          <div>Creation TXG</div>
-                          <div>Creation Time</div>
-                          <div className="align-right">Referenced</div>
-                          <div className="align-right">Unique</div>
-                          <div>Actions</div>
+                          <div className="snapshot-header-name">Name</div>
+                          <div className="snapshot-header-details">Snapshot Details</div>
+                          <div className="snapshot-header-actions">Actions</div>
+                          <div className="snapshot-header-obj">Obj</div>
+                          <div className="snapshot-header-txg">Creation TXG</div>
+                          <div className="snapshot-header-time">Creation Time</div>
+                          <div className="snapshot-header-ref">Referenced</div>
+                          <div className="snapshot-header-uniq">Unique</div>
                         </div>
                         {sortedSnapshotRows.map(row => (
                           <div key={`${row.name}-${row.dsobj}`} className="fs-row snapshot-row">
-                            <div className="fs-name">{row.name}</div>
-                            <div className="fs-obj">#{row.dsobj}</div>
-                            <div>{row.creation_txg ?? '—'}</div>
-                            <div>
+                            <div className="fs-name snapshot-row-name">{row.name}</div>
+                            <div className="snapshot-row-obj fs-obj">#{row.dsobj}</div>
+                            <div className="snapshot-row-txg">{row.creation_txg ?? '—'}</div>
+                            <div className="snapshot-row-time">
                               {row.creation_time
                                 ? new Date(row.creation_time * 1000).toLocaleString()
                                 : '—'}
                             </div>
-                            <div className="fs-size">
+                            <div className="snapshot-row-ref fs-size">
                               {row.referenced_bytes === null ? '—' : formatBytes(row.referenced_bytes)}
                             </div>
-                            <div className="fs-size">
+                            <div className="snapshot-row-uniq fs-size">
                               {row.unique_bytes === null ? '—' : formatBytes(row.unique_bytes)}
                             </div>
                             <div className="snapshot-actions">
@@ -9223,7 +9446,7 @@ function App() {
                                 }}
                                 disabled={snapshotOpeningDsobj === row.dsobj}
                               >
-                                {snapshotOpeningDsobj === row.dsobj ? 'Opening…' : 'Open in FS'}
+                                {snapshotOpeningDsobj === row.dsobj ? 'Opening…' : 'Open FS'}
                               </button>
                               <button
                                 type="button"
@@ -10895,7 +11118,7 @@ function App() {
       )}
 
       <footer>
-        <p>v0.01, OpenZFS commit: 21bbe7cb6</p>
+        <p>{`v${backendBuildLabel}, OpenZFS commit: ${openzfsCommitLabel}`}</p>
       </footer>
     </div>
   )

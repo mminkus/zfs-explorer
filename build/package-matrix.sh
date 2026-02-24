@@ -492,6 +492,25 @@ fi
   find . -type f -name "*.tar.gz" -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt || true
 )
 
+MATRIX_SUMMARY_FILE="$OUTPUT_ROOT/MATRIX_SUMMARY.txt"
+{
+  echo "timestamp_utc=$(timestamp)"
+  echo "output_root=$OUTPUT_ROOT"
+  echo "profile=$PROFILE"
+  echo "version_label=$VERSION_LABEL"
+  echo "local_git_sha=${LOCAL_GIT_SHA:-unknown}"
+  echo "linux_targets=$(join_for_summary "${LINUX_TARGETS[@]}")"
+  echo "freebsd_host=${FREEBSD_HOST:--}"
+  echo "passed=$(join_for_summary "${PASSED[@]}")"
+  echo "failed=$(join_for_summary "${FAILED[@]}")"
+} >"$MATRIX_SUMMARY_FILE"
+
+LOG_ARCHIVE_NAME="matrix-logs-$(basename "$OUTPUT_ROOT").tar.gz"
+(
+  cd "$OUTPUT_ROOT"
+  tar -czf "$LOG_ARCHIVE_NAME" logs MATRIX_SUMMARY.txt
+)
+
 if [[ "$KEEP_INTERMEDIATE" -eq 0 ]]; then
   rm -rf "$ROOT_DIR/dist/package-matrix"
 fi
@@ -501,6 +520,7 @@ echo "Package matrix summary:"
 echo "  Output: $OUTPUT_ROOT"
 echo "  Passed: $(join_for_summary "${PASSED[@]}")"
 echo "  Failed: $(join_for_summary "${FAILED[@]}")"
+echo "  Log archive: $OUTPUT_ROOT/$LOG_ARCHIVE_NAME"
 
 if [[ "${#FAILED[@]}" -gt 0 ]]; then
   exit 1

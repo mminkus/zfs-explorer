@@ -48,7 +48,7 @@ const REPO_URL: &str = "https://github.com/mminkus/zfs-explorer";
 const ZFS_SPA_VERSION: u64 = 5000;
 const ZFS_ZPL_VERSION: u64 = 5;
 const ARCSTATS_PATH: &str = "/proc/spl/kstat/zfs/arcstats";
-const TXGS_PATH: &str = "/proc/spl/kstat/zfs/txgs";
+const TXGS_LEGACY_PATH: &str = "/proc/spl/kstat/zfs/txgs";
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
 
@@ -1011,6 +1011,33 @@ pub struct PerfVdevIostatQuery {
     pub pool: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PerfTxgQuery {
+    pub pool: Option<String>,
+}
+
+fn txgs_path_for_pool(pool: &str) -> String {
+    format!("/proc/spl/kstat/zfs/{}/txgs", pool)
+}
+
+fn map_kstat_read_error(path: &str, err: &std::io::Error) -> ApiError {
+    let (status, message) = match err.kind() {
+        std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_IMPLEMENTED,
+            format!("txg stats file not found: {}", path),
+        ),
+        std::io::ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            format!("permission denied reading {}", path),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed reading {}: {}", path, err),
+        ),
+    };
+    api_error(status, message)
+}
+
 /// GET /api/perf/vdev_iostat?pool= - per-vdev iostat sample (live mode only)
 pub async fn perf_vdev_iostat(
     State(state): State<AppState>,
@@ -1087,8 +1114,11 @@ pub async fn perf_vdev_iostat(
     })))
 }
 
-/// GET /api/perf/txg - txg runtime indicators (live mode only)
-pub async fn perf_txg(State(state): State<AppState>) -> ApiResult {
+/// GET /api/perf/txg?pool= - txg runtime indicators (live mode only)
+pub async fn perf_txg(
+    State(state): State<AppState>,
+    Query(params): Query<PerfTxgQuery>,
+) -> ApiResult {
     let config = pool_open_config(&state);
     if matches!(config.mode, crate::PoolOpenMode::Offline) {
         return Err(api_error(
@@ -1097,29 +1127,54 @@ pub async fn perf_txg(State(state): State<AppState>) -> ApiResult {
         ));
     }
 
-    let contents = std::fs::read_to_string(TXGS_PATH).map_err(|err| {
-        let (status, message) = match err.kind() {
-            std::io::ErrorKind::NotFound => (
-                StatusCode::NOT_IMPLEMENTED,
-                format!("txg stats file not found: {}", TXGS_PATH),
-            ),
-            std::io::ErrorKind::PermissionDenied => (
-                StatusCode::FORBIDDEN,
-                format!("permission denied reading {}", TXGS_PATH),
-            ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed reading {}: {}", TXGS_PATH, err),
-            ),
-        };
-        api_error(status, message)
-    })?;
+    let requested_pool = params
+        .pool
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut attempted_sources: Vec<String> = Vec::new();
+    let (source_path, contents) = if let Some(pool) = requested_pool {
+        let pool_source = txgs_path_for_pool(pool);
+        attempted_sources.push(pool_source.clone());
+        match std::fs::read_to_string(&pool_source) {
+            Ok(contents) => (pool_source, contents),
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(map_kstat_read_error(&pool_source, &err));
+                }
+
+                attempted_sources.push(TXGS_LEGACY_PATH.to_string());
+                match std::fs::read_to_string(TXGS_LEGACY_PATH) {
+                    Ok(contents) => (TXGS_LEGACY_PATH.to_string(), contents),
+                    Err(fallback_err) => {
+                        if fallback_err.kind() == std::io::ErrorKind::NotFound {
+                            return Err(api_error(
+                                StatusCode::NOT_IMPLEMENTED,
+                                format!(
+                                    "txg stats file not found (tried: {})",
+                                    attempted_sources.join(", ")
+                                ),
+                            ));
+                        }
+                        return Err(map_kstat_read_error(TXGS_LEGACY_PATH, &fallback_err));
+                    }
+                }
+            }
+        }
+    } else {
+        attempted_sources.push(TXGS_LEGACY_PATH.to_string());
+        match std::fs::read_to_string(TXGS_LEGACY_PATH) {
+            Ok(contents) => (TXGS_LEGACY_PATH.to_string(), contents),
+            Err(err) => return Err(map_kstat_read_error(TXGS_LEGACY_PATH, &err)),
+        }
+    };
 
     let (columns, rows) = parse_txgs_rows(&contents);
     if rows.is_empty() {
         return Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("no txg rows parsed from {}", TXGS_PATH),
+            format!("no txg rows parsed from {}", source_path),
         ));
     }
 
@@ -1136,7 +1191,8 @@ pub async fn perf_txg(State(state): State<AppState>) -> ApiResult {
         .unwrap_or(0);
 
     Ok(Json(json!({
-        "source": TXGS_PATH,
+        "source": source_path,
+        "requested_pool": requested_pool,
         "sampled_at_unix_sec": sampled_at_unix_sec,
         "columns": columns,
         "count": rows.len(),

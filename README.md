@@ -766,6 +766,8 @@ Outputs are written under `dist/releases/<utc-timestamp>/` and include:
 - distro-labeled backend tarballs under `linux/` and `freebsd/`
 - shared `zfs-explorer-webui-<version-label>.tar.gz`
 - `SHA256SUMS.txt` for generated tarballs
+- `MATRIX_SUMMARY.txt` (run metadata + pass/fail summary)
+- `matrix-logs-<utc-timestamp>.tar.gz` (archived logs for support triage)
 
 Notes:
 
@@ -774,6 +776,27 @@ Notes:
   SSH/scp access, and the repo checked out at the same path
   (or pass `--freebsd-repo`).
 - Linux matrix builds the UI once locally unless `--skip-ui-build` is used.
+- Default version label is derived from git (`describe --tags --dirty --always`);
+  override with `--version-label <label>` for release candidates.
+
+### 1.0 Supported Platform Policy
+
+For the 1.0 announcement, we publish and smoke-test release tarballs for:
+
+- Debian 13
+- Ubuntu 24.04
+- FreeBSD 15
+- AlmaLinux 10 (EL10 family)
+
+Additional matrix targets (Debian 12, Ubuntu 22.04/25.04, EL9) are validated
+regularly but are considered compatibility coverage, not primary release gates.
+
+### Release Playbook
+
+Maintainer release steps (build, verify, publish, and log archival) are
+documented in:
+
+- `docs/RELEASE_PLAYBOOK.md`
 
 Note: full static backend linking is not the primary target right now.
 See `docs/PACKAGING_STATIC_FEASIBILITY.md` for the current packaging decision.
@@ -795,6 +818,16 @@ See `docs/PACKAGING_STATIC_FEASIBILITY.md` for the current packaging decision.
   `GET/PUT /api/mode`.
 
 This project is intended for inspection and debugging, not mutation.
+
+## Screenshot Mode
+
+For demos/recordings, a UI screenshot mode can anonymize selected sensitive
+JSON fields (hostname, GUIDs, hostid, and device path identifiers) while
+preserving object relationships.
+
+See:
+
+- `docs/SCREENSHOT_MODE.md`
 
 ## Known Limitations
 

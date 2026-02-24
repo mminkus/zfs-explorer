@@ -50,7 +50,7 @@ These return `400` in offline mode.
 |---|---|---|
 | `GET` | `/api/perf/arc` | ARC/L2ARC runtime summary |
 | `GET` | `/api/perf/vdev_iostat?pool={pool}` | Per-vdev iostat sample from `zpool iostat -vH -p` |
-| `GET` | `/api/perf/txg` | TXG runtime indicators |
+| `GET` | `/api/perf/txg?pool={pool}` | TXG runtime indicators (pool-scoped on modern Linux kstat layouts; falls back to legacy global path) |
 | `GET` | `/api/pools/{pool}/dedup` | DDT summary from `zpool status -D -p` |
 | `GET` | `/api/pools/{pool}/space-amplification` | Logical-vs-physical usage hints |
 
