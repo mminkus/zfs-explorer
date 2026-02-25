@@ -258,7 +258,7 @@ build_linux_target() {
   } >>"$log_file" 2>&1
 
   local backend_tar
-  backend_tar="$(find "$raw_dir" -maxdepth 1 -type f -name "zfs-explorer-zdx-api-*-${PROFILE}-*.tar.gz" | head -n1 || true)"
+  backend_tar="$(find "$raw_dir" -maxdepth 1 -type f -name "zfs-explorer-*-${PROFILE}-*.tar.gz" | head -n1 || true)"
   if [[ -z "$backend_tar" ]]; then
     echo "error: backend tarball not found for $target (see $log_file)" >&2
     return 1
@@ -316,7 +316,7 @@ run_freebsd_build() {
   fi
 
   local remote_backend_tar
-  remote_backend_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && ls -1 dist/zfs-explorer-zdx-api-*-${PROFILE}-*.tar.gz 2>/dev/null | head -n1" || true)"
+  remote_backend_tar="$(ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && ls -1 dist/zfs-explorer-*-${PROFILE}-*.tar.gz 2>/dev/null | head -n1" || true)"
   if [[ -z "$remote_backend_tar" ]]; then
     ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree remove --force '$remote_worktree' >/dev/null 2>&1 || true" >>"$log_file" 2>&1 || true
     echo "error: no FreeBSD backend tarball found (see $log_file)" >&2

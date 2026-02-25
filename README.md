@@ -40,7 +40,7 @@ You can think of this project as:
 For most users, the recommended path is:
 
 1. Download release artifacts from GitHub Releases:
-   - `zfs-explorer-zdx-api-<version-label>-<profile>-<os>-<arch>.tar.gz` (backend)
+   - `zfs-explorer-<version-label>-<profile>-<os>-<arch>.tar.gz` (backend)
    - `zfs-explorer-webui-<version-label>.tar.gz` (optional static UI bundle)
 2. Run the backend on a host with ZFS access.
 3. Use either:
@@ -54,8 +54,8 @@ Latest releases:
 Example backend startup from a release tarball:
 
 ```bash
-tar -xzf zfs-explorer-zdx-api-<version-label>-release-<os>-<arch>.tar.gz
-cd zfs-explorer-zdx-api-<version-label>-release-<os>-<arch>
+tar -xzf zfs-explorer-<version-label>-release-<os>-<arch>.tar.gz
+cd zfs-explorer-<version-label>-release-<os>-<arch>
 sudo ./run-backend.sh
 ```
 
@@ -206,7 +206,7 @@ your local machine (or another box).
 
 ```bash
 # Produces:
-# - dist/zfs-explorer-zdx-api-<version-label>-release-<os>-<arch>.tar.gz
+# - dist/zfs-explorer-<version-label>-release-<os>-<arch>.tar.gz
 # - dist/zfs-explorer-webui-<version-label>.tar.gz
 ./build/package.sh --profile release
 
@@ -220,7 +220,7 @@ your local machine (or another box).
 # Adjust OS/arch/USER/HOST to your environment.
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH_NAME="$(uname -m)"
-TARBALL="$(ls -1 dist/zfs-explorer-zdx-api-*-release-${OS_NAME}-${ARCH_NAME}.tar.gz | sort | tail -n1)"
+TARBALL="$(ls -1 dist/zfs-explorer-*-release-${OS_NAME}-${ARCH_NAME}.tar.gz | sort | tail -n1)"
 scp "$TARBALL" USER@HOST:/tmp/
 ```
 
@@ -230,7 +230,7 @@ scp "$TARBALL" USER@HOST:/tmp/
 ssh USER@HOST
 mkdir -p ~/zfs-explorer
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-BACKEND_TAR="$(ls -1 /tmp/zfs-explorer-zdx-api-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
+BACKEND_TAR="$(ls -1 /tmp/zfs-explorer-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
 tar -xzf "$BACKEND_TAR" -C ~/zfs-explorer --strip-components=1
 cd ~/zfs-explorer
 sudo ./run-backend.sh
@@ -694,8 +694,8 @@ Build two bundles:
 
 Output:
 
-- Backend directory: `dist/zfs-explorer-zdx-api-<version-label>-<profile>-<os>-<arch>/`
-- Backend tarball: `dist/zfs-explorer-zdx-api-<version-label>-<profile>-<os>-<arch>.tar.gz`
+- Backend directory: `dist/zfs-explorer-<version-label>-<profile>-<os>-<arch>/`
+- Backend tarball: `dist/zfs-explorer-<version-label>-<profile>-<os>-<arch>.tar.gz`
 - Web UI directory: `dist/zfs-explorer-webui-<version-label>/`
 - Web UI tarball: `dist/zfs-explorer-webui-<version-label>.tar.gz`
 
@@ -726,13 +726,13 @@ Typical remote-host flow:
 # on build machine
 ./build/package.sh --profile release
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-BACKEND_TAR="$(ls -1 dist/zfs-explorer-zdx-api-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
+BACKEND_TAR="$(ls -1 dist/zfs-explorer-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
 rsync -av "$BACKEND_TAR" USER@HOST:/tmp/
 
 # on target host
 cd /opt
 OS_NAME="$(uname -s | tr '[:upper:]' '[:lower:]')"
-BACKEND_TAR="$(ls -1 /tmp/zfs-explorer-zdx-api-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
+BACKEND_TAR="$(ls -1 /tmp/zfs-explorer-*-release-${OS_NAME}-$(uname -m).tar.gz | sort | tail -n1)"
 sudo tar -xzf "$BACKEND_TAR"
 cd "$(basename "$BACKEND_TAR" .tar.gz)"
 sudo ./run-backend.sh
