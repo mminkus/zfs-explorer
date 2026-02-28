@@ -33,7 +33,8 @@ Usage: build/build.sh [options]
 Options:
   --quick                Fast local loop:
                          (cd native && $MAKE clean && $MAKE)
-                         (cd backend && cargo build)
+                         (cd backend && cargo build + cargo test)
+                         (cd native && $MAKE test-native-unit)
                          (cd ui && npm run build)
   --bootstrap-openzfs    Build/install vendored OpenZFS userland into _deps/openzfs first
   --skip-ui-install      Skip npm install (useful when node_modules is already present)
@@ -236,6 +237,20 @@ build_backend() {
   cargo build
 }
 
+test_backend() {
+  log_step "Running backend unit tests"
+  ensure_cargo
+  cd "$ROOT_DIR/backend"
+  LD_LIBRARY_PATH=../native:../_deps/openzfs/lib cargo test
+}
+
+test_native() {
+  ensure_make_tool
+  log_step "Running native unit tests"
+  cd "$ROOT_DIR/native"
+  "$MAKE_CMD" test-native-unit
+}
+
 build_ui() {
   log_step "Building UI"
   cd "$ROOT_DIR/ui"
@@ -295,6 +310,10 @@ check_openzfs_glibc_compat
 
 build_native
 build_backend
+if [[ "$QUICK_MODE" -eq 1 ]]; then
+  test_backend
+  test_native
+fi
 build_ui
 
 echo

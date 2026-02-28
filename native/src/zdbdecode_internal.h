@@ -3,6 +3,7 @@
 
 #include "../include/zdbdecode.h"
 #include "json.h"
+#include "helpers.h"
 
 #include <stdio.h>
 #include <stdlib.h>

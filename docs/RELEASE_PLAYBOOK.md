@@ -9,6 +9,9 @@ This is the maintainer checklist for building, validating, and publishing
 - Commit is pushed to origin (required for FreeBSD matrix parity checks).
 - Docker is available on the Linux build host.
 - FreeBSD builder host is reachable via passwordless SSH.
+- Pre-release test gate passed on the release commit:
+  - `./build/test-quick.sh` (backend + native unit suites, optional UI build)
+  - `sudo build/test-corpus-matrix.sh` (fixture semantics gate)
 
 ## 2) Build Release Matrix
 

@@ -94,7 +94,8 @@ zdx_result_t
 make_error(int err, const char *fmt, ...)
 {
     zdx_result_t result = {0};
-    result.err = err;
+    int normalized_err = zdx_normalize_errno(err);
+    result.err = normalized_err;
     result.json = NULL;
     result.len = 0;
 
@@ -104,9 +105,9 @@ make_error(int err, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    if (err > 0) {
+    if (normalized_err > 0) {
         char with_errno[512];
-        const char *errtxt = zdx_error_text(err);
+        const char *errtxt = zdx_error_text(normalized_err);
         (void)snprintf(with_errno, sizeof (with_errno), "%s: %s", buf,
             errtxt);
         result.errmsg = strdup(with_errno);

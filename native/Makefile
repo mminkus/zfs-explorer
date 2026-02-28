@@ -47,6 +47,7 @@ LDLIBS = -L$(ZFS_PREFIX)/lib -lzfs -lzpool -lnvpair
 # Targets
 TARGET = libzdbdecode.so
 STATIC_TARGET = libzdbdecode.a
+TEST_NATIVE_BIN = tests/test_native_unit
 
 SRCS = src/zdx_core.c \
        src/zdx_pool.c \
@@ -58,10 +59,11 @@ SRCS = src/zdx_core.c \
        src/zdx_spacemap.c \
        src/zdx_block_tree.c \
        src/zdx_block.c \
+       src/helpers.c \
        src/json.c
 OBJS = $(SRCS:.c=.o)
 
-.PHONY: all clean
+.PHONY: all clean test-native-unit
 
 all: $(TARGET) $(STATIC_TARGET)
 
@@ -74,7 +76,13 @@ $(STATIC_TARGET): $(OBJS)
 src/%.o: src/%.c include/zdbdecode.h src/json.h src/zdbdecode_internal.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNFLAGS) -o $@ -c $<
 
+$(TEST_NATIVE_BIN): tests/test_main.c src/json.c src/json.h src/helpers.c src/helpers.h
+	$(CC) $(CFLAGS) $(WARNFLAGS) -D_GNU_SOURCE -Isrc -o $@ tests/test_main.c src/json.c src/helpers.c
+
+test-native-unit: $(TEST_NATIVE_BIN)
+	./$(TEST_NATIVE_BIN)
+
 clean:
-	rm -f $(TARGET) $(STATIC_TARGET) $(OBJS)
+	rm -f $(TARGET) $(STATIC_TARGET) $(OBJS) $(TEST_NATIVE_BIN)
 
 .SUFFIXES:

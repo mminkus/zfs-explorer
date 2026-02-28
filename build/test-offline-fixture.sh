@@ -146,6 +146,23 @@ echo "$VERSION_JSON" | jq -e '.pool_open.mode == "offline"' >/dev/null \
   || { echo "error: /api/version does not report offline mode" >&2; exit 1; }
 ok "/api/version reports offline mode"
 
+TXG_ERR_FILE="$(mktemp /tmp/zdx-offline-txg.XXXXXX.json)"
+TXG_STATUS="$(
+  curl -sS -o "$TXG_ERR_FILE" -w "%{http_code}" \
+    "$BASE_URL/api/perf/txg?pool=$POOL"
+)"
+if [[ "$TXG_STATUS" != "400" ]]; then
+  echo "error: expected /api/perf/txg offline rejection (HTTP 400), got $TXG_STATUS" >&2
+  cat "$TXG_ERR_FILE" >&2
+  rm -f "$TXG_ERR_FILE"
+  exit 1
+fi
+cat "$TXG_ERR_FILE" \
+  | jq -e '.error == "runtime telemetry is unavailable in offline mode"' >/dev/null \
+  || { echo "error: /api/perf/txg offline rejection payload mismatch" >&2; cat "$TXG_ERR_FILE" >&2; rm -f "$TXG_ERR_FILE"; exit 1; }
+rm -f "$TXG_ERR_FILE"
+ok "/api/perf/txg rejects offline mode with expected envelope"
+
 POOLS_JSON="$(curl -fsS "$BASE_URL/api/pools")"
 echo "$POOLS_JSON" | jq -e --arg pool "$POOL" 'index($pool) != null' >/dev/null \
   || { echo "error: pool '$POOL' missing from /api/pools in offline mode" >&2; exit 1; }

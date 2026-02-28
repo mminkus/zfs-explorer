@@ -63,24 +63,6 @@ typedef struct zdx_spacemap_bins_ctx {
     boolean_t has_more;
 } zdx_spacemap_bins_ctx_t;
 
-static uint64_t
-zdx_u64_add_sat(uint64_t a, uint64_t b)
-{
-    if (UINT64_MAX - a < b)
-        return UINT64_MAX;
-    return a + b;
-}
-
-static uint64_t
-zdx_u64_mul_sat(uint64_t a, uint64_t b)
-{
-    if (a == 0 || b == 0)
-        return 0;
-    if (a > UINT64_MAX / b)
-        return UINT64_MAX;
-    return a * b;
-}
-
 static unsigned
 zdx_u64_log2_bucket(uint64_t value)
 {
@@ -524,8 +506,7 @@ zdx_spacemap_ranges(zdx_pool_t *pool, uint64_t objid, uint64_t cursor,
 
     if (limit == 0)
         limit = 200;
-    if (limit > 2000)
-        limit = 2000;
+    limit = zdx_u64_clamp(limit, 1, 2000);
 
     if (op_filter != ZDX_SPACEMAP_OP_ANY &&
         op_filter != ZDX_SPACEMAP_OP_ALLOC &&
@@ -787,12 +768,10 @@ zdx_spacemap_bins(zdx_pool_t *pool, uint64_t objid, uint64_t bin_size,
 
     if (bin_size == 0)
         bin_size = 1ULL << 20;
-    if (bin_size < 512)
-        bin_size = 512;
+    bin_size = zdx_u64_clamp(bin_size, 512, UINT64_MAX);
     if (limit == 0)
         limit = 256;
-    if (limit > 2048)
-        limit = 2048;
+    limit = zdx_u64_clamp(limit, 1, 2048);
 
     if (op_filter != ZDX_SPACEMAP_OP_ANY &&
         op_filter != ZDX_SPACEMAP_OP_ALLOC &&

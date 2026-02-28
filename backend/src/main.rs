@@ -157,87 +157,8 @@ fn check_runtime_privileges(_mode: PoolOpenMode) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing with INFO level by default
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    let mode = parse_pool_open_mode()?;
-    let offline_search_paths = std::env::var("ZFS_EXPLORER_OFFLINE_PATHS")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let offline_pool_names = parse_offline_pool_names();
-    check_runtime_privileges(mode)?;
-
-    let (kernel_module_version, kernel_module_source) = detect_kernel_module_version();
-    tracing::info!(
-        "ZFS Explorer ({}), OpenZFS ({}) userland, starting...",
-        EXPLORER_BUILD_VERSION,
-        ffi::version()
-    );
-    tracing::info!("{}", REPO_URL);
-
-    // Initialize ZFS
-    tracing::info!("Initializing ZFS library...");
-    ffi::init()?;
-
-    match kernel_module_version {
-        Some(version) => tracing::info!(
-            "Kernel module {}: {}, ZFS pool version {}, ZFS filesystem version {}",
-            kernel_module_source,
-            version,
-            ZFS_SPA_VERSION,
-            ZFS_ZPL_VERSION
-        ),
-        None => tracing::info!(
-            "Kernel module {} (not found), ZFS pool version {}, ZFS filesystem version {}",
-            kernel_module_source,
-            ZFS_SPA_VERSION,
-            ZFS_ZPL_VERSION
-        ),
-    }
-
-    match mode {
-        PoolOpenMode::Live => {
-            tracing::info!("Pool open mode: live (imported pools)");
-            if offline_search_paths.is_some() {
-                tracing::warn!("ZFS_EXPLORER_OFFLINE_PATHS is set but ignored in live mode");
-            }
-        }
-        PoolOpenMode::Offline => {
-            tracing::info!("Pool open mode: offline (exported pools)");
-            if let Some(paths) = offline_search_paths.as_deref() {
-                tracing::info!("Offline search paths: {}", paths);
-            } else {
-                tracing::info!("Offline search paths: OpenZFS defaults");
-            }
-            if offline_pool_names.is_empty() {
-                tracing::warn!(
-                    "ZFS_EXPLORER_OFFLINE_POOLS is empty; /api/pools will only show imported pools"
-                );
-            } else {
-                tracing::info!("Offline pool names: {}", offline_pool_names.join(", "));
-            }
-        }
-    }
-
-    let state = AppState {
-        pool: Arc::new(Mutex::new(None)),
-        pool_open: Arc::new(Mutex::new(PoolOpenConfig {
-            mode,
-            offline_search_paths,
-            offline_pool_names,
-        })),
-    };
-
-    // Build the router
-    let app = Router::new()
+fn build_router(state: AppState) -> Router {
+    Router::new()
         .route("/api/version", get(api::api_version))
         .route("/api/mode", get(api::get_mode).put(api::set_mode))
         .route("/api/perf/arc", get(api::perf_arc))
@@ -375,7 +296,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/pools/{pool}/graph/from/{objid}", get(api::graph_from))
         .route("/api/mos/types", get(api::list_dmu_types))
         .with_state(state)
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing with INFO level by default
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let mode = parse_pool_open_mode()?;
+    let offline_search_paths = std::env::var("ZFS_EXPLORER_OFFLINE_PATHS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let offline_pool_names = parse_offline_pool_names();
+    check_runtime_privileges(mode)?;
+
+    let (kernel_module_version, kernel_module_source) = detect_kernel_module_version();
+    tracing::info!(
+        "ZFS Explorer ({}), OpenZFS ({}) userland, starting...",
+        EXPLORER_BUILD_VERSION,
+        ffi::version()
+    );
+    tracing::info!("{}", REPO_URL);
+
+    // Initialize ZFS
+    tracing::info!("Initializing ZFS library...");
+    ffi::init()?;
+
+    match kernel_module_version {
+        Some(version) => tracing::info!(
+            "Kernel module {}: {}, ZFS pool version {}, ZFS filesystem version {}",
+            kernel_module_source,
+            version,
+            ZFS_SPA_VERSION,
+            ZFS_ZPL_VERSION
+        ),
+        None => tracing::info!(
+            "Kernel module {} (not found), ZFS pool version {}, ZFS filesystem version {}",
+            kernel_module_source,
+            ZFS_SPA_VERSION,
+            ZFS_ZPL_VERSION
+        ),
+    }
+
+    match mode {
+        PoolOpenMode::Live => {
+            tracing::info!("Pool open mode: live (imported pools)");
+            if offline_search_paths.is_some() {
+                tracing::warn!("ZFS_EXPLORER_OFFLINE_PATHS is set but ignored in live mode");
+            }
+        }
+        PoolOpenMode::Offline => {
+            tracing::info!("Pool open mode: offline (exported pools)");
+            if let Some(paths) = offline_search_paths.as_deref() {
+                tracing::info!("Offline search paths: {}", paths);
+            } else {
+                tracing::info!("Offline search paths: OpenZFS defaults");
+            }
+            if offline_pool_names.is_empty() {
+                tracing::warn!(
+                    "ZFS_EXPLORER_OFFLINE_POOLS is empty; /api/pools will only show imported pools"
+                );
+            } else {
+                tracing::info!("Offline pool names: {}", offline_pool_names.join(", "));
+            }
+        }
+    }
+
+    let state = AppState {
+        pool: Arc::new(Mutex::new(None)),
+        pool_open: Arc::new(Mutex::new(PoolOpenConfig {
+            mode,
+            offline_search_paths,
+            offline_pool_names,
+        })),
+    };
+
+    // Build the router
+    let app = build_router(state);
 
     // Bind to localhost only (per security model in plan)
     let addr = SocketAddr::from(([127, 0, 0, 1], 9000));
@@ -386,4 +390,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Method, Request, StatusCode};
+    use serde_json::{json, Value};
+    use tower::util::ServiceExt;
+
+    fn test_state(config: PoolOpenConfig) -> AppState {
+        AppState {
+            pool: Arc::new(Mutex::new(None)),
+            pool_open: Arc::new(Mutex::new(config)),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_get_version_returns_expected_pool_mode() {
+        let app = build_router(test_state(PoolOpenConfig {
+            mode: PoolOpenMode::Offline,
+            offline_search_paths: Some("/fixtures".to_string()),
+            offline_pool_names: vec!["tank".to_string()],
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/version")
+                    .body(Body::empty())
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid JSON payload");
+        assert_eq!(payload["pool_open"]["mode"], "offline");
+        assert_eq!(payload["pool_open"]["offline_search_paths"], "/fixtures");
+        assert_eq!(payload["pool_open"]["offline_pools"][0], "tank");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_live_only_route_rejects_offline_mode() {
+        let app = build_router(test_state(PoolOpenConfig {
+            mode: PoolOpenMode::Offline,
+            offline_search_paths: None,
+            offline_pool_names: Vec::new(),
+        }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/perf/txg?pool=tank")
+                    .body(Body::empty())
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value = serde_json::from_slice(&body).expect("valid JSON payload");
+        assert_eq!(
+            payload,
+            json!({
+                "code": "HTTP_400",
+                "error": "runtime telemetry is unavailable in offline mode",
+                "message": "runtime telemetry is unavailable in offline mode",
+                "recoverable": true
+            })
+        );
+    }
 }

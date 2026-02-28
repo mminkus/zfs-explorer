@@ -609,9 +609,23 @@ Canonical build entrypoint:
 Fast local rebuild loop:
 
 ```bash
-# Equivalent to: native clean+make, backend build, UI build
+# Equivalent to: native clean+make, backend build+unit tests,
+# native unit tests, UI build
 ./build/build.sh --quick
 ```
+
+Quick local unit-test loop:
+
+```bash
+# backend unit tests + native unit tests + optional UI build
+./build/test-quick.sh
+
+# skip UI build when iterating backend/native only
+./build/test-quick.sh --skip-ui-build
+```
+
+Testing policy and scope split (unit vs fixture) are documented in
+`docs/TESTING_STRATEGY.md`.
 
 If you need to bootstrap vendored OpenZFS userland as well:
 
@@ -871,6 +885,7 @@ The Inspector also provides a `Copy debug` action that copies backend version/ru
 For repeatable milestone/release verification, use:
 
 - `docs/VALIDATION_CHECKLIST.md`
+- `docs/TESTING_STRATEGY.md`
 - `docs/SCREENSHOTS.md`
 
 ## Next Steps

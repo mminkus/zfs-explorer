@@ -225,60 +225,22 @@ typedef struct zdx_errlog_page {
 } zdx_errlog_page_t;
 
 static int
-parse_u64_token_base(const char *s, int base, const char **next, uint64_t *value)
-{
-    const char *p = s;
-    uint64_t acc = 0;
-    int saw_digit = 0;
-
-    if (s == NULL || value == NULL || (base != 10 && base != 16))
-        return EINVAL;
-
-    while (*p != '\0') {
-        int digit = -1;
-        if (*p >= '0' && *p <= '9') {
-            digit = *p - '0';
-        } else if (base == 16 && *p >= 'a' && *p <= 'f') {
-            digit = 10 + (*p - 'a');
-        } else if (base == 16 && *p >= 'A' && *p <= 'F') {
-            digit = 10 + (*p - 'A');
-        }
-
-        if (digit < 0 || digit >= base)
-            break;
-
-        saw_digit = 1;
-        if (acc > ((UINT64_MAX - (uint64_t)digit) / (uint64_t)base))
-            return ERANGE;
-        acc = (acc * (uint64_t)base) + (uint64_t)digit;
-        p++;
-    }
-
-    if (!saw_digit)
-        return EINVAL;
-    if (next != NULL)
-        *next = p;
-    *value = acc;
-    return 0;
-}
-
-static int
 parse_bookmark_key(const char *name, uint64_t *dsobj, uint64_t *object,
     int64_t *level, uint64_t *blkid)
 {
     const char *p = name;
     uint64_t lvl = 0;
 
-    if (parse_u64_token_base(p, 16, &p, dsobj) != 0 || *p != ':')
+    if (zdx_parse_u64_token_base(p, 16, &p, dsobj) != 0 || *p != ':')
         return EINVAL;
     p++;
-    if (parse_u64_token_base(p, 16, &p, object) != 0 || *p != ':')
+    if (zdx_parse_u64_token_base(p, 16, &p, object) != 0 || *p != ':')
         return EINVAL;
     p++;
-    if (parse_u64_token_base(p, 16, &p, &lvl) != 0 || *p != ':')
+    if (zdx_parse_u64_token_base(p, 16, &p, &lvl) != 0 || *p != ':')
         return EINVAL;
     p++;
-    if (parse_u64_token_base(p, 16, &p, blkid) != 0 || *p != '\0')
+    if (zdx_parse_u64_token_base(p, 16, &p, blkid) != 0 || *p != '\0')
         return EINVAL;
 
     *level = (int64_t)lvl;
@@ -292,16 +254,16 @@ parse_errphys_key(const char *name, uint64_t *object, int64_t *level,
     const char *p = name;
     uint64_t lvl = 0;
 
-    if (parse_u64_token_base(p, 16, &p, object) != 0 || *p != ':')
+    if (zdx_parse_u64_token_base(p, 16, &p, object) != 0 || *p != ':')
         return EINVAL;
     p++;
-    if (parse_u64_token_base(p, 16, &p, &lvl) != 0 || *p != ':')
+    if (zdx_parse_u64_token_base(p, 16, &p, &lvl) != 0 || *p != ':')
         return EINVAL;
     p++;
-    if (parse_u64_token_base(p, 16, &p, blkid) != 0 || *p != ':')
+    if (zdx_parse_u64_token_base(p, 16, &p, blkid) != 0 || *p != ':')
         return EINVAL;
     p++;
-    if (parse_u64_token_base(p, 16, &p, birth) != 0 || *p != '\0')
+    if (zdx_parse_u64_token_base(p, 16, &p, birth) != 0 || *p != '\0')
         return EINVAL;
 
     *level = (int64_t)lvl;
@@ -442,7 +404,7 @@ scan_errlog_head(spa_t *spa, uint64_t obj, const char *source,
          * Parse strictly as hex and require full-string consumption to avoid
          * truncating keys like "1eec33d" to decimal "1".
          */
-        if (parse_u64_token_base(top_attr->za_name, 16, &end, &head_ds) != 0 ||
+        if (zdx_parse_u64_token_base(top_attr->za_name, 16, &end, &head_ds) != 0 ||
             end == NULL || *end != '\0') {
             continue;
         }

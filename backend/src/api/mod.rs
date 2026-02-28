@@ -1038,6 +1038,88 @@ fn map_kstat_read_error(path: &str, err: &std::io::Error) -> ApiError {
     api_error(status, message)
 }
 
+fn resolve_txg_source<F>(
+    requested_pool: Option<&str>,
+    mut read_file: F,
+) -> Result<(String, String), ApiError>
+where
+    F: FnMut(&str) -> std::io::Result<String>,
+{
+    let mut attempted_sources: Vec<String> = Vec::new();
+
+    if let Some(pool) = requested_pool {
+        let pool_source = txgs_path_for_pool(pool);
+        attempted_sources.push(pool_source.clone());
+        match read_file(&pool_source) {
+            Ok(contents) => Ok((pool_source, contents)),
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(map_kstat_read_error(&pool_source, &err));
+                }
+
+                attempted_sources.push(TXGS_LEGACY_PATH.to_string());
+                match read_file(TXGS_LEGACY_PATH) {
+                    Ok(contents) => Ok((TXGS_LEGACY_PATH.to_string(), contents)),
+                    Err(fallback_err) => {
+                        if fallback_err.kind() == std::io::ErrorKind::NotFound {
+                            return Err(api_error(
+                                StatusCode::NOT_IMPLEMENTED,
+                                format!(
+                                    "txg stats file not found (tried: {})",
+                                    attempted_sources.join(", ")
+                                ),
+                            ));
+                        }
+                        Err(map_kstat_read_error(TXGS_LEGACY_PATH, &fallback_err))
+                    }
+                }
+            }
+        }
+    } else {
+        attempted_sources.push(TXGS_LEGACY_PATH.to_string());
+        match read_file(TXGS_LEGACY_PATH) {
+            Ok(contents) => Ok((TXGS_LEGACY_PATH.to_string(), contents)),
+            Err(err) => Err(map_kstat_read_error(TXGS_LEGACY_PATH, &err)),
+        }
+    }
+}
+
+fn build_txg_payload(
+    requested_pool: Option<&str>,
+    source_path: String,
+    contents: &str,
+) -> ApiResult {
+    let (columns, rows) = parse_txgs_rows(contents);
+    if rows.is_empty() {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("no txg rows parsed from {}", source_path),
+        ));
+    }
+
+    let latest = rows
+        .iter()
+        .filter_map(|row| row["txg"].as_u64().map(|txg| (txg, row)))
+        .max_by_key(|(txg, _)| *txg)
+        .map(|(_, row)| row.clone())
+        .unwrap_or(Value::Null);
+
+    let sampled_at_unix_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "source": source_path,
+        "requested_pool": requested_pool,
+        "sampled_at_unix_sec": sampled_at_unix_sec,
+        "columns": columns,
+        "count": rows.len(),
+        "latest": latest,
+        "rows": rows,
+    })))
+}
+
 /// GET /api/perf/vdev_iostat?pool= - per-vdev iostat sample (live mode only)
 pub async fn perf_vdev_iostat(
     State(state): State<AppState>,
@@ -1133,72 +1215,9 @@ pub async fn perf_txg(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    let mut attempted_sources: Vec<String> = Vec::new();
-    let (source_path, contents) = if let Some(pool) = requested_pool {
-        let pool_source = txgs_path_for_pool(pool);
-        attempted_sources.push(pool_source.clone());
-        match std::fs::read_to_string(&pool_source) {
-            Ok(contents) => (pool_source, contents),
-            Err(err) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(map_kstat_read_error(&pool_source, &err));
-                }
-
-                attempted_sources.push(TXGS_LEGACY_PATH.to_string());
-                match std::fs::read_to_string(TXGS_LEGACY_PATH) {
-                    Ok(contents) => (TXGS_LEGACY_PATH.to_string(), contents),
-                    Err(fallback_err) => {
-                        if fallback_err.kind() == std::io::ErrorKind::NotFound {
-                            return Err(api_error(
-                                StatusCode::NOT_IMPLEMENTED,
-                                format!(
-                                    "txg stats file not found (tried: {})",
-                                    attempted_sources.join(", ")
-                                ),
-                            ));
-                        }
-                        return Err(map_kstat_read_error(TXGS_LEGACY_PATH, &fallback_err));
-                    }
-                }
-            }
-        }
-    } else {
-        attempted_sources.push(TXGS_LEGACY_PATH.to_string());
-        match std::fs::read_to_string(TXGS_LEGACY_PATH) {
-            Ok(contents) => (TXGS_LEGACY_PATH.to_string(), contents),
-            Err(err) => return Err(map_kstat_read_error(TXGS_LEGACY_PATH, &err)),
-        }
-    };
-
-    let (columns, rows) = parse_txgs_rows(&contents);
-    if rows.is_empty() {
-        return Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("no txg rows parsed from {}", source_path),
-        ));
-    }
-
-    let latest = rows
-        .iter()
-        .filter_map(|row| row["txg"].as_u64().map(|txg| (txg, row)))
-        .max_by_key(|(txg, _)| *txg)
-        .map(|(_, row)| row.clone())
-        .unwrap_or(Value::Null);
-
-    let sampled_at_unix_sec = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-
-    Ok(Json(json!({
-        "source": source_path,
-        "requested_pool": requested_pool,
-        "sampled_at_unix_sec": sampled_at_unix_sec,
-        "columns": columns,
-        "count": rows.len(),
-        "latest": latest,
-        "rows": rows,
-    })))
+    let (source_path, contents) =
+        resolve_txg_source(requested_pool, |path| std::fs::read_to_string(path))?;
+    build_txg_payload(requested_pool, source_path, &contents)
 }
 
 /// GET /api/pools/:pool/dedup - DDT summary (`zpool status -D -p`) in live mode
@@ -4072,6 +4091,23 @@ pub async fn graph_from(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn test_state(config: crate::PoolOpenConfig) -> crate::AppState {
+        crate::AppState {
+            pool: Arc::new(Mutex::new(None)),
+            pool_open: Arc::new(Mutex::new(config)),
+        }
+    }
+
+    fn sample_txgs_payload() -> &'static str {
+        r#"
+2 1 0x01 6 288 1234
+txg birth state ndirty nread nwritten
+42 1770590000 C 0 0 0
+43 1770590001 O 4096 2 8192
+"#
+    }
 
     #[test]
     fn normalize_limit_uses_default_and_bounds() {
@@ -4464,6 +4500,113 @@ txg birth state ndirty nread nwritten
         assert_eq!(rows[0]["txg"], 42);
         assert_eq!(rows[0]["state"], "C");
         assert_eq!(rows[1]["ndirty"], 4096);
+    }
+
+    #[test]
+    fn resolve_txg_source_prefers_pool_specific_path_when_present() {
+        let source_path = txgs_path_for_pool("tank");
+        let requested = source_path.clone();
+        let (source, contents) = resolve_txg_source(Some("tank"), move |path| {
+            if path == requested {
+                Ok(sample_txgs_payload().to_string())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "unexpected path",
+                ))
+            }
+        })
+        .expect("pool-specific txg file should be selected");
+
+        assert_eq!(source, source_path);
+        assert!(contents.contains("txg birth state"));
+    }
+
+    #[test]
+    fn resolve_txg_source_falls_back_to_legacy_path() {
+        let pool_path = txgs_path_for_pool("tank");
+        let (source, contents) = resolve_txg_source(Some("tank"), move |path| {
+            if path == pool_path {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "pool file missing",
+                ))
+            } else if path == TXGS_LEGACY_PATH {
+                Ok(sample_txgs_payload().to_string())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "unexpected path",
+                ))
+            }
+        })
+        .expect("legacy fallback should be used when pool file is missing");
+
+        assert_eq!(source, TXGS_LEGACY_PATH);
+        assert!(contents.contains("txg birth state"));
+    }
+
+    #[test]
+    fn resolve_txg_source_reports_attempted_paths_when_missing() {
+        let pool_path = txgs_path_for_pool("tank");
+        let err = resolve_txg_source(Some("tank"), |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_IMPLEMENTED);
+        let message = err.1 .0["error"].as_str().unwrap_or_default();
+        assert!(message.contains(&pool_path));
+        assert!(message.contains(TXGS_LEGACY_PATH));
+    }
+
+    #[test]
+    fn build_txg_payload_preserves_requested_pool_and_latest_row() {
+        let Json(payload) = build_txg_payload(
+            Some("tank"),
+            TXGS_LEGACY_PATH.to_string(),
+            sample_txgs_payload(),
+        )
+        .expect("txg payload should parse");
+
+        assert_eq!(payload["source"], TXGS_LEGACY_PATH);
+        assert_eq!(payload["requested_pool"], "tank");
+        assert_eq!(payload["count"], 2);
+        assert_eq!(payload["latest"]["txg"], 43);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn api_version_handler_returns_pool_open_config() {
+        let state = test_state(crate::PoolOpenConfig {
+            mode: crate::PoolOpenMode::Offline,
+            offline_search_paths: Some("/fixtures".to_string()),
+            offline_pool_names: vec!["tank".to_string()],
+        });
+
+        let Json(payload) = api_version(State(state))
+            .await
+            .expect("version handler should return success");
+        assert_eq!(payload["pool_open"]["mode"], "offline");
+        assert_eq!(payload["pool_open"]["offline_search_paths"], "/fixtures");
+        assert_eq!(payload["pool_open"]["offline_pools"][0], "tank");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_only_route_rejects_offline_mode() {
+        let state = test_state(crate::PoolOpenConfig {
+            mode: crate::PoolOpenMode::Offline,
+            offline_search_paths: None,
+            offline_pool_names: Vec::new(),
+        });
+
+        let err = pool_dedup_summary(State(state), Path("tank".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1 .0["error"],
+            "dedup summary is unavailable in offline mode"
+        );
     }
 
     #[test]

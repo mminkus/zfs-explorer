@@ -17,3 +17,6 @@ mime_guess = "2"
 
 [build-dependencies]
 bindgen = "0.72"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
