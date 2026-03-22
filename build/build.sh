@@ -158,6 +158,30 @@ check_openzfs_submodule_state() {
   "$ROOT_DIR/build/check-openzfs-submodule.sh" "${args[@]}"
 }
 
+reset_openzfs_generated_files() {
+  local src_dir="$1"
+  local path
+  local rel
+
+  # OpenZFS does not track autotools outputs. After rebasing the submodule
+  # between release lines, stale ignored files can survive and reference
+  # headers that no longer exist in the checked-out tree.
+  while IFS= read -r -d '' path; do
+    rel="${path#"$src_dir"/}"
+    if git -C "$src_dir" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      continue
+    fi
+    rm -f "$path"
+  done < <(
+    find "$src_dir" -type f \
+      \( -name 'Makefile' -o -name 'Makefile.in' -o -name 'configure' \
+         -o -name 'aclocal.m4' -o -name 'config.status' -o -name 'config.log' \
+         -o -name 'Kbuild' \) \
+      -print0
+  )
+  rm -rf "$src_dir/autom4te.cache"
+}
+
 ensure_make_tool() {
   if ! command -v "$MAKE_CMD" >/dev/null 2>&1; then
     echo "error: build tool '$MAKE_CMD' not found in PATH." >&2
@@ -201,9 +225,8 @@ bootstrap_openzfs() {
   log_step "Bootstrapping vendored OpenZFS userland"
   cd "$OPENZFS_SRC_DIR"
 
-  if [[ ! -f configure ]]; then
-    ./autogen.sh
-  fi
+  reset_openzfs_generated_files "$OPENZFS_SRC_DIR"
+  ./autogen.sh
 
   local local_dracutdir="$OPENZFS_PREFIX_DIR/lib/dracut"
   local local_udevdir="$OPENZFS_PREFIX_DIR/lib/udev"

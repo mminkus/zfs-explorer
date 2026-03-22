@@ -19,13 +19,21 @@ endif
 # Get git SHA from ZFS repo
 ZDX_GIT_SHA := $(shell git -C $(ZFS_SRC) rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
-# Include paths - use source tree for headers, prefix for libs
-# zfs_config.h is generated at the source root.
+# Include paths - Linux can compile directly from the source tree, while
+# FreeBSD needs the generated userland include layout from the built prefix.
+ifeq ($(ZFS_OS),freebsd)
+CPPFLAGS += -I$(ZFS_PREFIX)/include/libzfs
+CPPFLAGS += -I$(ZFS_PREFIX)/include/libspl
+CPPFLAGS += -I$(ZFS_SRC)
+CPPFLAGS += -I$(ZFS_SRC)/include
+CPPFLAGS += -I$(ZFS_SRC)/lib/libzpool/include
+else
 CPPFLAGS += -I$(ZFS_SRC)
 CPPFLAGS += -I$(ZFS_SRC)/include
 CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include
 CPPFLAGS += -I$(ZFS_SRC)/lib/libspl/include/os/$(ZFS_OS)
 CPPFLAGS += -I$(ZFS_SRC)/lib/libzpool/include
+endif
 CPPFLAGS += -Iinclude
 CPPFLAGS += -D_GNU_SOURCE
 CPPFLAGS += -DZDX_GIT_SHA=\"$(ZDX_GIT_SHA)\"
@@ -33,6 +41,10 @@ CPPFLAGS += -DZDX_GIT_SHA=\"$(ZDX_GIT_SHA)\"
 # Keep native shim ABI-compatible with vendored libzpool regardless of
 # configure --enable-debug/--disable-debug mode.
 CPPFLAGS += -DDEBUG -UNDEBUG -DZFS_DEBUG
+ifeq ($(ZFS_OS),freebsd)
+CPPFLAGS += -I/usr/local/include
+CFLAGS += -include $(ZFS_SRC)/include/os/freebsd/spl/sys/ccompile.h
+endif
 
 # Warning flags
 WARNFLAGS = -Wall -Wextra -Wshadow -Wformat=2 -Wstrict-prototypes -Wno-cast-qual

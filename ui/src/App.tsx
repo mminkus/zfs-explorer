@@ -8031,7 +8031,7 @@ function App() {
       <header className="topbar">
         <div>
           <strong>ZFS Explorer</strong>
-          <p className="subtitle">Release Candidate 1</p>
+          <p className="subtitle">Release Candidate 4</p>
         </div>
         <div className="status">
           <div className="status-item">
