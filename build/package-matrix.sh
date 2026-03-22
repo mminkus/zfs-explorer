@@ -11,6 +11,7 @@ SKIP_LINUX=0
 SKIP_FREEBSD=1
 SKIP_UI_BUILD=0
 KEEP_INTERMEDIATE=0
+ALLOW_OPENZFS_DRIFT="${ALLOW_OPENZFS_DRIFT:-0}"
 
 LINUX_TARGETS=(debian12 debian13 ubuntu2204 ubuntu2404 ubuntu2504 rocky9 alma10)
 FREEBSD_HOST=""
@@ -43,6 +44,7 @@ Options:
   --skip-ui-build               Skip local UI build check/build
                                 (requires ui/dist to exist)
   --keep-intermediate           Keep intermediate dist/package-matrix outputs
+  --allow-openzfs-drift         Continue even if zfs/ differs from the pinned commit
   -h, --help                    Show help
 
 Examples:
@@ -139,6 +141,14 @@ join_for_summary() {
   echo "$joined"
 }
 
+check_openzfs_submodule_state() {
+  local args=(--mode error)
+  if [[ "$ALLOW_OPENZFS_DRIFT" == "1" ]]; then
+    args+=(--allow-drift)
+  fi
+  "$ROOT_DIR/build/check-openzfs-submodule.sh" "${args[@]}"
+}
+
 build_ui_if_needed() {
   if [[ "$SKIP_UI_BUILD" -eq 1 ]]; then
     if [[ ! -d "$ROOT_DIR/ui/dist" ]]; then
@@ -225,6 +235,7 @@ build_linux_target() {
       -e PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
       -e PROFILE="$PROFILE" \
       -e VERSION_LABEL="$VERSION_LABEL" \
+      -e ALLOW_OPENZFS_DRIFT="$ALLOW_OPENZFS_DRIFT" \
       -v "$ROOT_DIR:/workspace" \
       -w /workspace \
       "$image" \
@@ -306,8 +317,8 @@ run_freebsd_build() {
     ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree remove --force '$remote_worktree' >/dev/null 2>&1 || true"
     ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$FREEBSD_REPO_PATH' && git worktree add --detach --force '$remote_worktree' '$LOCAL_GIT_SHA'"
     ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && git submodule update --init --recursive"
-    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && env MAKE=gmake ./build/build.sh --bootstrap-openzfs --openzfs-release"
-    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && env MAKE=gmake ./build/package.sh --profile '$PROFILE' --version-label '$VERSION_LABEL'"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && env MAKE=gmake ALLOW_OPENZFS_DRIFT='$ALLOW_OPENZFS_DRIFT' ./build/build.sh --bootstrap-openzfs --openzfs-release"
+    ssh $FREEBSD_SSH_OPTS "$FREEBSD_HOST" "cd '$remote_worktree' && env MAKE=gmake ALLOW_OPENZFS_DRIFT='$ALLOW_OPENZFS_DRIFT' ./build/package.sh --profile '$PROFILE' --version-label '$VERSION_LABEL'"
   } >"$log_file" 2>&1 || build_rc=$?
 
   if [[ "$build_rc" -ne 0 ]]; then
@@ -381,6 +392,9 @@ while [[ $# -gt 0 ]]; do
     --keep-intermediate)
       KEEP_INTERMEDIATE=1
       ;;
+    --allow-openzfs-drift)
+      ALLOW_OPENZFS_DRIFT=1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -434,6 +448,7 @@ if [[ "$SKIP_FREEBSD" -eq 0 && -z "$FREEBSD_HOST" ]]; then
 fi
 
 mkdir -p "$OUTPUT_ROOT/logs"
+check_openzfs_submodule_state
 
 if [[ "$SKIP_LINUX" -eq 0 ]]; then
   ensure_tool "$DOCKER_BIN"

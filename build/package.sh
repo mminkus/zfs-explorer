@@ -7,6 +7,7 @@ OUTPUT_DIR="$ROOT_DIR/dist"
 SKIP_BUILD=0
 VERSION_LABEL="auto"
 HOST_OS="$(uname -s 2>/dev/null || echo unknown)"
+ALLOW_OPENZFS_DRIFT="${ALLOW_OPENZFS_DRIFT:-0}"
 
 if [[ -n "${MAKE:-}" ]]; then
   MAKE_CMD="$MAKE"
@@ -25,6 +26,7 @@ Options:
   --version-label <value>     Version label in artifact names (default: auto)
   --output-dir <path>         Output directory for bundles/tarballs (default: ./dist)
   --skip-build                Do not rebuild native/backend/ui before packaging
+  --allow-openzfs-drift       Continue even if zfs/ differs from the pinned commit
   -h, --help                  Show this help
 
 Examples:
@@ -132,6 +134,14 @@ check_openzfs_glibc_compat() {
   fi
 }
 
+check_openzfs_submodule_state() {
+  local args=(--mode error)
+  if [[ "$ALLOW_OPENZFS_DRIFT" == "1" ]]; then
+    args+=(--allow-drift)
+  fi
+  "$ROOT_DIR/build/check-openzfs-submodule.sh" "${args[@]}"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
@@ -151,6 +161,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-build)
       SKIP_BUILD=1
+      ;;
+    --allow-openzfs-drift)
+      ALLOW_OPENZFS_DRIFT=1
       ;;
     -h|--help)
       print_usage
@@ -180,6 +193,7 @@ if [[ -z "$VERSION_LABEL" ]]; then
 fi
 
 check_openzfs_glibc_compat
+check_openzfs_submodule_state
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   echo "==> Building native library"

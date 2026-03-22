@@ -9,6 +9,11 @@ This is the maintainer checklist for building, validating, and publishing
 - Commit is pushed to origin (required for FreeBSD matrix parity checks).
 - Docker is available on the Linux build host.
 - FreeBSD builder host is reachable via passwordless SSH.
+- `zfs/` matches the repo-pinned OpenZFS submodule commit before packaging.
+- `.gitmodules` points `zfs/` at `mminkus/zfs` because the pinned compat commit
+  is carried in that fork rather than upstream `openzfs/zfs`.
+- `--allow-openzfs-drift` exists for maintainer experiments, but release
+  artifacts should use the repo-pinned `zfs/` commit.
 - Pre-release test gate passed on the release commit:
   - `./build/test-quick.sh` (backend + native unit suites, optional UI build)
   - `sudo build/test-corpus-matrix.sh` (fixture semantics gate)

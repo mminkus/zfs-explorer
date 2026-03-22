@@ -25,6 +25,8 @@ QUICK_MODE=0
 BOOTSTRAP_OPENZFS=0
 SKIP_UI_INSTALL=0
 OPENZFS_DEBUG=1
+OPENZFS_SUBMODULE_CHECK_MODE="warn"
+ALLOW_OPENZFS_DRIFT="${ALLOW_OPENZFS_DRIFT:-0}"
 
 print_usage() {
   cat <<'EOF'
@@ -38,6 +40,9 @@ Options:
                          (cd ui && npm run build)
   --bootstrap-openzfs    Build/install vendored OpenZFS userland into _deps/openzfs first
   --skip-ui-install      Skip npm install (useful when node_modules is already present)
+  --strict-openzfs-submodule
+                         Fail if zfs/ differs from the repo-pinned submodule commit
+  --allow-openzfs-drift  Continue even if zfs/ differs from the repo-pinned commit
   --openzfs-debug        Build vendored OpenZFS with debug enabled (default)
   --openzfs-release      Build vendored OpenZFS with debug disabled
   --jobs N               Parallel jobs for OpenZFS make
@@ -48,6 +53,7 @@ Examples:
   build/build.sh --quick
   build/build.sh --bootstrap-openzfs --jobs 16
   build/build.sh --bootstrap-openzfs --openzfs-release
+  build/build.sh --strict-openzfs-submodule
 
 Environment:
   MAKE                   Override make tool (default: gmake on FreeBSD, make otherwise)
@@ -144,6 +150,14 @@ ensure_openzfs_submodule() {
   fi
 }
 
+check_openzfs_submodule_state() {
+  local args=(--mode "$OPENZFS_SUBMODULE_CHECK_MODE")
+  if [[ "$ALLOW_OPENZFS_DRIFT" == "1" ]]; then
+    args+=(--allow-drift)
+  fi
+  "$ROOT_DIR/build/check-openzfs-submodule.sh" "${args[@]}"
+}
+
 ensure_make_tool() {
   if ! command -v "$MAKE_CMD" >/dev/null 2>&1; then
     echo "error: build tool '$MAKE_CMD' not found in PATH." >&2
@@ -181,6 +195,7 @@ apply_host_build_defaults() {
 
 bootstrap_openzfs() {
   ensure_openzfs_submodule
+  check_openzfs_submodule_state
   ensure_make_tool
 
   log_step "Bootstrapping vendored OpenZFS userland"
@@ -273,6 +288,12 @@ while [[ $# -gt 0 ]]; do
     --skip-ui-install)
       SKIP_UI_INSTALL=1
       ;;
+    --strict-openzfs-submodule)
+      OPENZFS_SUBMODULE_CHECK_MODE="error"
+      ;;
+    --allow-openzfs-drift)
+      ALLOW_OPENZFS_DRIFT=1
+      ;;
     --openzfs-debug)
       OPENZFS_DEBUG=1
       ;;
@@ -306,6 +327,7 @@ if [[ "$BOOTSTRAP_OPENZFS" -eq 1 ]]; then
 fi
 
 ensure_openzfs_submodule
+check_openzfs_submodule_state
 check_openzfs_glibc_compat
 
 build_native

@@ -509,6 +509,10 @@ Commonly used endpoints:
 ### 0. Clone with submodules
 
 `zfs/` is an OpenZFS git submodule and is required for native/backend builds.
+For the current 1.0 RC line, the repo pins an OpenZFS compatibility commit used
+to tolerate older distro kernel modules, including older Ubuntu ZFS module
+packages. That commit currently lives in the `mminkus/zfs` fork, so the
+submodule URL points there to keep fresh clones reproducible.
 
 ```bash
 # fresh clone
@@ -527,6 +531,15 @@ git submodule update --init --recursive --force
 git -C zfs reset --hard
 git -C zfs clean -fdx
 git -C zfs sparse-checkout disable || true
+```
+
+Local `build/build.sh` runs this check in warning mode by default so maintainers
+can experiment with OpenZFS rebases. Packaging/release scripts still fail fast
+unless `--allow-openzfs-drift` is passed explicitly. If you want to restore the
+pinned compat baseline, run:
+
+```bash
+git submodule update --init --recursive
 ```
 
 ### 1. Install prerequisites (Debian/Ubuntu)
@@ -588,6 +601,14 @@ sudo apt-get install -y ksh
 Notes:
 - This project builds against the vendored `zfs/` submodule, not distro
   OpenZFS headers/libs.
+- The currently pinned `zfs/` commit carries the compatibility baseline we use
+  for older distro kernel modules. Release builds should use the pinned
+  submodule state, not an arbitrary local `zfs/` branch. Local builds warn on
+  drift by default; package/release scripts stay strict unless explicitly run
+  with `--allow-openzfs-drift`.
+- The submodule points at `mminkus/zfs` because the pinned compatibility commit
+  is not part of upstream `openzfs/zfs`. Maintainers working on rebases can add
+  an `upstream` remote inside `zfs/` as needed.
 - Host OpenZFS packages are still needed to access imported pools in live mode.
 - After `zfs-dkms` install/upgrade, a reboot or `modprobe zfs` may be required.
 - Debian backports currently tracks OpenZFS 2.4.0. If you want strict

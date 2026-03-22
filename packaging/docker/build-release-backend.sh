@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-/workspace}"
 PROFILE="${PROFILE:-release}"
 OPENZFS_DEBUG="${OPENZFS_DEBUG:-0}"
+ALLOW_OPENZFS_DRIFT="${ALLOW_OPENZFS_DRIFT:-0}"
 export PATH="/usr/local/cargo/bin:${PATH}"
 
 if [[ "$PROFILE" != "debug" && "$PROFILE" != "release" ]]; then
@@ -32,6 +33,11 @@ openzfs_prefix_dir="$ROOT_DIR/_deps/openzfs"
 
 cd "$ROOT_DIR"
 git submodule update --init --recursive
+check_args=(--mode error)
+if [[ "$ALLOW_OPENZFS_DRIFT" == "1" ]]; then
+  check_args+=(--allow-drift)
+fi
+"$ROOT_DIR/build/check-openzfs-submodule.sh" "${check_args[@]}"
 
 cd "$openzfs_src_dir"
 if [[ ! -f configure ]]; then
