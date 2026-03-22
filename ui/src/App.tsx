@@ -8030,8 +8030,7 @@ function App() {
     <div className="app">
       <header className="topbar">
         <div>
-          <strong>ZFS Explorer</strong>
-          <p className="subtitle">Release Candidate 4</p>
+          <h2>ZFS Explorer</h2>
         </div>
         <div className="status">
           <div className="status-item">
